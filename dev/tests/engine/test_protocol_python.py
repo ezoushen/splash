@@ -290,6 +290,14 @@ class ProtocolPythonTests(unittest.TestCase):
             request.score_tokens,
         )
         self.assertEqual(decode_client(wire), request)
+        # Score requests may carry image spans with matching pixels.
+        span = p.ImageSpan(0, 1, 2, 2, 1, 2)
+        imaged = replace(
+            request,
+            image_spans=(span,),
+            image_pixels=bytes(span.pixel_bytes),
+        )
+        self.assertEqual(decode_client(p.serialize_message(imaged)), imaged)
 
     def test_maximum_score_domain_roundtrips_without_truncation(self):
         request = replace(example_score_request(), score_tokens=tuple(range(255)))
@@ -465,6 +473,10 @@ class ProtocolPythonTests(unittest.TestCase):
                     image_spans=(p.ImageSpan(0, 1, 2, 2, 1, 2),),
                     image_pixels=bytes(48),
                 ),
+                p.IssueCode.INVALID_COUNT,
+            ),
+            (
+                replace(base, image_pixels=bytes(48)),
                 p.IssueCode.INVALID_COUNT,
             ),
         )

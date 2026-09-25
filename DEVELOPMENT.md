@@ -1274,12 +1274,12 @@ calibrate on representative held-out data before using decision thresholds.
 
 Requests carry the score-token IDs and Done events the selected f32 logits; the
 server and the engine must speak the same native wire version. Scoring requires
-2–255 distinct, in-vocabulary tokens, no images or generation constraints, and a
-zero output budget. It may use the full context window because no generated
-token needs a reserved position. The final prefill chunk runs the target head
-but no sampling policy or DFlash decode. Successful scoring emits no Tokens
-event, finishes with Stop, and reports zero decode time. Cancelled requests
-carry no logits.
+2–255 distinct, in-vocabulary tokens, a zero output budget, and no generation
+constraints; image spans are allowed. It may use the full context window because
+no generated token needs a reserved position. The final prefill chunk runs the
+target head but no sampling policy or DFlash decode. Successful scoring emits no
+Tokens event, finishes with Stop, and reports zero decode time. Cancelled
+requests carry no logits.
 
 A non-finite logit row is a per-request failure, not an engine fault: a score
 logit, or a token the sampling kernels could only select outside the
