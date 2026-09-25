@@ -1046,6 +1046,45 @@ void testScoreRequestCompletesAfterFullPrompt() {
           "score request did not complete without generating tokens");
 }
 
+// A score request may carry image spans: the engine admits it, the model
+// sees the image, and the final prompt chunk still returns its logits.
+void testScoreRequestWithImageCompletes() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 8192;
+  config.engine.maxImagePatches = ops::kMaximumImagePatches;
+  LoopFixture fixture(config, {.pages = 512});
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady();
+  auto scored = scoreRequest(9, 3000);
+  scored.imageSpans = {
+      {4, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL}};
+  scored.imagePixels.resize(scored.imageSpans[0].pixelBytes());
+  for (size_t index = 0; index < scored.imagePixels.size(); ++index)
+    scored.imagePixels[index] = static_cast<uint8_t>(index * 5 + 1);
+  require(loop.receive(protocol::peer::serialize(scored)),
+          "score+image request closed the native connection");
+  runUntilIdle(loop);
+  require(fixture.executor.beganImageSpans[9] == 1,
+          "score image span did not reach the model");
+
+  uint32_t tokensEvents = 0;
+  uint32_t doneCount = 0;
+  for (const protocol::EngineEvent &message : fixture.events()) {
+    if (std::holds_alternative<protocol::TokensEvent>(message))
+      ++tokensEvents;
+    if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
+      ++doneCount;
+      require(done->requestId == 9 &&
+                  done->reason == EngineFinishReason::Stop &&
+                  done->completionTokens == 0 &&
+                  done->optionLogits.size() == 3,
+              "score+image done is malformed");
+    }
+  }
+  require(doneCount == 1 && tokensEvents == 0,
+          "score+image request did not complete without generating tokens");
+}
+
 void testCancelledScoreReturnsEmptyLogits() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
@@ -2104,6 +2143,7 @@ int main() {
     testImageRequestBeyondVisionStaysRequestScoped();
     testStepTokensFitTheWire();
     testScoreRequestCompletesAfterFullPrompt();
+    testScoreRequestWithImageCompletes();
     testCancelledScoreReturnsEmptyLogits();
     testPrefillTimeCountsFromTheStart();
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();

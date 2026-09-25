@@ -170,7 +170,7 @@ struct RequestFrame {
   ConstraintMode constraint = ConstraintMode::None;
   // Empty selects ordinary generation. Nonempty selects score-only mode:
   // 2..255 distinct token ids, logicalMaxOutputTokens must be zero, and the
-  // request must be text-only, unconstrained, and greedy.
+  // request must be unconstrained and greedy; image spans are allowed.
   std::vector<uint32_t> scoreTokens{};
   // Trailing prompt tokens of the chat template's generation prompt; zero
   // when unknown. It must leave at least one prompt token.
