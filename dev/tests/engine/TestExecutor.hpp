@@ -232,6 +232,7 @@ public:
     if (beginObserver) beginObserver();
     beganFlags[request.id] = request.flags;
     beganSampling[request.id] = request.sampling;
+    beganImageSpans[request.id] = static_cast<uint32_t>(request.images.size());
     if (beginGrowthBlocked && beginGrowthBlocked())
       return {{}, StateFailure::MemoryPressure, beginAllocationFailure};
     if (deniedBegins) {
@@ -716,6 +717,8 @@ public:
   // The flags and sampling each request began with.
   std::unordered_map<uint64_t, uint32_t> beganFlags;
   std::unordered_map<uint64_t, SamplingParameters> beganSampling;
+  // The image spans each request began with.
+  std::unordered_map<uint64_t, uint32_t> beganImageSpans;
   // The prefill steps each request took.
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
   // The tokens a decode step emits.
