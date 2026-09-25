@@ -934,7 +934,8 @@ calibrate on representative held-out data before using decision thresholds.
 
 Native wire version 6 appends score-token IDs to requests and selected f32 logits
 to Done events; a version mismatch is fatal. Scoring requires 2–255 distinct,
-in-vocabulary tokens, no images or generation constraints, and a zero output budget.
+in-vocabulary tokens, a zero output budget, and no generation constraints;
+image spans are allowed.
 It may use the full context window because no generated token needs a reserved
 position. The final prefill chunk runs the target head but no sampling policy or
 DFlash decode. Successful scoring emits no Tokens event, finishes with Stop, and
