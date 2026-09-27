@@ -250,6 +250,11 @@ def loaded_entries(link: Path, cache: Path):
         "draft/model.bin",
         *(f"draft/layer-{index}.bin" for index in range(family.draft.layers)),
     }
+    # An MLX target prepares each MoE layer's routed experts into a file of
+    # their own (AffineTarget.cpp).
+    moe = "num_experts" in dict(family.signature)
+    if moe and record["target_format"] == "mlx-affine":
+        components.update(f"target/experts-{index}.bin" for index in range(layers))
     if record["vision_format"] != "none":
         components.add("vision/model.bin")
     # Each file is hashed once, through one of its links: the vision tower

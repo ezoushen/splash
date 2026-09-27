@@ -386,7 +386,11 @@ requantization, quantizes the draft's BF16 projections into the same tiles
 ([Drafts](#drafts)) and computes GDN decay as `float(-exp(double(A_log)))`,
 which may differ by one float ULP in this small vector from packages produced
 with MLX's float exponential. `GgufPreparation` repacks GGUF blocks ([GGUF
-targets](#gguf-targets)).
+targets](#gguf-targets)). `AffineTargetLoader` writes a sparse MoE layer's
+routed experts, most of its bytes, into a file of their own, `experts-N.bin`
+beside `layer-N.bin`, so a fine-tune that leaves them unchanged shares that
+file with its base (below); packages and GGUF images keep them in the layer's
+file.
 
 Preparation never rounds a target or vision weight, and rounds the draft's
 projections only as the packages' drafts are rounded. A tensor it converts to
@@ -405,10 +409,14 @@ missing files add beyond the entries they supersede (below), plus the largest
 file written while the entry it replaces remains, plus the reserve. Entries that
 every file of a source path supersedes, which its first published file removes,
 are credited to that path's files together. After a preparation-identity change,
-preparing thus needs little more than its largest file. Uninstalling a model
-does not delete possibly shared prepared weights. With Splash stopped, entry
-directories can be deleted; deleting the whole cache causes preparation at the
-next load.
+preparing thus needs little more than its largest file. A cache written by a
+build whose keys follow source tensors but whose MoE layer files still hold
+their routed experts is the exception: each old `layer-N.bin` is credited only
+to the new, smaller one and `experts-N.bin` replaces no entry, so preparing
+asks for about the size of the model's experts although the cache grows by
+little. Uninstalling a model does not delete possibly shared prepared weights.
+With Splash stopped, entry directories can be deleted; deleting the whole cache
+causes preparation at the next load.
 
 A prepared file's key hashes its adapter's preparation identity, its plan, and
 the digest of the bytes, size, type and shape of every source tensor it reads,
@@ -498,7 +506,10 @@ other applications still affect memory pressure and swap.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
 (`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or
-`GgufTargetLoader` prepared) through the format that stores them.
+`GgufTargetLoader` prepared) through the format that stores them. A sparse
+MoE layer's FFN is read from the layer's file and its routed experts' file,
+which for packed files and GGUF images is the layer's file again, in file
+order: router, routed experts, shared expert, scalar gate.
 `AffineTargetFormat`, for packed and MLX-prepared files, reads every
 projection, a fused one too, as one affine Q4 tensor and the norms as bf16.
 `BlockTargetFormat`, for prepared GGUF images, reads each GGUF tensor as one
@@ -1074,9 +1085,13 @@ family, so it runs once on each Mac. Per model, `release-check`:
   acceptance must be identical (`EXPECT_OUTPUT_CHANGE=1` allows changed
   outputs with acceptance within 0.02), and so must the prepared bytes,
   which a baseline of another preparation identity prepares into a cache of
-  its own; decode and prefill GPU time may regress by at most the larger of
+  its own (`EXPECT_PREPARED_CHANGE=1` records changed ones without failing);
+  decode and prefill GPU time may regress by at most the larger of
   2% and twice the run's own ABBA spread, and a spread above 5% fails as
-  inconclusive.
+  inconclusive. A change that means new prepared bytes follows the
+  procedure of the goldens README ([Weight preparation](#weight-preparation)),
+  and for an MLX target the affine source oracle, which compares them with
+  the packed package, carries the byte check.
 
 Results go to `build/release/<owner>--<repo>[--VARIANT]/`. Preparation does not
 depend on the GPU, so each model's `prepared.json` must be identical on the

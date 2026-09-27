@@ -17,6 +17,7 @@ from dev.tests.installer_fixtures import (
     DENSE,
     DRAFT_COMMIT,
     MODEL,
+    MOE,
     draft_dir,
     fake_hub,
     mlx_target,
@@ -287,6 +288,52 @@ class InstallerRestartsTest(unittest.TestCase):
                 )
         for link in (base, tuned):
             self.assertEqual(restarts.loaded_entries(link, weights), expected[link])
+
+    def test_prepared_names_the_experts_files_of_an_mlx_moe_target(self):
+        # An MLX target prepares each MoE layer's routed experts into a file
+        # of their own; a GGUF target's layer images keep them.
+        layers = dict(MOE.signature)["num_hidden_layers"]
+        for target_format, target, data in (
+            ("mlx-affine", "target/model.safetensors", safetensors_bytes(b"abcd")),
+            ("gguf", "target/model.gguf", gguf_bytes(b"abcd")),
+        ):
+            with self.subTest(target_format=target_format):
+                link = self.root / target_format
+                (link / "target").mkdir(parents=True)
+                (link / target).write_bytes(data)
+                (link / "draft").mkdir()
+                (link / "draft/model.safetensors").write_bytes(
+                    safetensors_bytes(b"draft")
+                )
+                files = {target: {}, "draft/model.safetensors": {}}
+                (link / "model.json").write_text(
+                    json.dumps(
+                        {
+                            "family": MOE.name,
+                            "target_format": target_format,
+                            "vision_format": "none",
+                            "files": files,
+                        }
+                    )
+                )
+                names = components(MOE)
+                if target_format == "mlx-affine":
+                    names = sorted(
+                        names + [f"target/experts-{i}.bin" for i in range(layers)]
+                    )
+                weights = link / "weights"
+                expected = [
+                    prepared_entry(
+                        weights,
+                        f"{i:064x}",
+                        name,
+                        source_inputs(
+                            b"draft" if name.startswith("draft/") else b"abcd"
+                        ),
+                    )
+                    for i, name in enumerate(names)
+                ]
+                self.assertEqual(restarts.loaded_entries(link, weights), expected)
 
     def test_a_gguf_digest_starts_at_the_aligned_tensor_data(self):
         path = self.root / "model.gguf"

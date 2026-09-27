@@ -14,6 +14,9 @@ namespace splash::model {
 struct Qwen3_6MoeLayout final : QwenHybridLayout<8> {
   static constexpr std::string_view layerMagic = "MDFM0001";
   static constexpr std::string_view headMagic = "MDFM0002";
+  // A layer's routed experts, which a target prepared from MLX keeps in a
+  // file of their own (AffineTarget.cpp).
+  static constexpr std::string_view expertsMagic = "MDFM0003";
   static constexpr QwenFfnKind ffnKind = QwenFfnKind::SparseMoe;
 
   uint32_t experts = 256;

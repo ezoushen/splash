@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace splash::model {
 
@@ -22,12 +23,15 @@ public:
   AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
                      const Qwen3_6MoeLayout &layout, PreparationCheck admitConversion = {});
   ~AffineTargetLoader();
-  // Every image's cache identity and size, layers first, for the model's
+  // Every image's cache identity and size, in the order a load opens them
+  // (layers first, each MoE layer followed by its experts), for the model's
   // disk check before the first image is written.
   [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept;
   // Writes every missing image and maps none.
   void prepare();
   [[nodiscard]] WeightFile layer(uint32_t index);
+  // A sparse MoE layer's routed experts, which its layer file does not hold.
+  [[nodiscard]] WeightFile experts(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
 private:
@@ -37,8 +41,9 @@ private:
 
 [[nodiscard]] uint64_t preparedAffineBytes(const Qwen3_8Layout &layout);
 [[nodiscard]] uint64_t preparedAffineBytes(const Qwen3_6MoeLayout &layout);
-// The planned image of target layer `layer`: its sections at their offsets.
-[[nodiscard]] affine::Image affineLayerImage(const Qwen3_8Layout &layout, uint32_t layer);
-[[nodiscard]] affine::Image affineLayerImage(const Qwen3_6MoeLayout &layout, uint32_t layer);
+// The planned images of target layer `layer`, its sections at their offsets:
+// the layer's, then a sparse MoE layer's routed experts'.
+[[nodiscard]] std::vector<affine::Image> affineLayerImages(const Qwen3_8Layout &layout, uint32_t layer);
+[[nodiscard]] std::vector<affine::Image> affineLayerImages(const Qwen3_6MoeLayout &layout, uint32_t layer);
 
 } // namespace splash::model
