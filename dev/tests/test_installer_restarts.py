@@ -12,6 +12,7 @@ from unittest import mock
 import httpx
 
 from dev.benchmarks import prepared
+from dev.tests.fixture_files import write_gguf, write_safetensors
 from dev.tests.installer_fixtures import (
     DENSE,
     DRAFT_COMMIT,
@@ -92,15 +93,18 @@ def gguf_bytes(data):
     return header + bytes(-len(header) % 64) + data
 
 
-def prepared_entry(weights, key, component, inputs):
+def prepared_entry(weights, key, component, inputs, tensors=None):
     """A weight cache entry at key that records its component and inputs,
-    and what loaded_entries names of it."""
+    and the tensor digests it lists when tensors is given, and what
+    loaded_entries names of it."""
     directory = weights / key
     directory.mkdir(parents=True)
     (directory / "source").write_text(
         f"{prepared.PROVENANCE}\ncomponent {component}\ninputs {inputs}\n"
         "source /elsewhere\n"
     )
+    if tensors is not None:
+        (directory / "tensors").write_text("".join(f"{t}\n" for t in tensors))
     digest = hashlib.sha256(key.encode()).hexdigest()
     (directory / "sha256").write_text(digest)
     return {"component": component, "sha256": digest}
@@ -214,16 +218,17 @@ class InstallerRestartsTest(unittest.TestCase):
         weights = self.root / "weights"
         (weights / "verified").mkdir(parents=True)
 
-        def entry(key, component, inputs=None):
-            data = b"draft" if component.startswith("draft/") else b"data"
-            return prepared_entry(
-                weights, key, component, inputs or source_inputs(data)
-            )
+        def entry(key, component, data=None):
+            """An entry of the one tensor of data, by default the tensor data
+            of the installation's source the component reads."""
+            data = data or (b"draft" if component.startswith("draft/") else b"data")
+            tensors = [hashlib.sha256(data).hexdigest()]
+            return prepared_entry(weights, key, component, source_inputs(data), tensors)
 
         names = components(DENSE)
         expected = [entry(f"{i:064x}", name) for i, name in enumerate(names)]
         # Another model's preparation of a component is not this one's.
-        entry("f" * 64, "target/layer-0.bin", inputs="0" * 64)
+        entry("f" * 64, "target/layer-0.bin", b"other")
         self.assertEqual(restarts.loaded_entries(chosen.link, weights), expected)
         entry("e" * 64, "target/layer-0.bin")
         with self.assertRaisesRegex(
@@ -231,20 +236,79 @@ class InstallerRestartsTest(unittest.TestCase):
         ):
             restarts.loaded_entries(chosen.link, weights)
         shutil.rmtree(weights / ("e" * 64))
-        (weights / f"{names.index('target/head.bin'):064x}" / "source").write_text(
-            f"{prepared.PROVENANCE}\ncomponent target/head.bin\ninputs {'1' * 64}\n"
-            "source /elsewhere\n"
+        # The tensors an entry lists decide, whatever its inputs.
+        (weights / f"{names.index('target/head.bin'):064x}" / "tensors").write_text(
+            f"{'1' * 64}\n"
         )
         with self.assertRaisesRegex(
             restarts.RestartFailure, "holds no prepared target/head.bin"
         ):
             restarts.loaded_entries(chosen.link, weights)
 
+    def test_prepared_joins_entries_on_the_tensors_they_list(self):
+        # A base and its fine-tune, each with two tensors in its target
+        # shard and in its draft's, share one cache. The fine-tune changed x:
+        # its layer 0, which reads y alone, and its draft are the base's.
+        weights = self.root / "weights"
+
+        def installation(name, x):
+            link = self.root / name
+            for directory, tensors in (
+                ("target", {"x": ([4], "U8", x), "y": ([4], "U8", b"yyyy")}),
+                ("draft", {"d": ([5], "U8", b"draft"), "e": ([4], "U8", b"eeee")}),
+            ):
+                (link / directory).mkdir(parents=True)
+                write_safetensors(link / directory / "model.safetensors", tensors)
+            files = {"target/model.safetensors": {}, "draft/model.safetensors": {}}
+            (link / "model.json").write_text(
+                json.dumps(
+                    {"family": DENSE.name, "vision_format": "none", "files": files}
+                )
+            )
+            return link
+
+        def entry(key, component, *data):
+            digests = sorted(hashlib.sha256(d).hexdigest() for d in data)
+            inputs = hashlib.sha256("".join(digests).encode()).hexdigest()
+            return prepared_entry(weights, key, component, inputs, digests)
+
+        base, tuned = installation("base", b"base"), installation("tuned", b"tune")
+        expected = {base: [], tuned: []}
+        for index, name in enumerate(components(DENSE)):
+            if name.startswith("draft/") or name == "target/layer-0.bin":
+                data = (b"draft", b"eeee") if name.startswith("draft/") else (b"yyyy",)
+                shared = entry(f"{index:064x}", name, *data)
+                expected[base].append(shared)
+                expected[tuned].append(shared)
+            else:
+                expected[base].append(entry(f"{index:064x}", name, b"base", b"yyyy"))
+                expected[tuned].append(
+                    entry(f"{index + 100:064x}", name, b"tune", b"yyyy")
+                )
+        for link in (base, tuned):
+            self.assertEqual(restarts.loaded_entries(link, weights), expected[link])
+
     def test_a_gguf_digest_starts_at_the_aligned_tensor_data(self):
         path = self.root / "model.gguf"
         path.write_bytes(gguf_bytes(b"abcd"))
         self.assertEqual(
-            restarts.data_digest(path), hashlib.sha256(b"abcd").hexdigest()
+            restarts.source_digests(path, False)[0], hashlib.sha256(b"abcd").hexdigest()
+        )
+
+    def test_an_mmproj_tensor_digest_is_its_bytes_after_the_aligned_table(self):
+        # An F32 tensor and a BF16 one, each padded to the 32-byte alignment.
+        path = write_gguf(
+            self.root / "mmproj.gguf",
+            {"general.architecture": "clip"},
+            [("a", [2], 0, b"aaaaaaaa"), ("b", [3, 1], 30, b"bbbbbb")],
+        )
+        data = b"aaaaaaaa" + bytes(24) + b"bbbbbb" + bytes(26)
+        self.assertEqual(
+            restarts.source_digests(path),
+            (
+                hashlib.sha256(data).hexdigest(),
+                {hashlib.sha256(t).hexdigest() for t in (b"aaaaaaaa", b"bbbbbb")},
+            ),
         )
 
     def test_prepared_reads_a_gguf_source_through_its_assembly_link(self):

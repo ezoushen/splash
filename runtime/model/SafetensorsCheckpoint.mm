@@ -66,7 +66,8 @@ SourceTensor tensorRecord(NSDictionary *record, const WeightSource &file, uint64
 }
 
 // Adds the tensors of a shard's header to tensors, whose count and the
-// checkpoint's metadataBytes are bounded, and sets where its data starts.
+// checkpoint's metadataBytes are bounded, and to file, and sets where its
+// data starts.
 void indexShard(WeightSource &file, TensorIndex &tensors, uint64_t &metadataBytes) {
   if (file.bytes() < 8) throw WeightStoreError("truncated safetensors file");
   uint64_t headerBytes = 0;
@@ -86,6 +87,7 @@ void indexShard(WeightSource &file, TensorIndex &tensors, uint64_t &metadataByte
     if (tensors.size() == 16384) throw WeightStoreError("source tensor metadata exceeds bounds");
     SourceTensor tensor = tensorRecord(index[key], file, file.bytes() - file.dataOffset());
     if (tensor.bytes) ranges.emplace_back(tensor.offset, tensor.offset + tensor.bytes);
+    file.addTensor(tensor.offset, tensor.bytes);
     const std::string name = [key UTF8String];
     if (!tensors.emplace(name, std::move(tensor)).second)
       throw WeightStoreError("duplicate source tensor: " + name);

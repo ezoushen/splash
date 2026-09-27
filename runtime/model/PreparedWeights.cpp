@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <limits>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <sstream>
@@ -154,15 +155,13 @@ std::string verificationRecord(std::string_view key, std::string_view digest) {
   return std::string(digest) + weightDigest(std::string(key) + std::string(digest));
 }
 
-void rememberDigest(const std::filesystem::path &root, const struct stat &state, uint64_t from,
-                    const std::string &digest) {
+void remember(const std::filesystem::path &root, const std::string &key, std::string_view record) {
   const auto directory = root / "verified";
   std::filesystem::create_directories(directory);
-  const auto key = verificationKey(state, from);
   std::string temporary = (directory / ".pending-XXXXXX").string();
   Descriptor file(mkstemp(temporary.data()));
   try {
-    writeSmallFile(file, verificationRecord(key, digest), "flush weight verification");
+    writeSmallFile(file, record, "flush weight verification");
     std::filesystem::rename(temporary, directory / key);
   } catch (...) {
     unlink(temporary.c_str());
@@ -170,10 +169,15 @@ void rememberDigest(const std::filesystem::path &root, const struct stat &state,
   }
 }
 
-// The digest a valid proof remembers for bytes [from, end) of the file of
-// state; empty when none does.
-std::string provenDigest(const struct stat &state, uint64_t from, const std::filesystem::path &root) {
+void rememberDigest(const std::filesystem::path &root, const struct stat &state, uint64_t from,
+                    const std::string &digest) {
   const auto key = verificationKey(state, from);
+  remember(root, key, verificationRecord(key, digest));
+}
+
+// The value, digests of 64 hex digits, that the valid record `key` of `bytes`
+// bytes remembers; empty when none does.
+std::string remembered(const std::filesystem::path &root, const std::string &key, uint64_t bytes) {
   const int existing = open((root / "verified" / key).c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
   if (existing < 0) {
     if (errno != ENOENT) fail("open weight verification");
@@ -181,13 +185,19 @@ std::string provenDigest(const struct stat &state, uint64_t from, const std::fil
   }
   Descriptor proof(existing);
   struct stat info{};
-  if (fstat(proof, &info) || !S_ISREG(info.st_mode) || info.st_size != 128) return {};
-  std::array<uint8_t, 128> bytes;
-  readWeightBytes(proof, 0, bytes);
-  const std::string record(bytes.begin(), bytes.end());
-  const auto value = record.substr(0, 64);
+  if (fstat(proof, &info) || !S_ISREG(info.st_mode) || info.st_size < 0 || uint64_t(info.st_size) != bytes)
+    return {};
+  std::string record(bytes, '\0');
+  readWeightBytes(proof, 0, {reinterpret_cast<uint8_t *>(record.data()), record.size()});
+  const auto value = record.substr(0, bytes - 64);
   if (value.find_first_not_of("0123456789abcdef") != value.npos || verificationRecord(key, value) != record) return {};
   return value;
+}
+
+// The digest a valid proof remembers for bytes [from, end) of the file of
+// state; empty when none does.
+std::string provenDigest(const struct stat &state, uint64_t from, const std::filesystem::path &root) {
+  return remembered(root, verificationKey(state, from), 128);
 }
 
 // The content hash is computed on first use. A proof is reusable only for the
@@ -213,10 +223,71 @@ std::string verifiedDigest(int fd, uint64_t from, const std::filesystem::path &p
   return digest;
 }
 
+// Each tensor's range [offset, offset + size) of a source's tensor data and,
+// once hashed, its digest.
+using TensorDigests = std::map<std::pair<uint64_t, uint64_t>, std::string>;
+
+// A source's table of tensor digests names their ranges of its data from
+// `from` and holds for the file of state only, as a proof does.
+std::string tableKey(const struct stat &state, uint64_t from, const TensorDigests &tensors) {
+  std::ostringstream identity;
+  identity << "splash-tensor-digests-v1 " << verificationKey(state, from);
+  for (const auto &[range, digest] : tensors) identity << ' ' << range.first << ' ' << range.second;
+  return weightDigest(identity.str());
+}
+
+// The SHA-256 of each tensor of fd's data from `from`, concatenated in file
+// order: one pass.
+std::string tensorTable(int fd, uint64_t from, const TensorDigests &tensors, const PreparationCheck &check) {
+  std::vector<uint8_t> buffer(1024 * 1024);
+  std::string table;
+  for (const auto &[range, digest] : tensors) {
+    const auto [offset, size] = range;
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    for (uint64_t at = 0; at < size; at += buffer.size()) {
+      run(check);
+      const auto part = std::span(buffer).first(std::min<uint64_t>(buffer.size(), size - at));
+      readWeightBytes(fd, from + offset + at, part);
+      CC_SHA256_Update(&context, part.data(), static_cast<CC_LONG>(part.size()));
+    }
+    unsigned char value[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(value, &context);
+    table += hex(value);
+  }
+  return table;
+}
+
+// The tensor digests of a source file, like its digest: hashed on first use
+// and remembered for the unmodified file, so a warm start reads the table
+// and no tensor data.
+std::string verifiedTensors(int fd, uint64_t from, const TensorDigests &tensors, const std::filesystem::path &path,
+                            const std::filesystem::path &root, const PreparationCheck &check) {
+  run(check);
+  struct stat before{}, after{};
+  if (fstat(fd, &before)) fail("stat verified weights");
+  if (!S_ISREG(before.st_mode) || before.st_size < 0) throw std::runtime_error("weights must be a regular file");
+  const auto key = tableKey(before, from, tensors);
+  std::string table = remembered(root, key, 64 * (tensors.size() + 1));
+  const bool missing = table.empty();
+  if (missing) {
+    std::clog << "Hashing the tensors of " << path.string() << " (" << (uint64_t(before.st_size) - from) / (1024 * 1024)
+              << " MiB) once; later starts reuse the result" << std::endl;
+    table = tensorTable(fd, from, tensors, check);
+  }
+  if (fstat(fd, &after)) fail("stat verified weights after read");
+  if (!sameFile(before, after)) throw std::runtime_error("weight file changed during verification");
+  if (missing) remember(root, key, verificationRecord(key, table));
+  return table;
+}
+
 // What an entry records in its source file: the component, the digest of the
-// source data it was written from and the source path. Entries of earlier
-// versions recorded only the source path and the file name.
-constexpr std::string_view kProvenance = "splash-prepared-weight-v1";
+// source data it was written from and the source path. The first version
+// recorded the same fields for inputs located in their shards (a digest of
+// each shard's tensor data); earlier versions recorded only the source path
+// and the file name.
+constexpr std::string_view kProvenance = "splash-prepared-weight-v2";
+constexpr std::string_view kShardProvenance = "splash-prepared-weight-v1";
 
 std::string provenance(const PreparedWeight &weight) {
   std::ostringstream text;
@@ -233,14 +304,35 @@ std::vector<std::string> sourceLines(const std::filesystem::path &directory) {
   return lines;
 }
 
+// Whether an entry is an earlier preparation of a file's component, or one
+// that every file of the file's source path supersedes.
+enum class Superseded { No, Component, Source };
+
 // Whether an entry whose source file starts with `lines` is an earlier
-// preparation of what weight holds: the same component from the same source
-// data under another key (a new preparation identity or plan), or an entry of
-// an earlier version prepared from the same source path.
-bool supersedes(const PreparedWeight &weight, std::span<const std::string> lines) {
+// preparation of what weight holds: the same component under another key (a
+// new preparation identity or plan) from the same source data, whichever
+// model it was prepared for, or from the same source path, an immutable
+// snapshot whose tensors a changed planner may read otherwise; or an entry
+// of an earlier version prepared from the same source path. No file keyed by
+// its tensors can reuse a first-version entry, so it supersedes the one of its
+// component from any path (a re-assembly moves a model's root while its blobs
+// stay), and every one of its own path, whatever its component: the model may
+// now reuse another's entry for it. A GGUF target's inputs are located in its
+// file as the first version's were, so a first-version entry prepared from a
+// GGUF file is current and stays, and its entries of other components are
+// still its own.
+Superseded supersedes(const PreparedWeight &weight, std::span<const std::string> lines) {
+  const bool component = lines.size() == 4 && lines[1] == "component " + weight.component;
+  const bool sameData = component && lines[2] == "inputs " + weight.inputs;
+  const bool samePath = lines.size() == 4 && lines[3] == "source " + weight.source;
   if (lines.size() == 4 && lines[0] == kProvenance)
-    return lines[1] == "component " + weight.component && lines[2] == "inputs " + weight.inputs;
-  return lines.size() == 2 && lines[0] == weight.source;
+    return sameData || (component && samePath) ? Superseded::Component : Superseded::No;
+  if (lines.size() == 4 && lines[0] == kShardProvenance) {
+    if (weight.tensors.empty()) return sameData ? Superseded::Component : Superseded::No;
+    if (component && !lines[3].ends_with(".gguf")) return Superseded::Component;
+    return samePath ? Superseded::Source : Superseded::No;
+  }
+  return lines.size() == 2 && lines[0] == weight.source ? Superseded::Source : Superseded::No;
 }
 
 // Removes a complete entry. Its directory is first renamed to staging, which
@@ -293,7 +385,8 @@ bool complete(const std::filesystem::path &directory, uint64_t bytes,
 }
 
 // Writes the file of weight into staging and seals it: read-only, flushed to
-// the drive, its digest remembered and recorded beside it with its provenance.
+// the drive, its digest remembered and recorded beside it with its provenance
+// and any tensors it lists.
 void writeStaged(const std::filesystem::path &root, const std::filesystem::path &staging, const PreparedWeight &weight,
                  const WeightWriter &write, const PreparationGuards &guards) {
   Descriptor file(open((staging / "weights").c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
@@ -326,6 +419,11 @@ void writeStaged(const std::filesystem::path &root, const std::filesystem::path 
                  digest, "flush prepared weight digest");
   writeSmallFile(Descriptor(open((staging / "source").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400)),
                  provenance(weight), "flush prepared weight source");
+  if (weight.tensors.empty()) return;
+  std::string tensors;
+  for (const auto &digest : weight.tensors) tensors += digest + '\n';
+  writeSmallFile(Descriptor(open((staging / "tensors").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400)),
+                 tensors, "flush prepared weight tensors");
 }
 
 // Renames the sealed staging entry to its key. Invalid cached generations may
@@ -345,31 +443,42 @@ void evictSuperseded(const std::filesystem::path &root, const PreparedWeight &we
   std::error_code error;
   for (const auto &entry : std::filesystem::directory_iterator(root, error)) {
     const auto name = entry.path().filename().string();
-    if (name != weight.key && isKey(name) && supersedes(weight, sourceLines(entry.path())))
+    if (name != weight.key && isKey(name) && supersedes(weight, sourceLines(entry.path())) != Superseded::No)
       removeEntry(root, entry.path());
   }
 }
 
 // The free space preparing the missing weights needs. Publishing a file
 // evicts the entries it supersedes (evictSuperseded), each credited here to
-// one file, so the model needs what its files add beyond those entries, plus
-// the largest file written while the entries it replaces remain. Other
-// generations stay and are not credited.
+// one file: the file of its component, or, for an entry every file of a
+// source path supersedes, which the first of them evicts, a share of that
+// path's pool spread over its files, each up to its size. The model needs
+// what its files add beyond those entries, plus the largest file written
+// while the entries it replaces remain. Other generations stay and are not
+// credited.
 uint64_t requiredBytes(const std::filesystem::path &root, std::span<const PreparedWeight *const> missing,
                        const PreparationCheck &check) {
   std::vector<uint64_t> evicted(missing.size());
+  std::map<std::string, uint64_t> pooled;
   for (const auto &entry : std::filesystem::directory_iterator(root)) {
     run(check);
     const auto name = entry.path().filename().string();
     struct stat state{};
     if (!isKey(name) || lstat((entry.path() / "weights").c_str(), &state) || !S_ISREG(state.st_mode)) continue;
     const auto lines = sourceLines(entry.path());
-    for (size_t i = 0; i < missing.size(); ++i)
-      if (name != missing[i]->key && supersedes(*missing[i], lines)) {
-        evicted[i] += uint64_t(state.st_size);
-        break;
-      }
+    for (size_t i = 0; i < missing.size(); ++i) {
+      const Superseded superseded = name == missing[i]->key ? Superseded::No : supersedes(*missing[i], lines);
+      if (superseded == Superseded::No) continue;
+      (superseded == Superseded::Component ? evicted[i] : pooled[missing[i]->source]) += uint64_t(state.st_size);
+      break;
+    }
   }
+  for (size_t i = 0; i < missing.size(); ++i)
+    if (const auto pool = pooled.find(missing[i]->source); pool != pooled.end()) {
+      const uint64_t share = std::min(pool->second, missing[i]->bytes - std::min(missing[i]->bytes, evicted[i]));
+      evicted[i] += share;
+      pool->second -= share;
+    }
   uint64_t added = 0, largest = 0;
   for (size_t i = 0; i < missing.size(); ++i) {
     const uint64_t replacing = std::min(missing[i]->bytes, evicted[i]);
@@ -433,6 +542,7 @@ struct WeightSource::Impl {
   uint64_t dataOffset = 0;
   // The tensor data's digest, once hashed.
   std::optional<std::string> digest;
+  TensorDigests tensors;
   Impl(const std::filesystem::path &path, PreparationCheck check)
       : path(path), file(openSource(path)), check(std::move(check)) {
     if (fstat(file, &state)) failSource("stat weight source", path);
@@ -450,6 +560,7 @@ void WeightSource::setDataOffset(uint64_t offset) {
   impl_->dataOffset = offset;
 }
 uint64_t WeightSource::dataOffset() const noexcept { return impl_->dataOffset; }
+void WeightSource::addTensor(uint64_t offset, uint64_t bytes) { impl_->tensors.try_emplace({offset, bytes}); }
 void WeightSource::readData(uint64_t offset, std::span<uint8_t> bytes) const {
   if (offset > std::numeric_limits<uint64_t>::max() - impl_->dataOffset)
     throw std::overflow_error("weight read offset overflow");
@@ -459,6 +570,17 @@ const std::string &WeightSource::digest() const {
   if (!impl_->digest)
     impl_->digest = verifiedDigest(impl_->file, impl_->dataOffset, impl_->path, cacheRoot(), impl_->check);
   return *impl_->digest;
+}
+const std::string &WeightSource::tensorDigest(uint64_t offset, uint64_t bytes) const {
+  const auto found = impl_->tensors.find({offset, bytes});
+  if (found == impl_->tensors.end()) throw std::logic_error("source tensor was not added: " + impl_->path.string());
+  if (found->second.empty()) {
+    const std::string table =
+        verifiedTensors(impl_->file, impl_->dataOffset, impl_->tensors, impl_->path, cacheRoot(), impl_->check);
+    size_t at = 0;
+    for (auto &[range, digest] : impl_->tensors) digest = table.substr(at++ * 64, 64);
+  }
+  return found->second;
 }
 void WeightSource::checkUnchanged() const {
   struct stat current{};
@@ -485,12 +607,24 @@ void SourceTensor::copy(int destination, uint64_t to, std::span<uint8_t> staging
   }
 }
 
-void SourceTensor::identify(WeightIdentity &identity) const { identity.input(*file, offset, bytes, dtype, shape); }
+void SourceTensor::identify(WeightIdentity &identity) const {
+  identity.input(file->tensorDigest(offset, bytes), bytes, dtype, shape);
+}
+
+WeightIdentity &WeightIdentity::input(std::string_view digest, uint64_t bytes, std::string_view type,
+                                      std::span<const uint64_t> shape) {
+  digests_.emplace(digest);
+  text_ << "input " << digest << ' ' << bytes << ' ' << type;
+  for (uint64_t dimension : shape) text_ << ' ' << dimension;
+  text_ << '\n';
+  return *this;
+}
 
 WeightIdentity &WeightIdentity::input(const WeightSource &source, uint64_t offset, uint64_t bytes,
                                       std::string_view type, std::span<const uint64_t> shape) {
   const std::string &digest = source.digest();
   digests_.insert(digest);
+  located_ = true;
   text_ << "input " << digest << ' ' << offset << ' ' << bytes << ' ' << type;
   for (uint64_t dimension : shape) text_ << ' ' << dimension;
   text_ << '\n';
@@ -500,7 +634,10 @@ WeightIdentity &WeightIdentity::input(const WeightSource &source, uint64_t offse
 PreparedWeight WeightIdentity::weight(uint64_t bytes, std::string component, std::string source) const {
   std::string inputs;
   for (const auto &digest : digests_) inputs += digest;
-  return {weightDigest(text_.str()), bytes, std::move(component), weightDigest(inputs), std::move(source)};
+  std::vector<std::string> tensors;
+  if (!located_) tensors.assign(digests_.begin(), digests_.end());
+  return {weightDigest(text_.str()), bytes, std::move(component), weightDigest(inputs), std::move(source),
+          std::move(tensors)};
 }
 
 void requireWeightDiskSpace(uint64_t available, uint64_t required) {

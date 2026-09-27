@@ -29,12 +29,15 @@ using PreparationCheck = std::function<void()>;
 // target/layer-0.bin), the digest of the source data it is written from and
 // where that source is. An entry of the same component and inputs under
 // another key is an earlier preparation, which publishing this one removes.
+// A file keyed by the content of its source tensors lists their sorted
+// digests, whose digest its inputs are.
 struct PreparedWeight {
   std::string key;
   uint64_t bytes;
   std::string component;
   std::string inputs;
   std::string source;
+  std::vector<std::string> tensors{};
 };
 
 void readWeightBytes(int descriptor, uint64_t offset, std::span<uint8_t> bytes);
@@ -43,11 +46,12 @@ void writeWeightBytes(int descriptor, uint64_t offset, std::span<const uint8_t> 
 [[nodiscard]] std::string weightDigest(std::string_view text);
 
 // A source file, opened once; checkUnchanged throws when it was modified or
-// replaced since. Its parser reads the metadata through descriptor() and
-// sets where the tensor data starts; tensor offsets are relative to it. The
-// digest of the tensor data is computed on first use, after the parser has
-// validated the metadata, and remembered for this file identity, so a warm
-// start does not read the file again.
+// replaced since. Its parser reads the metadata through descriptor(), sets
+// where the tensor data starts, to which tensor offsets are relative, and
+// adds every tensor it indexes. The digest of the tensor data and those of
+// its tensors are computed on first use, after the parser has validated the
+// metadata, and remembered for this file identity, so a warm start does not
+// read the file again.
 class WeightSource final {
 public:
   explicit WeightSource(const std::filesystem::path &path, PreparationCheck check = {});
@@ -60,11 +64,16 @@ public:
   [[nodiscard]] uint64_t bytes() const noexcept;
   void setDataOffset(uint64_t offset);
   [[nodiscard]] uint64_t dataOffset() const noexcept;
+  // Bytes [offset, offset + bytes) of the tensor data hold a tensor.
+  void addTensor(uint64_t offset, uint64_t bytes);
   // Bytes [offset, offset + size) of the tensor data.
   void readData(uint64_t offset, std::span<uint8_t> bytes) const;
   // SHA-256 of the tensor data: editing only the metadata keeps the identity
   // of every tensor.
   [[nodiscard]] const std::string &digest() const;
+  // SHA-256 of the added tensor at bytes [offset, offset + bytes) of the
+  // tensor data. The first request hashes every added tensor, in one pass.
+  [[nodiscard]] const std::string &tensorDigest(uint64_t offset, uint64_t bytes) const;
   void checkUnchanged() const;
 private:
   struct Impl;
@@ -100,8 +109,9 @@ concept IdentityField =
 
 // What a prepared file's key is the SHA-256 of: the adapter's preparation
 // identity, its plan as one record per line, and every source tensor it
-// reads, by the digest of its file's tensor data, its offset there, size,
-// type and shape.
+// reads, by the digest of its own bytes, its size, type and shape, wherever
+// its file stores it. A GGUF target's row ranges are recorded by the digest
+// of their file's tensor data and their offset there.
 class WeightIdentity final {
 public:
   explicit WeightIdentity(std::string_view preparation) { text_ << preparation << '\n'; }
@@ -110,6 +120,9 @@ public:
     text_ << '\n';
     return *this;
   }
+  // A tensor, by the SHA-256 of its bytes.
+  WeightIdentity &input(std::string_view digest, uint64_t bytes, std::string_view type,
+                        std::span<const uint64_t> shape);
   // Bytes [offset, offset + bytes) of source's tensor data.
   WeightIdentity &input(const WeightSource &source, uint64_t offset, uint64_t bytes, std::string_view type,
                         std::span<const uint64_t> shape);
@@ -127,6 +140,8 @@ private:
   }
   std::ostringstream text_;
   std::set<std::string> digests_;
+  // Whether an input is located in its file rather than a tensor.
+  bool located_ = false;
 };
 
 // The callbacks of one load. check runs throughout (cancellation, memory

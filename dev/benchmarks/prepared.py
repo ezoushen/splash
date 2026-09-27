@@ -1,6 +1,7 @@
 """The prepared weights of two builds, compared by their bytes.
 
-A weight cache entry is <cache>/<key>/{weights, sha256, source}. Its key
+A weight cache entry is <cache>/<key>/{weights, sha256, source}, and tensors
+for an entry keyed by the content of its source tensors. Its key
 hashes the build's preparation identity (build/engine/
 WeightPreparationIdentity.hpp), so builds of different identities never share
 an entry, and two such builds sharing one cache supersede each other's entries
@@ -18,7 +19,9 @@ import re
 from pathlib import Path
 
 IDENTITY_HEADER = Path("engine/WeightPreparationIdentity.hpp")
-PROVENANCE = "splash-prepared-weight-v1"
+PROVENANCE = "splash-prepared-weight-v2"
+# The first version's inputs digest whole shards, not source tensors.
+PROVENANCES = ("splash-prepared-weight-v1", PROVENANCE)
 DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
@@ -52,8 +55,9 @@ def cache_root(environment) -> Path:
 def entries(root: Path) -> list[dict]:
     """The complete entries of the cache at root: key and sha256 of the
     prepared bytes, plus component, inputs and source when the entry
-    records its provenance; an entry of an earlier version records only
-    its source."""
+    records its provenance, and tensors, the digests of the source tensors
+    it reads, when it lists them; an entry of an earlier version records
+    only its source."""
     records = []
     try:
         directories = sorted(Path(root).iterdir())
@@ -73,7 +77,7 @@ def entries(root: Path) -> list[dict]:
             lines = (directory / "source").read_text().splitlines()
         except FileNotFoundError:
             lines = []
-        if len(lines) == 4 and lines[0] == PROVENANCE:
+        if len(lines) == 4 and lines[0] in PROVENANCES:
             for line, field in zip(lines[1:], ("component", "inputs", "source")):
                 name, _, value = line.partition(" ")
                 if name == field:
@@ -81,6 +85,10 @@ def entries(root: Path) -> list[dict]:
         elif len(lines) == 2:
             # Earlier versions recorded the source path and the file name.
             record["source"] = lines[0]
+        try:
+            record["tensors"] = (directory / "tensors").read_text().splitlines()
+        except FileNotFoundError:
+            pass
         records.append(record)
     return records
 

@@ -99,6 +99,36 @@ class PreparedBytesTests(unittest.TestCase):
             self.assertEqual(len(failures), 2, failures)
             self.assertIn("8" * 64, failures[1])
 
+    def test_entries_of_both_provenance_versions_record_their_inputs(self):
+        # The first version's inputs digest whole shards, this version's the
+        # source tensors, which its entry lists; both name what compare joins
+        # on.
+        with TemporaryDirectory() as directory:
+            cache = Path(directory)
+            for key, version in (("1" * 64, 1), ("2" * 64, 2)):
+                (cache / key).mkdir()
+                (cache / key / "sha256").write_text("a" * 64)
+                (cache / key / "source").write_text(
+                    f"splash-prepared-weight-v{version}\ncomponent target/head.bin\n"
+                    f"inputs {str(version) * 64}\nsource {PACKAGE}\n"
+                )
+            (cache / ("2" * 64) / "tensors").write_text(f"{'b' * 64}\n{'c' * 64}\n")
+            self.assertEqual(
+                [
+                    (
+                        record["component"],
+                        record["inputs"],
+                        record["source"],
+                        record.get("tensors"),
+                    )
+                    for record in prepared.entries(cache)
+                ],
+                [
+                    ("target/head.bin", "1" * 64, str(PACKAGE), None),
+                    ("target/head.bin", "2" * 64, str(PACKAGE), ["b" * 64, "c" * 64]),
+                ],
+            )
+
     def test_a_baseline_of_another_identity_gets_its_own_cache(self):
         with TemporaryDirectory() as directory:
             output = Path(directory).resolve() / "release/model"

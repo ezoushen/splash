@@ -402,36 +402,57 @@ before anything is written, the factory (`ModelFactory.cpp`) constructs the
 vision tower's loader (`planVisionLoader`, which the vision encoder test
 shares), the draft's and the target's, and checks once for the space their
 missing files add beyond the entries they supersede (below), plus the largest
-file written while the entry it replaces remains, plus the reserve. After a
-preparation-identity change, preparing thus needs little more than its largest
-file. Uninstalling a model does not delete possibly shared prepared weights.
-With Splash stopped, entry directories can be deleted; deleting the whole cache
-causes preparation at the next load.
+file written while the entry it replaces remains, plus the reserve. Entries that
+every file of a source path supersedes, which its first published file removes,
+are credited to that path's files together. After a preparation-identity change,
+preparing thus needs little more than its largest file. Uninstalling a model
+does not delete possibly shared prepared weights. With Splash stopped, entry
+directories can be deleted; deleting the whole cache causes preparation at the
+next load.
 
 A prepared file's key hashes its adapter's preparation identity, its plan, and
-the bytes, type and shape of every source tensor it reads, located and hashed
-within its file's tensor data. An edit to a source's metadata only (a GGUF chat
-template, a safetensors header), `config.json` or files the component does not
-read keeps every key. The preparation identity is a build-generated fingerprint
-of only the code that writes the bytes, the files listed per adapter in
-`INPUTS` of `dev/tools/weight_preparation_identity.py`; inference, parser,
+the digest of the bytes, size, type and shape of every source tensor it reads,
+wherever its file stores them. The same tensor in another shard, at another
+offset or in another model's checkpoint keeps the key, so a fine-tune and its
+base share the files of the tensors the fine-tune left unchanged. An edit to a
+source's metadata only (a GGUF chat template, a safetensors header),
+`config.json`, or tensors or files the component does not read keeps every key.
+A GGUF target's images are the exception: they read row ranges, often parts of
+tensors, located and hashed within the file's tensor data, so any edit to that
+data prepares every image again. The preparation identity is a build-generated
+fingerprint of only the code that writes the bytes, the files listed per adapter
+in `INPUTS` of `dev/tools/weight_preparation_identity.py`; inference, parser,
 planner and reader changes keep it. The hashes of the images prepared from the
 test fixtures, in `dev/tests/fixtures/weight-goldens/goldens.json`, fail the
 tests on any change of prepared bytes. The README beside it gives the
 procedure for an intended change: the key the new bytes need, and the order in
 which the independent layout oracles and the hashes are updated.
 
-Each entry records in `source` its component (such as `target/layer-0.bin`),
-the digest of the source data it was written from and the source path.
-Publishing an entry removes the complete entries it supersedes: the same
-component from the same source data under another key, which an earlier
-preparation identity wrote, and entries of earlier Splash versions prepared from
-the same source path. Entries of other sources or revisions, which
-installations may share, stay. Removal happens under the converter lock, so no
-entry being written is touched, and a running process keeps the files it has
-mapped until it unmaps them. Two builds of different preparation identities
-sharing one cache supersede each other's entries at every start; give a
-development build its own `SPLASH_WEIGHT_CACHE`.
+Each entry records in `source` its component (such as `target/layer-0.bin`), the
+digest of the sorted digests of the source tensors it was written from (of its
+file's tensor data for a GGUF target) and the source path of the model that
+prepared it. An entry of source tensors also lists their digests in `tensors`,
+one per line, by which the release check finds the entries an installation
+loads. Publishing an entry removes the complete entries it supersedes: the same
+component under another key, which an earlier preparation identity wrote, from
+the same source data for any model or from the same source path, whose tensors a
+changed planner may read otherwise, and entries of earlier Splash versions
+prepared from the same source path. No entry of source tensors can reuse an
+entry of the first provenance version (`splash-prepared-weight-v1`), whose
+inputs named whole shards, so it also removes the first-version entry of its
+component from any path, since a re-assembly moves a model's root while its
+files stay, and every first-version entry prepared from its own source path,
+whatever the component. A GGUF target's inputs did not change with that
+version, so first-version entries prepared from a GGUF file are current: a GGUF
+image removes only the one of its own component and inputs. Other entries of
+other sources or revisions stay, another model's preparation of a component
+from other tensors too. A model that reuses every file it needs, other models'
+among them, publishes nothing and keeps its first-version entries until it
+next publishes a file. Removal happens under the
+converter lock, so no entry being written is touched, and a running process
+keeps the files it has mapped until it unmaps them. Two builds of different
+preparation identities sharing one cache supersede each other's entries at every
+start; give a development build its own `SPLASH_WEIGHT_CACHE`.
 
 One writer per cache serializes conversion; complete cache hits bypass this
 lock. Each output's disk space is preallocated before writing. Interruption,
@@ -440,15 +461,17 @@ concurrent external disk activity can still exhaust the volume. Retrying removes
 abandoned writes under the converter lock and reuses previously completed
 files, which are read-only. Cold preparation reports each artifact's progress.
 
-Cold source hashing and output validation stream bounded buffers. Unchanged
-files reuse a digest proof tied to device, inode, size, birth time, mtime and
-ctime; a write or replacement invalidates it. This is not a full disk scrub on
-every startup. Preparation uses uncached destination I/O. Every adapter sizes
-its conversion steps to one staging bound, input and output together, of
-32 MiB (`kWeightPreparationStagingBytes`), whatever the tensor, layer or expert
-count, inside a 64 MiB admission reserve that also covers source metadata.
-Complete rows and multiple row tiles are processed together where possible,
-avoiding per-row I/O and small GPU waits. Startup runs two checks
+Cold source hashing and output validation stream bounded buffers. A source's
+tensors are hashed in one pass over its tensor data. Unchanged files reuse a
+digest proof, or a source's table of tensor digests, tied to device, inode,
+size, birth time, mtime and ctime; a write or replacement invalidates it, and a
+damaged one is computed again. This is not a full disk scrub on every startup.
+Preparation uses uncached destination I/O. Every adapter sizes its conversion
+steps to one staging bound, input and output together, of 32 MiB
+(`kWeightPreparationStagingBytes`), whatever the tensor, layer or expert count,
+inside a 64 MiB admission reserve that also covers source metadata. Complete
+rows and multiple row tiles are processed together where possible, avoiding
+per-row I/O and small GPU waits. Startup runs two checks
 (`RuntimeResources.mm`), both stopped by cancellation. `admitWeightPreparation`,
 which the loaders receive as `admitConversion`, admits the conversion workspace
 on a cache miss, before anything is allocated and again before each chunk: it

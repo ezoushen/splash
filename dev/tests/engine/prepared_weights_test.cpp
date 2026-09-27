@@ -8,11 +8,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -195,6 +198,131 @@ void supersededEntriesAreCredited(Cache &cache) {
   for (const auto &weight : earlier) std::filesystem::remove_all(cache.root / weight.key);
 }
 
+// A complete entry of the first provenance version at key(value), whose
+// sparse file is bytes long; its inputs are key(value) unless given.
+void firstVersionEntry(Cache &cache, uint8_t value, const std::string &component, const std::string &source,
+                       uint64_t bytes, const std::string &inputs = {}) {
+  const auto directory = cache.root / key(value);
+  std::filesystem::create_directory(directory);
+  splash::test::writeFile(directory / "weights", "");
+  std::filesystem::resize_file(directory / "weights", bytes);
+  splash::test::writeFile(directory / "source", "splash-prepared-weight-v1\ncomponent " + component + "\ninputs " +
+                                                    (inputs.empty() ? key(value) : inputs) + "\nsource " + source +
+                                                    "\n");
+}
+
+// Every first-version entry of a source path goes when the first file of
+// that path is published, so the disk check pools them and spreads them over
+// the path's missing files, each up to its size: two missing files, whatever
+// the entries' sizes and order, need room for one. A file larger than the
+// free space still does not fit.
+void firstVersionCreditIsPooledBySource(Cache &cache) {
+  constexpr uint64_t kReserve = uint64_t{2} << 30;
+  const uint64_t available = std::filesystem::space(cache.root).available;
+  const uint64_t size = (available - kReserve) / 5 * 4;
+  const std::string source = "/models/pooled";
+  firstVersionEntry(cache, 230, "model/a.bin", source, size / 2);
+  firstVersionEntry(cache, 231, "model/b.bin", source, size / 2 * 3);
+  const std::array<PreparedWeight, 2> model{{{key(232), size, "model/a.bin", key(233), source, {key(233)}},
+                                            {key(234), size, "model/b.bin", key(235), source, {key(235)}}}};
+  cache.store.requireSpace(model);
+  const std::array<PreparedWeight, 1> large{{{key(236), available, "model/c.bin", key(237), source, {key(237)}}}};
+  rejects([&] { cache.store.requireSpace(large); }, "not enough disk space", "a file larger than the free space fit");
+  for (uint8_t value : {230, 231}) std::filesystem::remove_all(cache.root / key(value));
+}
+
+// A re-assembly gives a model's root a new path while its blobs stay, so the
+// first version may have prepared the same components under another path. A
+// file keyed by its tensors removes the first-version entry of its component
+// from any path, and the disk check credits it to that file: two files, each
+// replacing an entry as large, need room for one. A GGUF target's
+// first-version entry of that component is current and stays, and so does an
+// entry of another component from another path.
+void firstVersionComponentsOfAnotherPathAreSuperseded(Cache &cache) {
+  constexpr uint64_t kReserve = uint64_t{2} << 30;
+  const uint64_t size = (std::filesystem::space(cache.root).available - kReserve) / 3 * 2;
+  const std::string earlier = "/models/.resolved/earlier/target", now = "/models/.resolved/now/target";
+  firstVersionEntry(cache, 240, "target/layer-0.bin", earlier, size);
+  firstVersionEntry(cache, 241, "target/layer-1.bin", earlier, size);
+  const std::array<PreparedWeight, 2> model{{{key(242), size, "target/layer-0.bin", key(243), now, {key(243)}},
+                                            {key(244), size, "target/layer-1.bin", key(245), now, {key(245)}}}};
+  cache.store.requireSpace(model);
+  firstVersionEntry(cache, 246, "target/layer-0.bin", "/models/gguf/target/model.gguf", cache.bytes.size(), key(247));
+  firstVersionEntry(cache, 248, "target/head.bin", earlier, cache.bytes.size());
+  static_cast<void>(cache.prepare({key(249), cache.bytes.size(), "target/layer-0.bin", key(250), now, {key(250)}}));
+  const auto kept = [&](uint8_t value) { return std::filesystem::exists(cache.root / key(value)); };
+  require(!kept(240) && kept(241) && kept(246) && kept(248) && kept(249),
+          "a first-version entry of the component under another path was kept, or others removed");
+  for (uint8_t value : {241, 246, 248, 249}) std::filesystem::remove_all(cache.root / key(value));
+}
+
+// A GGUF target's inputs are located in its file, as the first version's
+// were, so its first-version entries are current entries. Publishing a
+// missing image removes the first-version entry of its component and
+// inputs; its siblings from the same file stay.
+void firstVersionGgufSiblingsStay(Cache &cache) {
+  const std::string gguf = "/models/gguf/target/model.gguf";
+  firstVersionEntry(cache, 220, "target/layer-0.bin", gguf, cache.bytes.size(), key(223));
+  firstVersionEntry(cache, 221, "target/layer-1.bin", gguf, cache.bytes.size(), key(223));
+  static_cast<void>(cache.prepare({key(222), cache.bytes.size(), "target/layer-0.bin", key(223), gguf}));
+  const auto kept = [&](uint8_t value) { return std::filesystem::exists(cache.root / key(value)); };
+  require(!kept(220) && kept(221) && kept(222), "a GGUF target's current first-version entry was removed");
+  for (uint8_t value : {221, 222}) std::filesystem::remove_all(cache.root / key(value));
+}
+
+// Entries of the first provenance version recorded the digests of whole
+// shards as their inputs, which no entry keyed by its tensors matches.
+// Publishing one removes every first-version entry prepared from its source
+// path, whatever its component, and the disk check credits them; those of
+// other paths stay.
+void firstVersionEntriesAreSupersededBySource(Cache &cache) {
+  const uint64_t available = std::filesystem::space(cache.root).available;
+  const uint64_t size = available / 4;
+  const auto firstVersion = [&](uint8_t value, const std::string &component, const std::string &source,
+                                uint64_t bytes) { firstVersionEntry(cache, value, component, source, bytes); };
+  std::vector<PreparedWeight> model;
+  for (uint8_t i = 0; i < 8; ++i) {
+    const std::string component = "model/layer-" + std::to_string(i) + ".bin";
+    model.push_back({key(140 + i), size, component, key(150 + i), "/models/v1", {key(150 + i)}});
+    firstVersion(160 + i, component, "/models/v1", size);
+  }
+  cache.store.requireSpace(model);
+  firstVersion(170, "model/layer-0.bin", "/models/other", cache.bytes.size());
+  firstVersion(171, "model/head.bin", "/models/v1", cache.bytes.size());
+  static_cast<void>(
+      cache.prepare({key(172), cache.bytes.size(), "model/layer-0.bin", key(173), "/models/v1", {key(173)}}));
+  const auto kept = [&](uint8_t value) { return std::filesystem::exists(cache.root / key(value)); };
+  for (uint8_t value = 160; value < 168; ++value)
+    require(!kept(value), "a first-version entry of the source path was kept");
+  require(!kept(171) && !kept(170) && kept(172), "first-version entries were kept or others removed");
+  std::filesystem::remove_all(cache.root / key(172));
+}
+
+// A fine-tune and its base, both prepared by the first version; the
+// fine-tune left layer 0 unchanged. The fine-tune loads first and publishes
+// its files, layer 0 among them; the base reuses that layer and publishes its
+// head, which removes every first-version entry of the base, its layer 0's
+// too.
+void firstVersionEntriesOfASharingModelAreRemoved(Cache &cache) {
+  uint8_t value = 210;
+  for (const std::string source : {"/models/base", "/models/tuned"})
+    for (const std::string component : {"target/layer-0.bin", "target/head.bin"})
+      firstVersionEntry(cache, value++, component, source, cache.bytes.size());
+  const auto weight = [&](uint8_t value, const std::string &component, const std::string &source) {
+    return PreparedWeight{key(value), cache.bytes.size(), component, key(value + 1), source, {key(value + 1)}};
+  };
+  const int builds = cache.builds;
+  static_cast<void>(cache.prepare(weight(214, "target/layer-0.bin", "/models/tuned")));
+  static_cast<void>(cache.prepare(weight(216, "target/head.bin", "/models/tuned")));
+  static_cast<void>(cache.prepare(weight(214, "target/layer-0.bin", "/models/base")));
+  static_cast<void>(cache.prepare(weight(218, "target/head.bin", "/models/base")));
+  const auto kept = [&](uint8_t value) { return std::filesystem::exists(cache.root / key(value)); };
+  require(cache.builds == builds + 3 && !kept(210) && !kept(211) && !kept(212) && !kept(213) && kept(214) &&
+              kept(216) && kept(218),
+          "a first-version entry of a model sharing another's files was kept");
+  for (uint8_t value : {214, 216, 218}) std::filesystem::remove_all(cache.root / key(value));
+}
+
 // Same-size corruption must not pass a metadata-only check.
 void corruptionIsRepaired(Cache &cache) {
   const auto path = cache.prepare(1);
@@ -271,6 +399,107 @@ void changedSourcesAreRejected(Cache &cache) {
           "a missing source was reported without its path");
 }
 
+constexpr uint64_t kTensor = 4 << 20;
+
+// A source of two tensors after a 16-byte header; its bytes.
+std::vector<uint8_t> tensorSource(const std::filesystem::path &path) {
+  std::vector<uint8_t> data(16 + 2 * kTensor);
+  for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<uint8_t>(i * 13);
+  splash::test::writeFile(path, data);
+  return data;
+}
+
+// The digests of the tensors of the source at path, opened now; checks
+// counts the checks run.
+std::array<std::string, 2> tensorDigests(const std::filesystem::path &path, int &checks) {
+  WeightSource source(path, [&] { ++checks; });
+  source.setDataOffset(16);
+  source.addTensor(kTensor, kTensor);
+  source.addTensor(0, kTensor);
+  return {source.tensorDigest(0, kTensor), source.tensorDigest(kTensor, kTensor)};
+}
+
+// A source's tensors are hashed once, in one pass that checks between its
+// bounded reads: a warm start reads the digests remembered for the unchanged
+// file, not its tensor data.
+void warmSourcesReadNoTensorData(Cache &cache) {
+  const auto path = cache.root / "tensors.safetensors";
+  const auto data = tensorSource(path);
+  int checks = 0;
+  const auto cold = tensorDigests(path, checks);
+  require(cold[0] == weightDigest(std::span(data).subspan(16, kTensor)) &&
+              cold[1] == weightDigest(std::span(data).subspan(16 + kTensor, kTensor)),
+          "tensor digests differ");
+  checks = 0;
+  require(tensorDigests(path, checks) == cold && checks <= 1, "a warm start read tensor data");
+  // A digest is only of a tensor the parser added.
+  WeightSource source(path);
+  source.setDataOffset(16);
+  source.addTensor(0, kTensor);
+  rejects([&] { static_cast<void>(source.tensorDigest(0, kTensor - 1)); }, "source tensor was not added",
+          "a range that was not added was hashed");
+}
+
+// The records the cache remembers.
+std::set<std::filesystem::path> records(Cache &cache) {
+  std::set<std::filesystem::path> result;
+  for (const auto &entry : std::filesystem::directory_iterator(cache.root / "verified")) result.insert(entry.path());
+  return result;
+}
+
+// A damaged table of tensor digests is recomputed, not trusted, and
+// remembered again.
+void damagedTablesAreRecomputed(Cache &cache) {
+  const auto path = cache.root / "damaged.safetensors";
+  static_cast<void>(tensorSource(path));
+  const auto before = records(cache);
+  int checks = 0;
+  const auto cold = tensorDigests(path, checks);
+  // The source's table, the same size, with its first digit changed.
+  const auto after = records(cache);
+  std::vector<std::filesystem::path> tables;
+  std::set_difference(after.begin(), after.end(), before.begin(), before.end(), std::back_inserter(tables));
+  require(tables.size() == 1, "hashing a source's tensors did not remember one table");
+  const int record = open(tables.front().c_str(), O_RDWR);
+  require(record >= 0, "open table fixture");
+  uint8_t digit = 0;
+  readWeightBytes(record, 0, std::span(&digit, 1));
+  digit = digit == '0' ? '1' : '0';
+  writeWeightBytes(record, 0, std::span(&digit, 1));
+  close(record);
+  checks = 0;
+  require(tensorDigests(path, checks) == cold && checks > 1, "a damaged table was trusted");
+  checks = 0;
+  require(tensorDigests(path, checks) == cold && checks <= 1, "a recomputed table was not remembered");
+}
+
+// An entry keyed by the content of its source tensors lists their sorted
+// digests beside its file, one per line and read-only, which release tooling
+// joins on; an entry of located inputs lists none.
+void entriesListTheirTensors(Cache &cache) {
+  const uint64_t shape[] = {1};
+  WeightIdentity content("fixture");
+  content.input(key(201), 1, "U8", shape).input(key(200), 1, "U8", shape).input(key(201), 1, "U8", shape);
+  const auto listed = cache.prepare(content.weight(cache.bytes.size(), "test/tensors", "/test")).parent_path() /
+                      "tensors";
+  std::string expected;
+  for (const auto &digest : std::set{key(200), key(201)}) expected += digest + "\n";
+  const auto bytes = splash::test::readFile(listed);
+  struct stat info{};
+  require(std::string(bytes.begin(), bytes.end()) == expected && stat(listed.c_str(), &info) == 0 &&
+              !(info.st_mode & 0222),
+          "an entry did not list its tensors");
+  const auto path = cache.root / "located.gguf";
+  static_cast<void>(tensorSource(path));
+  WeightSource source(path);
+  source.setDataOffset(16);
+  WeightIdentity located("fixture");
+  located.input(source, 0, kTensor, "U8", shape);
+  require(!std::filesystem::exists(
+              cache.prepare(located.weight(cache.bytes.size(), "test/located", "/test")).parent_path() / "tensors"),
+          "an entry of located inputs listed tensors");
+}
+
 // A prepared file is mapped only as the cache verified it (WeightFile): not
 // once replaced, even by the same bytes, until prepare verifies it again, and
 // not once modified.
@@ -314,22 +543,46 @@ void damagedProofsAreRecomputed(Cache &cache) {
 }
 
 // Publishing an entry removes the earlier preparations of its component from
-// the same source data, and the entries earlier versions prepared from its
-// source path; others stay.
+// the same source data, whichever model's, or from its source path, whose
+// planner may now read other tensors, and the entries earlier versions
+// prepared from its source path; others stay, another model's preparation
+// of the component from other data too.
 void publishingSupersedesEarlierPreparations(Cache &cache) {
   static_cast<void>(cache.prepare(36));
-  const PreparedWeight older{key(30), cache.bytes.size(), "target/layer-0.bin", key(40), "/models/a"};
+  const PreparedWeight older{key(30), cache.bytes.size(), "target/layer-0.bin", key(40), "/models/z"};
   const PreparedWeight otherData{key(31), cache.bytes.size(), "target/layer-0.bin", key(41), "/models/b"};
   const PreparedWeight otherComponent{key(32), cache.bytes.size(), "target/head.bin", key(40), "/models/a"};
-  for (const auto &weight : {older, otherData, otherComponent}) static_cast<void>(cache.prepare(weight));
+  const PreparedWeight otherTensors{key(37), cache.bytes.size(), "target/layer-0.bin", key(42), "/models/a"};
+  for (const auto &weight : {older, otherData, otherComponent, otherTensors})
+    static_cast<void>(cache.prepare(weight));
   std::filesystem::create_directory(cache.root / key(33));
   splash::test::writeFile(cache.root / key(33) / "source", "/models/a\nhead.bin\n");
   std::filesystem::create_directory(cache.root / key(34));
   splash::test::writeFile(cache.root / key(34) / "source", "/models/c\nhead.bin\n");
   static_cast<void>(cache.prepare({key(35), cache.bytes.size(), "target/layer-0.bin", key(40), "/models/a"}));
   const auto kept = [&](uint8_t value) { return std::filesystem::exists(cache.root / key(value)); };
-  require(!kept(30) && !kept(33) && kept(31) && kept(32) && kept(34) && kept(35) && kept(36),
+  require(!kept(30) && !kept(33) && !kept(37) && kept(31) && kept(32) && kept(34) && kept(35) && kept(36),
           "superseded entries were kept or others removed");
+}
+
+// Two models whose sources hold the same tensors share an entry, whichever
+// prepared it. After a preparation-identity change, the first of them to
+// prepare it publishes the new key and removes the earlier entry; the other
+// reuses the new one.
+void sharedEntriesAreSupersededOnce(Cache &cache) {
+  for (const bool baseFirst : {true, false}) {
+    const uint8_t generation = baseFirst ? 180 : 190;
+    const auto shared = [&](uint8_t identity, const std::string &source) {
+      return PreparedWeight{key(generation + identity), cache.bytes.size(), "target/layer-0.bin", key(179), source};
+    };
+    static_cast<void>(cache.prepare(shared(0, "/models/base")));
+    const int builds = cache.builds;
+    static_cast<void>(cache.prepare(shared(1, baseFirst ? "/models/base" : "/models/tuned")));
+    static_cast<void>(cache.prepare(shared(1, baseFirst ? "/models/tuned" : "/models/base")));
+    require(cache.builds == builds + 1 && !std::filesystem::exists(cache.root / key(generation)),
+            "a shared entry was prepared twice or its earlier preparation kept");
+    std::filesystem::remove_all(cache.root / key(generation + 1));
+  }
 }
 
 } // namespace
@@ -345,16 +598,25 @@ int main() {
     warmLoadDoesNotWaitForTheConverterLock(cache);
     diskChecksKeepTheReserveAndCoverTheModel(cache);
     supersededEntriesAreCredited(cache);
+    firstVersionEntriesAreSupersededBySource(cache);
+    firstVersionEntriesOfASharingModelAreRemoved(cache);
+    firstVersionGgufSiblingsStay(cache);
+    firstVersionComponentsOfAnotherPathAreSuperseded(cache);
+    firstVersionCreditIsPooledBySource(cache);
     corruptionIsRepaired(cache);
     failedWritesPublishNothing(cache);
     crashedWriteIsReclaimed(cache);
     concurrentMissesWriteOnce(cache);
     changedSourcesAreRejected(cache);
+    warmSourcesReadNoTensorData(cache);
+    damagedTablesAreRecomputed(cache);
+    entriesListTheirTensors(cache);
     onlyVerifiedFilesAreMapped(cache);
     damagedProofsAreRecomputed(cache);
     publishingSupersedesEarlierPreparations(cache);
-    std::cout << "prepared weights: content, reuse, corruption, interruption, pressure, concurrency and "
-                 "superseded entries PASS\n";
+    sharedEntriesAreSupersededOnce(cache);
+    std::cout << "prepared weights: content, reuse, corruption, interruption, pressure, concurrency, tensor "
+                 "digests and superseded entries PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;
