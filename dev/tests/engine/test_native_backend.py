@@ -185,9 +185,14 @@ def make_job(request_id=101, *, constraint=None, temperature=0.0):
         prompt_tokens=[11, 12, 13, 14],
         max_new_tokens=37,
         seed=0x123456789ABCDEF0,
-        temperature=temperature,
-        top_p=0.75,
-        top_k=17,
+        sampling=wire.SamplingParameters(
+            temperature,
+            0.75,
+            17,
+            presence_penalty=1.5,
+            frequency_penalty=-0.25,
+            repetition_penalty=1.125,
+        ),
         deadline=time.monotonic() + 10.0,
         priority=backend_api.REQUEST_PRIORITIES["foreground"],
         constraint=constraint,
@@ -223,7 +228,7 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(request.prompt_tokens, (11, 12, 13, 14))
         self.assertEqual(request.logical_max_output_tokens, 37)
         self.assertEqual(request.priority, wire.RequestPriority.FOREGROUND)
-        self.assertEqual(request.sampling, wire.SamplingParameters(0.6, 0.75, 17))
+        self.assertEqual(request.sampling, job.sampling)
         self.assertEqual(request.seed, 0x123456789ABCDEF0)
         self.assertEqual(request.cohort, wire.Cohort.CONSTRAINED)
         self.assertEqual(request.constraint, wire.ConstraintMode.TOKEN_MASK)
@@ -265,6 +270,9 @@ class NativeBackendContractTests(unittest.TestCase):
                 "temperature": 0.7,
                 "top_p": 0.8,
                 "top_k": 13,
+                "presence_penalty": 1.5,
+                "frequency_penalty": 0.5,
+                "repetition_penalty": 1.05,
                 "seed": 99,
                 "priority": "background",
             }
@@ -275,7 +283,10 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(request.prompt_tokens, (31, 32, 33))
         self.assertEqual(request.logical_max_output_tokens, 19)
         self.assertEqual(request.priority, wire.RequestPriority.BACKGROUND)
-        self.assertEqual(request.sampling, wire.SamplingParameters(0.7, 0.8, 13))
+        self.assertEqual(
+            request.sampling,
+            wire.SamplingParameters(0.7, 0.8, 13, 1.5, 0.5, 1.05),
+        )
         self.assertEqual(request.seed, 99)
         self.assertEqual(request.cohort, wire.Cohort.SAMPLING)
 
@@ -299,7 +310,12 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(frame.generation_prompt_tokens, 2)
         self.assertEqual(frame.flags, wire.RequestFlag.IGNORE_END_OF_SEQUENCE)
         self.assertAlmostEqual(frame.sampling.temperature, 0.6)
-        self.assertEqual((frame.sampling.top_p, frame.sampling.top_k), (0.75, 17))
+        self.assertEqual(
+            frame.sampling,
+            wire.SamplingParameters(
+                frame.sampling.temperature, 0.75, 17, 1.5, -0.25, 1.125
+            ),
+        )
         self.assertEqual(frame.seed, 0x123456789ABCDEF0)
         self.assertEqual(frame.cohort, wire.Cohort.SAMPLING)
         self.assertEqual(frame.constraint, wire.ConstraintMode.NONE)
@@ -359,9 +375,7 @@ class NativeBackendContractTests(unittest.TestCase):
         transport, _runtime = self.make_transport(native)
         job = make_job(404)
         job.max_new_tokens = 0
-        job.temperature = 0.0
-        job.top_p = 1.0
-        job.top_k = 0
+        job.sampling = wire.SamplingParameters()
         job.score_tokens = (101, 202, 303)
 
         self.assertTrue(transport.submit(job))

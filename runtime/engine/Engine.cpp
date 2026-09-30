@@ -94,7 +94,7 @@ void Engine::submit(EngineRequest value) {
     if (value.cohort != BatchCohort::Greedy ||
         value.constraint != ConstraintMode::None || !value.images.empty() ||
         value.sampling.temperature != 0.0f || value.sampling.topP != 1.0f ||
-        value.sampling.topK != 0 ||
+        value.sampling.topK != 0 || value.sampling.penalized() ||
         value.scoreTokens.size() < model::ExecutionLimits::minimumScoreOptions ||
         value.scoreTokens.size() > model::ExecutionLimits::maximumScoreOptions) {
       throw std::invalid_argument("invalid score request");

@@ -795,10 +795,34 @@ special tokens such as a BOS and recognizing special-token strings, or one array
 of token IDs from its vocabulary. No chat template, reasoning split, tools or
 images apply: `text` is the generated text, decoded without special tokens.
 `max_tokens` defaults to 16, OpenAI's default for the endpoint as in vLLM and
-SGLang, or to what the context leaves when that is less. `temperature`,
-`top_p`, `top_k`, `seed`, `stop`, `priority`, `timeout` and `stream` with
+SGLang, or to what the context leaves when that is less. The sampling fields
+below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 `stream_options.include_usage` work as in Chat. Batched prompts, `suffix`,
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
+
+Chat, text completions and Responses sample with `temperature` (default 1.0,
+in [0, 2]), `top_p` (0.95), `top_k` (20, in [1, 32]) and vLLM's
+`presence_penalty` and `frequency_penalty` (0, in [-2, 2]) and
+`repetition_penalty` (1, positive); the defaults are Qwen's generation config,
+which sets no penalties, so its recommended `presence_penalty` of 1.5 for
+non-thinking use must be sent explicitly. Each field that is out of range
+returns 400 naming it. As in vLLM, a nonzero temperature below 0.01 samples at
+0.01, and the penalties rewrite the raw logits before
+temperature, for greedy requests too: repetition divides a positive logit and
+multiplies a negative one for every token of the prompt or of the output so
+far, and presence and frequency lower the logit of every output token by
+`presence_penalty` plus `frequency_penalty` times its count. Speculative
+decoding stays exact: each verified draft position counts the draft tokens
+before it, so a penalized request samples as it would without a draft. Like
+vLLM with speculative decoding, which Splash always uses, a nonzero `min_p`
+and any `logit_bias` return 400. Like vLLM and HF, repetition counts every
+prompt token: with the Qwen templates that includes the tool-call syntax every
+tool-enabled system prompt carries, earlier tool calls and reasoning, and the
+`<think>` markers of the generation prompt, so a `repetition_penalty` above 1
+can delay tool calls and the end of reasoning and change names copied from
+the context. Anthropic Messages defines no penalties. The engine receives
+these fields as one block after `top_k` in the request frame (native wire
+version 7).
 
 Chat's `max_completion_tokens` or `max_tokens` and Responses'
 `max_output_tokens` bound a response's output. Omitted, the output may use

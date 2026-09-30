@@ -20,7 +20,7 @@ std::string_view frameTypeName(FrameType type);
 std::string_view failureClassName(FailureClass failureClass);
 
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
-constexpr uint64_t kRequestFixedBytes = 72;
+constexpr uint64_t kRequestFixedBytes = 84;
 constexpr uint64_t kImageSpanBytes = 32;
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
@@ -451,6 +451,14 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
                    "sampling requires temperature>=0, top_p in (0,1], and "
                    "top_k in [1,32] when sampling is enabled");
   }
+  if (!(std::fabs(sampling.presencePenalty) <= 2.0f) ||
+      !(std::fabs(sampling.frequencyPenalty) <= 2.0f) ||
+      !std::isfinite(sampling.repetitionPenalty) ||
+      sampling.repetitionPenalty <= 0.0f) {
+    return invalid(IssueCode::InvalidSampling,
+                   "sampling requires presence and frequency penalties in "
+                   "[-2,2] and a positive repetition penalty");
+  }
   Cohort expected = Cohort::Constrained;
   if (request.constraint == ConstraintMode::None) {
     expected =
@@ -465,8 +473,7 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
       return invalid(IssueCode::InvalidCohortConstraint,
                      "score requests cannot carry a constraint");
     }
-    if (sampling.temperature != 0.0f || sampling.topP != 1.0f ||
-        sampling.topK != 0) {
+    if (sampling != SamplingParameters{}) {
       return invalid(IssueCode::InvalidSampling,
                      "score requests require greedy default sampling");
     }
@@ -689,6 +696,9 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   writer.f32(request.sampling.temperature);
   writer.f32(request.sampling.topP);
   writer.u32(request.sampling.topK);
+  writer.f32(request.sampling.presencePenalty);
+  writer.f32(request.sampling.frequencyPenalty);
+  writer.f32(request.sampling.repetitionPenalty);
   writer.u64(request.seed);
   writer.u8(request.returnProgress);
   writer.u32(static_cast<uint32_t>(request.scoreTokens.size()));
@@ -887,7 +897,11 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
       !reader.u32(imageSpanCount) ||
       !reader.f32(request.sampling.temperature) ||
       !reader.f32(request.sampling.topP) ||
-      !reader.u32(request.sampling.topK) || !reader.u64(request.seed) ||
+      !reader.u32(request.sampling.topK) ||
+      !reader.f32(request.sampling.presencePenalty) ||
+      !reader.f32(request.sampling.frequencyPenalty) ||
+      !reader.f32(request.sampling.repetitionPenalty) ||
+      !reader.u64(request.seed) ||
       !reader.u8(returnProgress) || !reader.u32(scoreCount) ||
       !reader.u32(request.generationPromptTokens) ||
       !reader.u32(request.flags)) {

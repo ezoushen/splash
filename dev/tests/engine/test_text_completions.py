@@ -263,22 +263,28 @@ class TextCompletionTests(unittest.TestCase):
             temperature=0.7,
             top_p=0.5,
             top_k=5,
+            presence_penalty=1.5,
+            frequency_penalty=-0.5,
+            repetition_penalty=1.1,
             seed=7,
             priority="foreground",
         )
         self.assertEqual(status, 200, response)
         request = runtime.requests[0]
         self.assertEqual(request.cohort, wire.Cohort.SAMPLING)
-        self.assertAlmostEqual(request.sampling.temperature, 0.7)
-        self.assertEqual((request.sampling.top_p, request.sampling.top_k), (0.5, 5))
+        self.assertEqual(
+            request.sampling, wire.SamplingParameters(0.7, 0.5, 5, 1.5, -0.5, 1.1)
+        )
         self.assertEqual(request.seed, 7)
         self.assertEqual(request.priority, wire.RequestPriority.FOREGROUND)
         invalid = (
-            ({"temperature": -1}, "invalid sampling parameters"),
-            ({"top_k": 33}, "invalid sampling parameters"),
-            ({"presence_penalty": 1}, "output transformation is not supported"),
-            ({"repetition_penalty": 1.1}, "output transformation is not supported"),
-            ({"logit_bias": {"1": 2}}, "output transformation is not supported"),
+            ({"temperature": -1}, "temperature must be a number in [0, 2]"),
+            ({"top_k": 33}, "top_k must be an integer in [1, 32]"),
+            ({"top_k": 0}, "top_k must be an integer in [1, 32]"),
+            ({"min_p": 0.1}, "min_p is not supported with speculative decoding"),
+            ({"presence_penalty": 3}, "presence_penalty must be a number in [-2, 2]"),
+            ({"repetition_penalty": 0}, "repetition_penalty must be a positive number"),
+            ({"logit_bias": {"1": 2}}, "logit_bias is not supported with speculative"),
             ({"seed": 2**64}, "seed must be an unsigned 64-bit integer"),
             ({"priority": "urgent"}, "priority must be"),
             ({"max_tokens": 0}, "max_tokens must be a positive integer"),

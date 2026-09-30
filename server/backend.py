@@ -89,9 +89,7 @@ class Job:
     prompt_tokens: list
     max_new_tokens: int
     seed: int
-    temperature: float
-    top_p: float
-    top_k: int
+    sampling: wire.SamplingParameters
     deadline: float
     priority: int = REQUEST_PRIORITIES["normal"]
     stop_sequences: tuple[str, ...] = ()
@@ -493,7 +491,7 @@ class NativeBackend:
         if job.constraint is not None:
             cohort = wire.Cohort.CONSTRAINED
             constraint = wire.ConstraintMode.TOKEN_MASK
-        elif job.temperature > 0:
+        elif job.sampling.temperature > 0:
             cohort = wire.Cohort.SAMPLING
             constraint = wire.ConstraintMode.NONE
         else:
@@ -504,9 +502,7 @@ class NativeBackend:
             logical_max_output_tokens=job.max_new_tokens,
             deadline=self._deadline(job),
             priority=priority,
-            sampling=wire.SamplingParameters(
-                float(job.temperature), float(job.top_p), job.top_k
-            ),
+            sampling=job.sampling,
             seed=job.seed,
             cohort=cohort,
             constraint=constraint,

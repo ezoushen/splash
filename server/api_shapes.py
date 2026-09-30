@@ -591,11 +591,17 @@ def responses_to_chat_body(body, previous_items=()):
     if response_format is not None:
         chat["response_format"] = response_format
     aliases = {"max_output_tokens": "max_completion_tokens"}
+    # Chat validates what it receives, so a field Splash cannot honor, such
+    # as logit_bias, is refused rather than dropped.
     for field_name in (
         "model",
         "temperature",
         "top_p",
         "top_k",
+        "presence_penalty",
+        "frequency_penalty",
+        "repetition_penalty",
+        "logit_bias",
         "seed",
         "timeout",
         "priority",

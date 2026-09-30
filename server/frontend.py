@@ -89,6 +89,41 @@ PREPARATION_WAIT_SECONDS = 30.0
 
 
 MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
+FLOAT32_MAX = float.fromhex("0x1.fffffep127")
+# vLLM raises a nonzero temperature below this to it (_MAX_TEMP in
+# vllm/sampling_params.py), which also keeps the sampler's reciprocal of the
+# temperature finite.
+MIN_SAMPLING_TEMPERATURE = 0.01
+
+# The sampling numbers a request may set: each with its default (Qwen's
+# generation config for temperature and top_p, and otherwise the value that
+# leaves the logits unchanged, as in vLLM), the values the engine accepts and
+# how a 400 names them. A nonzero top_p or repetition_penalty must not round
+# to zero in the engine's float32, which would make the value invalid.
+SAMPLING_NUMBERS = {
+    "temperature": (
+        1.0,
+        lambda value: 0 <= value <= 2,
+        "a number in [0, 2]",
+    ),
+    "top_p": (
+        0.95,
+        lambda value: MIN_FLOAT32_SUBNORMAL <= value <= 1,
+        "a number in (0, 1]",
+    ),
+    "presence_penalty": (0.0, lambda value: -2 <= value <= 2, "a number in [-2, 2]"),
+    "frequency_penalty": (0.0, lambda value: -2 <= value <= 2, "a number in [-2, 2]"),
+    "repetition_penalty": (
+        1.0,
+        lambda value: MIN_FLOAT32_SUBNORMAL <= value <= FLOAT32_MAX,
+        "a positive number",
+    ),
+}
+
+# vLLM refuses a nonzero min_p and any logit_bias with speculative decoding,
+# which Splash always uses, so a request may send them only with the values
+# that change nothing.
+SPECULATIVE_DECODING_NEUTRAL = {"min_p": (None, 0), "logit_bias": (None, {})}
 
 
 RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
@@ -230,9 +265,7 @@ class RenderedPrompt:
 class GenerationOptions:
     """Sampling and stop options, validated alike by every generation API."""
 
-    temperature: float
-    top_p: float
-    top_k: int
+    sampling: wire.SamplingParameters
     stop_sequences: tuple[str, ...]
     ignore_eos: bool
 
@@ -625,9 +658,7 @@ class Frontend:
             prompt_tokens=prompt_tokens,
             max_new_tokens=0,
             seed=0,
-            temperature=0.0,
-            top_p=1.0,
-            top_k=0,
+            sampling=wire.SamplingParameters(),
             deadline=deadline,
             priority=priority,
             score_tokens=tuple(slot_ids),
@@ -1092,21 +1123,23 @@ class Frontend:
         ]
 
     def _generation_options(self, body):
-        temperature = body.get("temperature", 1.0)
-        top_p, top_k = body.get("top_p", 0.95), body.get("top_k", 20)
+        numbers = {}
+        for name, (default, accepts, requirement) in SAMPLING_NUMBERS.items():
+            value = body.get(name, default)
+            if not is_finite_number(value) or not accepts(value):
+                raise APIError(400, f"{name} must be {requirement}")
+            numbers[name] = float(value)
+        if 0 < numbers["temperature"] < MIN_SAMPLING_TEMPERATURE:
+            numbers["temperature"] = MIN_SAMPLING_TEMPERATURE
+        # The sampler keeps at most MAX_TOP_K candidates, so vLLM's 0 or -1
+        # for the whole vocabulary would be silently cut.
+        top_k = body.get("top_k", 20)
         if (
-            not is_finite_number(temperature)
-            or not is_finite_number(top_p)
-            or not isinstance(top_k, int)
+            not isinstance(top_k, int)
             or isinstance(top_k, bool)
-            or temperature < 0
-            or temperature > 2
-            or (temperature != 0 and temperature < MIN_FLOAT32_SUBNORMAL)
-            or not 0 < top_p <= 1
-            or top_p < MIN_FLOAT32_SUBNORMAL
             or not 1 <= top_k <= wire.MAX_TOP_K
         ):
-            raise APIError(400, "invalid sampling parameters")
+            raise APIError(400, f"top_k must be an integer in [1, {wire.MAX_TOP_K}]")
         stop = body.get("stop")
         if stop in (None, []):
             stop_sequences = ()
@@ -1120,24 +1153,17 @@ class Frontend:
             stop_sequences = tuple(stop)
         else:
             raise APIError(400, "stop must be a string or up to four strings")
-        # Each with the value that leaves the logits unchanged.
-        penalties = (
-            (body.get("presence_penalty", 0), 0),
-            (body.get("frequency_penalty", 0), 0),
-            (body.get("repetition_penalty", 1), 1),
-            (body.get("min_p", 0), 0),
-        )
-        if any(
-            not is_finite_number(value) or value != neutral
-            for value, neutral in penalties
-        ) or body.get("logit_bias") not in (None, {}):
-            raise APIError(
-                400, "the requested logits or output transformation is not supported"
-            )
+        for name, neutral in SPECULATIVE_DECODING_NEUTRAL.items():
+            if body.get(name) not in neutral:
+                raise APIError(
+                    400, f"{name} is not supported with speculative decoding"
+                )
         ignore_eos = body.get("ignore_eos", False)
         if not isinstance(ignore_eos, bool):
             raise APIError(400, "ignore_eos must be a boolean")
-        return GenerationOptions(temperature, top_p, top_k, stop_sequences, ignore_eos)
+        return GenerationOptions(
+            wire.SamplingParameters(top_k=top_k, **numbers), stop_sequences, ignore_eos
+        )
 
     def _output_budget(self, requested, prompt_tokens, field, clamp=False):
         """The output token budget requested under the API's field name,
@@ -1177,9 +1203,7 @@ class Frontend:
             prompt_tokens=prompt_tokens,
             max_new_tokens=max_new,
             seed=seed,
-            temperature=options.temperature,
-            top_p=options.top_p,
-            top_k=options.top_k,
+            sampling=options.sampling,
             deadline=deadline,
             priority=priority,
             stop_sequences=options.stop_sequences,

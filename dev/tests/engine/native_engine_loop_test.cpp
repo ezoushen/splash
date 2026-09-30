@@ -70,8 +70,9 @@ public:
   std::function<void()> onHealthCheck;
   // Score requests whose final prompt chunk reports a per-lane model failure.
   std::unordered_set<uint64_t> invalidScores;
-  // The request flags each request began with.
+  // The request flags and sampling each request began with.
   std::unordered_map<uint64_t, uint32_t> beganFlags;
+  std::unordered_map<uint64_t, SamplingParameters> beganSampling;
   // Prefill chunks each request received, to prove a failure was isolated to
   // the last one rather than to a prefill that never chunked.
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
@@ -82,6 +83,7 @@ public:
   }
   StateAdmission begin(const ModelRequest &request) override {
     beganFlags[request.id] = request.flags;
+    beganSampling[request.id] = request.sampling;
     for (uint32_t slot = 0; slot < model::ExecutionLimits::maximumBatchWidth;
          ++slot) {
       const bool used = std::any_of(
@@ -485,6 +487,46 @@ void testRequestFlagsReachTheModel() {
               std::unordered_map<uint64_t, uint32_t>{
                   {1, 0}, {2, RequestIgnoreEndOfSequence}},
           "request flags did not reach the model");
+}
+
+// The penalties cross the wire to the model with the rest of the sampling;
+// greedy requests carry them too.
+void testSamplingReachesTheModel() {
+  Storage storage(32);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  double monotonic = 100.0;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  engine::NativeRuntime loop(
+      config, resources, executor, [](std::span<const uint8_t>) {},
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
+  loop.announceReady();
+  auto greedy = request(1);
+  greedy.sampling = {0.0f, 1.0f, 0, 1.5f, 0.0f, 1.1f};
+  auto sampled = request(2);
+  sampled.cohort = protocol::Cohort::Sampling;
+  sampled.seed = 77;
+  sampled.sampling = {0.7f, 0.8f, 20, -0.5f, 2.0f, 0.9f};
+  for (const auto &input : {greedy, sampled}) {
+    auto encoded = protocol::serializeMessage(protocol::Message{input});
+    require(encoded && loop.receive(*encoded.value), "sampled request wire failed");
+    runUntilIdle(loop);
+  }
+  const auto matches = [&](uint64_t id, const protocol::RequestFrame &input) {
+    const SamplingParameters &sampling = executor.beganSampling.at(id);
+    const protocol::SamplingParameters &sent = input.sampling;
+    return sampling.temperature == sent.temperature &&
+           sampling.topP == sent.topP && sampling.topK == sent.topK &&
+           sampling.seed == input.seed &&
+           sampling.presencePenalty == sent.presencePenalty &&
+           sampling.frequencyPenalty == sent.frequencyPenalty &&
+           sampling.repetitionPenalty == sent.repetitionPenalty;
+  };
+  require(matches(1, greedy) && matches(2, sampled),
+          "a penalty did not reach the model");
 }
 
 void testFatalFramingClosesConnection() {
@@ -1343,6 +1385,7 @@ int main() {
     testWireLifecycleAndCacheHit();
     testGenerationPromptBoundsTheReplayState();
     testRequestFlagsReachTheModel();
+    testSamplingReachesTheModel();
     testPromptProgress();
     testCapacityFailureHasOneTerminalFrame();
     testFatalFramingClosesConnection();

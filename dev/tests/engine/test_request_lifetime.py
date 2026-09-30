@@ -37,9 +37,7 @@ class RequestLifetimeTests(unittest.TestCase):
             prompt_tokens=[101, 102],
             max_new_tokens=16,
             seed=0,
-            temperature=0,
-            top_p=1,
-            top_k=1,
+            sampling=wire.SamplingParameters(top_k=1),
             deadline=time.monotonic() + 30,
             image_owner=owner,
         )
