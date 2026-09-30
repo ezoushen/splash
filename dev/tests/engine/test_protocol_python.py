@@ -494,9 +494,12 @@ class ProtocolPythonTests(unittest.TestCase):
                         parse_all(bytes(mutated))[0]
                     ),
                 )
+        # The limits, and any top_k, 0 keeping every token.
         for limit in (
             p.SamplingParameters(f32(0.8), f32(0.95), 32, -2.0, 2.0, 2.0**-149),
             p.SamplingParameters(f32(0.8), f32(0.95), 32, 2.0, -2.0, f32(3.4e38)),
+            p.SamplingParameters(f32(0.8), f32(0.95), 0),
+            p.SamplingParameters(1.0, 1.0, 0xFFFFFFFF),
         ):
             valid = replace(request, sampling=limit)
             self.assertEqual(

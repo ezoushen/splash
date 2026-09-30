@@ -445,11 +445,9 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
   const SamplingParameters &sampling = request.sampling;
   if (!std::isfinite(sampling.temperature) || sampling.temperature < 0.0f ||
       !std::isfinite(sampling.topP) || sampling.topP <= 0.0f ||
-      sampling.topP > 1.0f || sampling.topK > 32 ||
-      (sampling.temperature > 0.0f && !sampling.topK)) {
+      sampling.topP > 1.0f) {
     return invalid(IssueCode::InvalidSampling,
-                   "sampling requires temperature>=0, top_p in (0,1], and "
-                   "top_k in [1,32] when sampling is enabled");
+                   "sampling requires temperature>=0 and top_p in (0,1]");
   }
   if (!(std::fabs(sampling.presencePenalty) <= 2.0f) ||
       !(std::fabs(sampling.frequencyPenalty) <= 2.0f) ||

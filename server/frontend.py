@@ -1131,15 +1131,15 @@ class Frontend:
             numbers[name] = float(value)
         if 0 < numbers["temperature"] < MIN_SAMPLING_TEMPERATURE:
             numbers["temperature"] = MIN_SAMPLING_TEMPERATURE
-        # The sampler keeps at most MAX_TOP_K candidates, so vLLM's 0 or -1
-        # for the whole vocabulary would be silently cut.
+        # A top_k of 0 or -1 keeps every token, which the frame says with 0. A
+        # top_k past the vocabulary keeps every token too, so one past the
+        # frame's u32 is sent as its largest value.
         top_k = body.get("top_k", 20)
-        if (
-            not isinstance(top_k, int)
-            or isinstance(top_k, bool)
-            or not 1 <= top_k <= wire.MAX_TOP_K
-        ):
-            raise APIError(400, f"top_k must be an integer in [1, {wire.MAX_TOP_K}]")
+        if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < -1:
+            raise APIError(
+                400, "top_k must be 0 or -1 (disabled) or a positive integer"
+            )
+        top_k = min(max(top_k, 0), 0xFFFFFFFF)
         stop = body.get("stop")
         if stop in (None, []):
             stop_sequences = ()

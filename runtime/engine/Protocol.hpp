@@ -151,6 +151,8 @@ inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
 struct SamplingParameters {
   float temperature = 0.0f;
   float topP = 1.0f;
+  // Sampling keeps the topK most likely tokens; 0 keeps every token, as does
+  // a topK past the vocabulary.
   uint32_t topK = 0;
   // The penalties: presence and frequency in [-2, 2] lower the logits of
   // output tokens; a positive repetition scales those of prompt and output

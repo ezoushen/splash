@@ -6259,7 +6259,8 @@ class ServerTest(unittest.TestCase):
         invalid = [
             self.body(temperature=-1),
             self.body(top_p=0),
-            self.body(top_k=33),
+            self.body(top_k=-2),
+            self.body(top_k=1.5),
             self.body(stop=""),
             self.body(stop=3),
             self.body(stop=["x"] * 5),
@@ -6400,9 +6401,6 @@ class ServerTest(unittest.TestCase):
             ({"temperature": 2.5}, "temperature must be a number in [0, 2]"),
             ({"temperature": -0.5}, "temperature must be a number in [0, 2]"),
             ({"top_p": 0}, "top_p must be a number in (0, 1]"),
-            ({"top_k": 0}, "top_k must be an integer in [1, 32]"),
-            ({"top_k": -1}, "top_k must be an integer in [1, 32]"),
-            ({"top_k": 33}, "top_k must be an integer in [1, 32]"),
             ({"min_p": 0.05}, "min_p is not supported with speculative decoding"),
             ({"min_p": 1.5}, "min_p is not supported with speculative decoding"),
             ({"presence_penalty": 2.5}, "presence_penalty must be a number in [-2, 2]"),
@@ -6431,6 +6429,39 @@ class ServerTest(unittest.TestCase):
                 )
                 self.assertEqual(status, 400, payload)
                 self.assertIn(message, json.loads(payload)["error"]["message"])
+                self.assertEqual(runtime.requests, [])
+
+    def test_top_k_takes_any_positive_integer_and_0_or_minus_1_disables_it(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        # 0 and -1 keep every token, which the frame says with 0; a top_k
+        # past the vocabulary keeps every token too, however large.
+        for top_k, sent in (
+            (1, 1),
+            (33, 33),
+            (1000, 1000),
+            (0, 0),
+            (-1, 0),
+            (2**40, 0xFFFFFFFF),
+        ):
+            with self.subTest(top_k=top_k):
+                runtime.requests.clear()
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", self.body(top_k=top_k)
+                )
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(runtime.requests[0].sampling.top_k, sent)
+        for top_k in (-2, 2.5, True, "20"):
+            with self.subTest(top_k=top_k):
+                runtime.requests.clear()
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", self.body(top_k=top_k)
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(
+                    json.loads(payload)["error"]["message"],
+                    "top_k must be 0 or -1 (disabled) or a positive integer",
+                )
                 self.assertEqual(runtime.requests, [])
 
     def test_responses_forward_the_sampling_fields_chat_validates(self):

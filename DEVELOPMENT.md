@@ -801,7 +801,7 @@ below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
 
 Chat, text completions and Responses sample with `temperature` (default 1.0,
-in [0, 2]), `top_p` (0.95), `top_k` (20, in [1, 32]) and vLLM's
+in [0, 2]), `top_p` (0.95), `top_k` (20, a positive integer, 0 or -1) and
 `presence_penalty` and `frequency_penalty` (0, in [-2, 2]) and
 `repetition_penalty` (1, positive); the defaults are Qwen's generation config,
 which sets no penalties, so its recommended `presence_penalty` of 1.5 for
@@ -823,6 +823,14 @@ can delay tool calls and the end of reasoning and change names copied from
 the context. Anthropic Messages defines no penalties. The engine receives
 these fields as one block after `top_k` in the request frame (native wire
 version 7).
+
+As in vLLM, `top_k` keeps the most likely tokens after temperature, every
+token when it is 0 or -1 or past the vocabulary, and `top_p` then the fewest
+of those whose probabilities, renormalized over them, sum past it. Both apply
+to the whole vocabulary, exactly, for the first token, the verified draft
+positions and their corrections alike: the sampler sums each row's softmax
+denominator, finds where its distribution ends without sorting the
+vocabulary, and draws over every token the distribution keeps.
 
 Chat's `max_completion_tokens` or `max_tokens` and Responses'
 `max_output_tokens` bound a response's output. Omitted, the output may use

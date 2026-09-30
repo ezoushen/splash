@@ -16,8 +16,6 @@ from typing import TypeAlias
 PROTOCOL_VERSION = 7
 FRAME_HEADER_BYTES = 24
 STATUS_SCHEMA_VERSION = 6
-# Largest top-k the native sampler keeps as candidates.
-MAX_TOP_K = 32
 # Score-only requests carry 2..255 distinct option token ids and produce no
 # generated tokens; a successful score DoneEvent returns one raw
 # final-position logit per requested token, in request order.
@@ -186,7 +184,8 @@ _REQUEST_FLAG_BITS = int(RequestFlag.IGNORE_END_OF_SEQUENCE)
 @dataclass(slots=True, frozen=True)
 class SamplingParameters:
     """The defaults are greedy selection with nothing changing the logits,
-    which score requests require. The penalties are vLLM's."""
+    which score requests require. A top_k of 0, or one past the vocabulary,
+    keeps every token; the default penalties change nothing."""
 
     temperature: float = 0.0
     top_p: float = 1.0
@@ -781,19 +780,14 @@ def _request_issue(
         )
     try:
         sampling = _sampling_values(request.sampling)
-        temperature, top_p, top_k, presence, frequency, repetition = sampling
+        temperature, top_p, _, presence, frequency, repetition = sampling
         if (
             not math.isfinite(temperature)
             or temperature < 0.0
             or not math.isfinite(top_p)
             or not 0.0 < top_p <= 1.0
-            or top_k > MAX_TOP_K
-            or (temperature > 0.0 and not top_k)
         ):
-            raise ValueError(
-                "sampling requires temperature>=0, top_p in (0,1], and "
-                "top_k in [1,32] when sampling is enabled"
-            )
+            raise ValueError("sampling requires temperature>=0 and top_p in (0,1]")
         if (
             not abs(presence) <= 2.0
             or not abs(frequency) <= 2.0

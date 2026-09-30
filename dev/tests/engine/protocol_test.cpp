@@ -810,8 +810,8 @@ void testPromptAndImageSpanRejections() {
 
 // The sampling parameters are one block after the image span count:
 // temperature, top_p, top_k and the presence, frequency and repetition
-// penalties. Each codec refuses a penalty outside vLLM's range, and a score
-// request anything but the defaults.
+// penalties. Each codec takes any top_k and refuses a penalty outside its
+// range, and a score request anything but the defaults.
 void testSamplingBlock() {
   constexpr std::string_view test = "sampling block";
   RequestFrame request = exampleRequest();
@@ -864,12 +864,15 @@ void testSamplingBlock() {
     invalid.sampling.repetitionPenalty = repetition;
     expectInvalid(invalid);
   }
-  // The limits themselves, and the smallest and largest repetition.
+  // The limits themselves, the smallest and largest repetition, and any
+  // top_k, 0 keeping every token.
   for (const SamplingParameters limit :
        {SamplingParameters{0.8f, 0.95f, 32, -2.0f, 2.0f,
                            std::numeric_limits<float>::denorm_min()},
         SamplingParameters{0.8f, 0.95f, 32, 2.0f, -2.0f,
-                           std::numeric_limits<float>::max()}}) {
+                           std::numeric_limits<float>::max()},
+        SamplingParameters{0.8f, 0.95f, 0}, SamplingParameters{0.8f, 1.0f, 1000},
+        SamplingParameters{1.0f, 0.9f, 0xffffffffU}}) {
     RequestFrame valid = request;
     valid.sampling = limit;
     CHECK(test, roundTrip(valid) == valid);
