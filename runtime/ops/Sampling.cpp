@@ -3,6 +3,8 @@
 #include "metal/abi/Sampling.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -30,6 +32,13 @@ constexpr uint32_t kDraftCandidates = 16;
 // simdgroup task; eight simdgroups balance the seven-group B1 dispatch
 // against the 28 groups of B4 (wider groups speed up B1 and slow down B4).
 constexpr uint32_t kEdgeThreads = 256;
+constexpr uint32_t kPenaltyThreads = 256;
+
+void requireVocabulary(std::span<const uint32_t> tokens, size_t vocabulary) {
+  if (std::any_of(tokens.begin(), tokens.end(),
+                  [&](uint32_t token) { return token >= vocabulary; }))
+    throw std::invalid_argument("penalty token is outside the vocabulary");
+}
 
 } // namespace
 
@@ -55,6 +64,29 @@ DraftSelectorWorkspace Sampling::draftWorkspace(uint32_t positions) {
           candidates * sizeof(float)};
 }
 
+void Sampling::loadPenaltyWords(std::span<uint32_t> words,
+                                std::span<const uint32_t> prompt,
+                                std::span<const uint32_t> selected,
+                                bool markPrompt) {
+  requireVocabulary(prompt, words.size());
+  requireVocabulary(selected, words.size());
+  std::fill(words.begin(), words.end(), 0U);
+  if (markPrompt) {
+    for (const uint32_t token : prompt)
+      words[token] |= SPLASH_PENALTY_PROMPT_BIT;
+  }
+  countPenaltyTokens(words, selected);
+}
+
+// Counts stay far below the prompt bit: a request selects at most one token
+// per position of its context.
+void Sampling::countPenaltyTokens(std::span<uint32_t> words,
+                                  std::span<const uint32_t> selected) {
+  requireVocabulary(selected, words.size());
+  for (const uint32_t token : selected)
+    ++words[token];
+}
+
 Sampling::Sampling(metal::MetalBackend &backend, uint32_t vocabulary,
                    uint32_t rowsPerLane)
     : backend_(backend), vocabulary_(vocabulary), rowsPerLane_(rowsPerLane),
@@ -63,12 +95,63 @@ Sampling::Sampling(metal::MetalBackend &backend, uint32_t vocabulary,
     throw std::invalid_argument("invalid sampling geometry");
 }
 
+void Sampling::addPenalties(metal::CommandGraph &graph,
+                            std::span<const SamplingPolicy> policies,
+                            const SamplingBuffers &buffers,
+                            const PenaltyTable &table, uint32_t rowOffset,
+                            bool verify) const {
+  SamplingPenaltyParams params{};
+  params.vocabulary = vocabulary_;
+  params.rows = verify ? rowsPerLane_ : 1;
+  params.row_stride = rowsPerLane_;
+  params.row_offset = rowOffset;
+  const uint64_t rowBytes = uint64_t{vocabulary_} * sizeof(uint32_t);
+  for (uint32_t lane = 0; lane < policies.size(); ++lane) {
+    const SamplingPenalties &penalties = policies[lane].penalties;
+    if (!penalties.active())
+      continue;
+    if (!std::isfinite(penalties.repetition) || penalties.repetition <= 0.0F ||
+        !std::isfinite(penalties.presence) ||
+        !std::isfinite(penalties.frequency))
+      throw std::invalid_argument("invalid sampling penalties");
+    // The kernel indexes the whole table by this row.
+    if (lane >= table.rows.size() ||
+        (uint64_t{table.rows[lane]} + 1) * rowBytes > table.words.sizeBytes())
+      throw std::invalid_argument("penalized lane has no penalty table row");
+    const uint32_t entry = params.entries++;
+    params.logits_lane[entry] = lane;
+    params.table_row[entry] = table.rows[lane];
+    params.repetition[entry] = penalties.repetition;
+    // 1 / 2^-149 overflows; the saturated inverse keeps the product finite.
+    params.repetition_inverse[entry] = std::min(
+        1.0F / penalties.repetition, std::numeric_limits<float>::max());
+    params.presence[entry] = penalties.presence;
+    params.frequency[entry] = penalties.frequency;
+  }
+  if (!params.entries)
+    return;
+  const metal::DispatchSize groups{
+      (vocabulary_ + kPenaltyThreads - 1) / kPenaltyThreads, params.entries, 1};
+  if (!verify) {
+    graph.add("decode_sample_penalize", {buffers.logits, table.words}, params,
+              groups, {kPenaltyThreads, 1, 1});
+    return;
+  }
+  if (!buffers.inputTokens)
+    throw std::invalid_argument("penalized verify rows need their input tokens");
+  graph.add("decode_sample_penalize_verify",
+            {buffers.logits, table.words, buffers.inputTokens}, params, groups,
+            {kPenaltyThreads, 1, 1});
+}
+
 void Sampling::addInitial(metal::CommandGraph &graph,
                           const SamplingPolicy &policy,
                           SamplingBuffers buffers, uint32_t rowOffset,
-                          uint32_t stopToken0, uint32_t stopToken1) const {
+                          uint32_t stopToken0, uint32_t stopToken1,
+                          PenaltyTable penalties) const {
   if (rowOffset >= rowsPerLane_)
     throw std::invalid_argument("invalid initial sampling row");
+  addPenalties(graph, {&policy, 1}, buffers, penalties, rowOffset, false);
   // The argmax kernels read every token, so a greedy lane that skips some
   // takes its one winner from the top-32 kernels, as a constrained one does.
   if (policy.samples() || policy.constrained || policy.excludesStopTokens) {
@@ -116,9 +199,10 @@ void Sampling::addInitial(metal::CommandGraph &graph,
 void Sampling::addVerify(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
                          SamplingBuffers buffers, uint32_t stopToken0,
-                         uint32_t stopToken1) const {
+                         uint32_t stopToken1, PenaltyTable penalties) const {
   if (policies.empty() || policies.size() > kMaximumLanes)
     throw std::invalid_argument("invalid sampling batch width");
+  addPenalties(graph, policies, buffers, penalties, 0, true);
   const uint32_t lanes = static_cast<uint32_t>(policies.size());
   const bool constrained = std::any_of(
       policies.begin(), policies.end(),

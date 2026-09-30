@@ -306,6 +306,77 @@ kernel void decode_sample_top32_probs_batch(
                   params.top_p[batch]);
 }
 
+// The sampling penalties of one logit: repetition divides a positive
+// logit and multiplies a negative one when the prompt or the output holds
+// the token, and presence and frequency lower it by the output's count of
+// the token. The result saturates, so no rewritten logit is infinite.
+inline float penalize_logit(float value, uint count, float repetition,
+                            float repetition_inverse, float presence,
+                            float frequency) {
+  value *= value > 0.0f ? repetition_inverse : repetition;
+  if (count)
+    value -= frequency * float(count) + presence;
+  return clamp(value, -FLT_MAX, FLT_MAX);
+}
+
+// Rewrites one token's logit in each penalized row of one entry, in place.
+// Bit r of drafted is set when the lane's verify input row r holds the
+// token: those are the draft tokens that verify row r's context adds to the
+// output, so row r counts bits 1..r on top of the table's count.
+inline void penalize_token(device float *logits, device const uint *words,
+                           uint token, uint entry, uint drafted,
+                           constant SamplingPenaltyParams &params) {
+  const uint word =
+      words[ulong(params.table_row[entry]) * params.vocabulary + token];
+  if (!word && !drafted)
+    return;
+  device float *column =
+      logits +
+      (ulong(params.logits_lane[entry]) * params.row_stride +
+       params.row_offset) * params.vocabulary +
+      token;
+  for (uint row = 0; row < params.rows; ++row) {
+    const uint count = (word & SPLASH_PENALTY_COUNT_MASK) +
+                       popcount(drafted & ((2u << row) - 2u));
+    if (!count && !(word & SPLASH_PENALTY_PROMPT_BIT))
+      continue;
+    device float &logit = column[ulong(row) * params.vocabulary];
+    logit = penalize_logit(logit, count, params.repetition[entry],
+                           params.repetition_inverse[entry],
+                           params.presence[entry], params.frequency[entry]);
+  }
+}
+
+// One thread per vocabulary token and penalized entry, over the rows the
+// first token after a prompt is selected from.
+kernel void decode_sample_penalize(device float *logits [[buffer(0)]],
+                                   device const uint *words [[buffer(1)]],
+                                   constant SamplingPenaltyParams &params
+                                   [[buffer(2)]],
+                                   uint2 position [[thread_position_in_grid]]) {
+  if (position.x < params.vocabulary && position.y < params.entries)
+    penalize_token(logits, words, position.x, position.y, 0, params);
+}
+
+// The verify rows of each penalized lane, whose contexts add the lane's
+// draft tokens (verify input rows 1..7) one row at a time.
+kernel void decode_sample_penalize_verify(
+    device float *logits [[buffer(0)]], device const uint *words [[buffer(1)]],
+    device const uint *input_tokens [[buffer(2)]],
+    constant SamplingPenaltyParams &params [[buffer(3)]],
+    uint2 position [[thread_position_in_grid]]) {
+  const uint token = position.x;
+  const uint entry = position.y;
+  if (token >= params.vocabulary || entry >= params.entries)
+    return;
+  device const uint *inputs =
+      input_tokens + ulong(params.logits_lane[entry]) * SPLASH_TARGET_VERIFY_ROWS;
+  uint drafted = 0;
+  for (uint row = 1; row < SPLASH_TARGET_VERIFY_ROWS; ++row)
+    drafted |= uint(inputs[row] == token) << row;
+  penalize_token(logits, words, token, entry, drafted, params);
+}
+
 inline bool top_beats(float value, uint token, float other, uint other_token) {
   return value > other || (value == other && token < other_token);
 }

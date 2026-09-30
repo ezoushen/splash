@@ -45,6 +45,33 @@ struct TargetSamplingBatchParams {
 static_assert(sizeof(TargetSamplingBatchParams) == 80,
               "Batched target sampling parameters are 80 bytes on both sides");
 
+// A penalized request's word for each vocabulary token, in its state slot's
+// row of the penalty table (ops::Sampling::loadPenaltyWords): the prompt bit
+// marks a prompt token, and the count is how often the target selected it.
+#define SPLASH_PENALTY_PROMPT_BIT 0x80000000u
+#define SPLASH_PENALTY_COUNT_MASK 0x7fffffffu
+
+// The penalized lanes of one penalty dispatch. Each entry names the lane of
+// its logits and the penalty table row it reads; rows penalizes that many
+// rows of the lane's row_stride, from row_offset. repetition_inverse is
+// 1 / repetition, saturated to the largest float.
+struct SamplingPenaltyParams {
+  uint32_t vocabulary;
+  uint32_t rows;
+  uint32_t row_stride;
+  uint32_t row_offset;
+  uint32_t entries;
+  uint32_t logits_lane[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t table_row[SPLASH_MAXIMUM_BATCH_WIDTH];
+  float repetition[SPLASH_MAXIMUM_BATCH_WIDTH];
+  float repetition_inverse[SPLASH_MAXIMUM_BATCH_WIDTH];
+  float presence[SPLASH_MAXIMUM_BATCH_WIDTH];
+  float frequency[SPLASH_MAXIMUM_BATCH_WIDTH];
+};
+
+static_assert(sizeof(SamplingPenaltyParams) == 116,
+              "Sampling penalty parameters are 116 bytes on both sides");
+
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];

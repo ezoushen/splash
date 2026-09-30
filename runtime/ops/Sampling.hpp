@@ -13,6 +13,20 @@ namespace splash::ops {
 // ask for a larger top-k.
 inline constexpr uint32_t kTargetSamplingCandidates = 32;
 
+// The sampling penalties, which rewrite a lane's target logits before its
+// policy selects from them: repetition scales the logit of every token the
+// prompt or the output holds, presence and frequency lower that of every
+// token the output holds. The defaults leave the logits unchanged.
+struct SamplingPenalties final {
+  float repetition = 1.0F;
+  float presence = 0.0F;
+  float frequency = 0.0F;
+
+  [[nodiscard]] bool active() const noexcept {
+    return repetition != 1.0F || presence != 0.0F || frequency != 0.0F;
+  }
+};
+
 struct SamplingPolicy final {
   uint32_t topK = 1;
   float temperature = 1.0F;
@@ -21,8 +35,18 @@ struct SamplingPolicy final {
   // The lane ignores end-of-sequence: the target never selects a stop token,
   // though the draft may still propose one.
   bool excludesStopTokens = false;
+  // Greedy lanes take the argmax of the penalized logits.
+  SamplingPenalties penalties{};
 
   [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F; }
+};
+
+// The penalty words of every state slot, one row of vocabulary words each,
+// and the row each lane of a dispatch reads. Lanes follow the batch plan,
+// not slots, so a lane never binds a slot's row by its own index.
+struct PenaltyTable final {
+  metal::MetalBuffer words;
+  std::span<const uint32_t> rows;
 };
 
 struct SamplingWorkspace final {
@@ -54,6 +78,9 @@ struct SamplingBuffers final {
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer argmaxValues;
   metal::MetalBuffer argmaxIndices;
+  // Verify input tokens [rows]: row 0 of a lane is its anchor, rows 1..7 its
+  // draft tokens. Only penalized verify rows read them.
+  metal::MetalBuffer inputTokens{};
 };
 
 struct DraftSelectorBuffers final {
@@ -84,9 +111,10 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer acceptedCounts;
 };
 
-// Target token policy. This operator owns top-k/top-p, constrained selection,
-// stop-token exclusion and greedy argmax pipeline ABIs; the model only
-// supplies policy, buffers and its stop tokens.
+// Target token policy. This operator owns the sampling penalties,
+// top-k/top-p, constrained selection, stop-token exclusion and greedy
+// argmax pipeline ABIs; the model only supplies policy, buffers, penalty
+// words and its stop tokens.
 class Sampling final {
 public:
   // rowsPerLane is the kernels' SPLASH_TARGET_VERIFY_ROWS.
@@ -98,13 +126,28 @@ public:
   [[nodiscard]] static SamplingWorkspace workspace(uint32_t rows);
   [[nodiscard]] static DraftSelectorWorkspace draftWorkspace(uint32_t positions);
 
+  // A penalized request's penalty words (metal/abi/Sampling.h): the prompt
+  // bit of every prompt token when markPrompt, as only repetition reads it,
+  // and the count of every token the target selected. Every token must be
+  // inside the vocabulary, one word each.
+  static void loadPenaltyWords(std::span<uint32_t> words,
+                               std::span<const uint32_t> prompt,
+                               std::span<const uint32_t> selected,
+                               bool markPrompt);
+  static void countPenaltyTokens(std::span<uint32_t> words,
+                                 std::span<const uint32_t> selected);
+
+  // A lane whose policy has active penalties has its logits rewritten in
+  // place first, from its row of the penalty table; the rows must hold the
+  // LM head's fresh output. Other lanes dispatch nothing new.
   void addInitial(metal::CommandGraph &graph, const SamplingPolicy &policy,
                   SamplingBuffers buffers, uint32_t rowOffset,
-                  uint32_t stopToken0, uint32_t stopToken1) const;
+                  uint32_t stopToken0, uint32_t stopToken1,
+                  PenaltyTable penalties = {}) const;
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, uint32_t stopToken0,
-                 uint32_t stopToken1) const;
+                 uint32_t stopToken1, PenaltyTable penalties = {}) const;
   // proposalTokens is the kernels' SPLASH_DRAFT_PROPOSAL_TOKENS.
   void addDraftSelector(
       metal::CommandGraph &graph, DraftSelectorBuffers buffers,
@@ -122,6 +165,13 @@ public:
                       uint32_t lanes) const;
 
 private:
+  // Penalizes the row at rowOffset of each penalized lane or, for verify,
+  // all its rows, each also counting the draft tokens its context adds.
+  void addPenalties(metal::CommandGraph &graph,
+                    std::span<const SamplingPolicy> policies,
+                    const SamplingBuffers &buffers, const PenaltyTable &table,
+                    uint32_t rowOffset, bool verify) const;
+
   metal::MetalBackend &backend_;
   uint32_t vocabulary_ = 0;
   uint32_t rowsPerLane_ = 0;

@@ -281,6 +281,9 @@ enum class DecodeTensor : uint32_t {
   ProposalProbs,
   ProposedTokens,
   PageTable,
+  // Indexed by state slot, like PageTable: a penalized request's penalty
+  // words (ops::Sampling::loadPenaltyWords).
+  PenaltyState,
   VerifyPackedBase,
   VerifyMixedBase,
   VerifyDecayBase,
