@@ -113,12 +113,16 @@ public:
   [[nodiscard]] uint32_t page(uint64_t blockId) const;
   [[nodiscard]] std::shared_ptr<model::KvDiskSlot> slot(uint64_t blockId) const;
   [[nodiscard]] bool hasDiskChildren(uint64_t blockId) const;
-  // StateCache counts each of its entries in and out: a state restores
-  // through the KV of every block above its own.
-  void countState(uint64_t blockId, bool added) noexcept;
+  // StateCache counts each of its entries in and out, and each entry while
+  // an unfinished request uses it: a state restores through the KV of every
+  // block above its own.
+  void countState(uint64_t blockId, bool added, bool inUse) noexcept;
+  void countStateInUse(uint64_t blockId, bool added) noexcept;
   // A state sits below the block. Without one, the disk-only blocks below
   // it are never read again.
   [[nodiscard]] bool stateBelow(uint64_t blockId) const;
+  // A state an unfinished request uses sits below the block.
+  [[nodiscard]] bool stateInUseBelow(uint64_t blockId) const;
   // StateCache notes each ordinary publication or reuse of a state at this
   // block; lookups that find the block without one report a lost state.
   void noteState(uint64_t blockId);
@@ -149,11 +153,11 @@ public:
   evictionCandidate(uint64_t after = 0) const;
   // Oldest unused holder of a disk copy to replace: with duplicate, a
   // resident block whose copy is redundant; otherwise a disk-only block
-  // without children.
+  // without children. Pass the previous candidate to continue the scan.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  diskCandidate(bool duplicate) const noexcept;
+  diskCandidate(bool duplicate, uint64_t after = 0) const;
   // The blocks below a block, each after its children, visiting only that
-  // subtree; empty when one of them is in transfer or in use. Below a
+  // subtree; empty when one of them is in transfer or active. Below a
   // resident leaf they are disk-only; below a poisoned block some may be
   // resident.
   [[nodiscard]] std::vector<uint64_t> subtree(uint64_t blockId) const;
@@ -180,6 +184,7 @@ private:
     uint32_t children = 0;
     uint32_t residentChildren = 0;
     uint32_t statesBelow = 0;
+    uint32_t statesInUseBelow = 0;
     uint32_t activeUsers = 0;
     uint32_t depth = 0;
     uint64_t lastUsed = 0;
@@ -200,6 +205,9 @@ private:
   void unlink(Block &entry) noexcept;
   void giveDiskCopy(Block &entry, std::shared_ptr<model::KvDiskSlot> slot) noexcept;
   void inherit(Block &parent, uint64_t lastUsed) noexcept;
+  // Applies count to every block above this one.
+  template <typename Count>
+  void countAbove(uint64_t blockId, const Count &count) noexcept;
   // A poisoned block leaves as soon as nothing refers to it.
   void erasePoisonedLeaf(uint64_t blockId) noexcept;
 

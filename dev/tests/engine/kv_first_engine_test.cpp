@@ -586,6 +586,14 @@ void runUntilIdle(engine::Engine &engine) {
   require(engine.idle(), "engine did not reach idle");
 }
 
+// Ticks on from `now` until done() holds.
+void tickUntil(engine::Engine &engine, double &now, const std::function<bool()> &done,
+               const char *message) {
+  for (uint32_t step = 0; step < 1000 && !done(); ++step)
+    static_cast<void>(engine.tick(now++));
+  require(done(), message);
+}
+
 void testConcurrentColdPrefixesComputeOnce() {
   Storage storage(64);
   KvPool pool(storage);
@@ -670,7 +678,10 @@ void testSharedPrefillEvictedPublicationFallsBack() {
   engine.submit(request(2, std::vector<uint32_t>(193, 7)));
   static_cast<void>(engine.tick(0));
   static_cast<void>(engine.tick(1));
-  require(cache.reclaimOneState(),
+  // The producer's replay point is in use, so pressure takes it, not an
+  // ordinary publication.
+  static_cast<void>(cache.reclaimCache(0, true));
+  require(cache.snapshot().stateCache.entries == 0,
           "published shared prefix was pinned against pressure reclamation");
   runUntilIdle(engine);
   require(events.completedCount == 2 && model.prefillRows == 386 &&
@@ -5642,8 +5653,414 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
           "the constrained lane stopped, or the restore did not land whole");
 }
 
+// The field failure: a long decode's own replay point was the oldest cache
+// entry while another request prefilled, and growth reclaim took it before
+// newer state and KV; the conversation's next turn replayed its prompt.
+void testRunningRequestKeepsItsReplayPoint() {
+  Storage storage(12);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  double now = 1;
+
+  const std::vector<uint32_t> first(65, 1);
+  auto conversation = request(1, first);
+  conversation.maxNewTokens = 60;
+  engine.submit(std::move(conversation));
+  tickUntil(engine, now, [&] { return events.outputs[1].size() >= 4; },
+            "the conversation did not decode");
+  require(resources.snapshot().stateCache.inUse == 1,
+          "the decode did not use its replay point");
+  // A newer request runs to completion: its state and KV are newer than the
+  // decode's replay point.
+  engine.submit(request(2, std::vector<uint32_t>(97, 2)));
+  tickUntil(engine, now, [&] { return events.usage.contains(2); },
+            "the newer request did not finish");
+  // Growth now needs cached pages back.
+  storage.growthBlocked = true;
+  executor.kvGrowthBlocked = &storage.growthBlocked;
+  executor.unblockGrowthOnSuspend = false;
+  engine.submit(request(3, std::vector<uint32_t>(97, 3)));
+  tickUntil(engine, now, [&] { return events.usage.contains(1) && events.usage.contains(3); },
+            "the conversation or the growing request did not finish");
+  require(executor.suspensions == 0 && events.failedCount == 0,
+          "the fixture suspended or failed a lane");
+
+  std::vector<uint32_t> next = first;
+  next.insert(next.end(), events.outputs[1].begin(), events.outputs[1].end());
+  next.resize(next.size() + 40, 7);
+  engine.submit(request(4, next));
+  tickUntil(engine, now, [&] { return engine.idle(); }, "the next turn did not finish");
+  require(events.starts.back() ==
+              std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64},
+          "the next turn lost the replay point its predecessor ran from");
+  const auto state = resources.snapshot().stateCache;
+  require(state.inUse == 0 && state.inUseEvictions == 0,
+          "a finished request still used its replay point");
+}
+
+// A lane suspended under host pressure keeps using its replay point, the
+// oldest cache entry once a peer finishes. The growth of another peer that
+// still runs reuses cached pages: it takes the finished peer's newer state
+// and KV, not the point the suspended lane and its next turn resume from.
+void testSuspendedRequestKeepsItsReplayPoint() {
+  Storage storage(64);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(3);
+  executor.decodeFinishes = false;
+  Events events;
+  bool paused = false;
+  EngineConfig config;
+  config.growthPaused = [&] { return paused; };
+  engine::Engine engine(config, resources, executor, events);
+  double now = 1;
+  // Every lane needs its next page at the same step: the shortest history
+  // yields, the next one finishes first.
+  const std::vector<uint32_t> first(81, 1);
+  const std::vector<std::pair<std::vector<uint32_t>, uint32_t>> lanes{
+      {first, 40}, {std::vector<uint32_t>(113, 2), 20}, {std::vector<uint32_t>(145, 3), 210}};
+  for (uint64_t id = 1; id <= lanes.size(); ++id) {
+    auto value = request(id, lanes[id - 1].first);
+    value.maxNewTokens = lanes[id - 1].second;
+    engine.submit(std::move(value));
+  }
+  tickUntil(engine, now, [&] { return !events.outputs[3].empty(); }, "the lanes did not decode");
+  paused = true;
+  storage.growthBlocked = true;
+  storage.allocationFailure = metal::AllocationFailure::HostPressure;
+  tickUntil(engine, now, [&] { return executor.suspensions == 1; }, "no lane was suspended");
+  // The pool grows again while the engine still drains.
+  storage.growthBlocked = false;
+  tickUntil(engine, now, [&] { return events.usage.contains(2); }, "the peer did not finish");
+  require(executor.resumptions == 0 && resources.snapshot().stateCache.inUse == 2,
+          "the suspended lane and the running peer did not both use their points");
+  storage.growthBlocked = true;
+  tickUntil(engine, now, [&] { return events.usage.contains(3); },
+            "the growing peer did not finish");
+  std::vector<uint32_t> history = first;
+  history.insert(history.end(), events.outputs[1].begin(), events.outputs[1].end());
+  const auto state = resources.snapshot().stateCache;
+  require(executor.resumptions == 0 && state.evictions == 1 && state.inUseEvictions == 0 &&
+              resources.probe(history).cachedTokens() == 64,
+          "the growing peer took the suspended lane's replay point");
+  paused = false;
+  storage.growthBlocked = false;
+  tickUntil(engine, now, [&] { return engine.idle(); }, "the suspended lane did not finish");
+  require(executor.restored == 64, "the suspended lane did not resume from its replay point");
+  std::vector<uint32_t> next = first;
+  next.insert(next.end(), events.outputs[1].begin(), events.outputs[1].end());
+  next.resize(next.size() + 40, 7);
+  engine.submit(request(4, next));
+  tickUntil(engine, now, [&] { return engine.idle(); }, "the next turn did not finish");
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              resources.snapshot().stateCache.inUse == 0,
+          "the next turn lost the replay point its predecessor resumed from");
+}
+
+// A resumed lane keeps using its prompt's replay point: the point its
+// generated history reaches lies inside the generation prompt, which the
+// conversation's next turn renders anew, so that point stays ordinary.
+void testResumedLaneKeepsThePromptReplayPoint() {
+  Storage storage(6);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  for (uint64_t id : {264, 265}) {
+    auto value = request(id, std::vector<uint32_t>(65, id));
+    // The prompt's replay point lands at 32, the history's at 64.
+    value.generationPromptTokens = 30;
+    value.maxNewTokens = 30;
+    engine.submit(std::move(value));
+  }
+  // Lookups keep both prompts' points resident while the lanes contend for
+  // pages: the reclaim that ends in a yield takes what is in use too.
+  std::vector<CacheLookup> held = runUntilStatesHeld(engine, resources, {264, 265});
+  double now = 100;
+  for (; now < 200 && executor.suspensions == 0; ++now)
+    static_cast<void>(engine.tick(now));
+  held.clear();
+  // Each prompt's point, then the resumed lane's history point.
+  for (; now < 400 && resources.snapshot().stateCache.entries < 3; ++now)
+    static_cast<void>(engine.tick(now));
+  require(executor.resumptions == 1 && executor.restored == 32 &&
+              resources.snapshot().stateCache.entries == 3,
+          "the resumed lane did not publish its history's replay point");
+  // Prompt tokens are the request id.
+  const uint64_t id = executor.resumedPrompts.front().front();
+  require(!events.usage.contains(id), "the resumed lane finished early");
+  while (resources.snapshot().stateCache.entries > 1) {
+    require(resources.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress,
+            "the cache could not be reclaimed");
+  }
+  // The next turn keeps the text before the generation prompt.
+  std::vector<uint32_t> next(35, static_cast<uint32_t>(id));
+  next.resize(80, 7);
+  require(resources.probe(next).cachedTokens() == 32,
+          "the history's replay point outlasted the prompt's");
+  for (; now < 400 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  engine.submit(request(266, next));
+  for (; now < 500 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && events.starts.back() ==
+              std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 32},
+          "the next turn did not resume from the prompt's replay point");
+}
+
+// Requests with the same prompt resume from the same replay point and each
+// use it: the first to end leaves it in use.
+void testSharedReplayPointCountsEachRequest() {
+  Storage storage(64);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  for (uint64_t id : {1, 2}) {
+    auto value = request(id, std::vector<uint32_t>(65, 7));
+    value.maxNewTokens = id == 1 ? 10 : 40;
+    engine.submit(std::move(value));
+  }
+  double now = 1;
+  for (; now < 100 && !events.usage.contains(1); ++now)
+    static_cast<void>(engine.tick(now));
+  require(events.startIds.size() == 2 && executor.restored == 64 &&
+              events.usage.contains(1) && !events.usage.contains(2),
+          "the fixture did not overlap two requests on one replay point");
+  require(resources.snapshot().stateCache.inUse == 1,
+          "the first request to end released its peer's replay point");
+  for (; now < 200 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && resources.snapshot().stateCache.inUse == 0,
+          "the last request to end kept its replay point in use");
+}
+
+// A prompt sent again restores the replay point its first run published and
+// uses it while it runs.
+void testRestoredEndpointIsInUse() {
+  Storage storage(64);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  const std::vector<uint32_t> prompt(65, 7);
+  engine.submit(request(1, prompt));
+  runUntilIdle(engine);
+  executor.decodeFinishes = false;
+  auto again = request(2, prompt);
+  again.maxNewTokens = 10;
+  engine.submit(std::move(again));
+  double now = 100;
+  for (; now < 120 && events.outputs[2].size() < 2; ++now)
+    static_cast<void>(engine.tick(now));
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              resources.snapshot().stateCache.inUse == 1,
+          "a restored replay point was not in use");
+  for (; now < 200 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && resources.snapshot().stateCache.inUse == 0,
+          "the restored replay point stayed in use");
+}
+
+// A request's replay point is in use from the moment it is reached. With no
+// cache slot free and only another running request's point cached, its
+// publication recycles that older point, as no ordinary publication may.
+void testReplayPointRecyclesAnOlderPointInUse() {
+  Storage storage(64);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  double now = 1;
+  const auto decode = [&](uint64_t id) {
+    auto value = request(id, std::vector<uint32_t>(65, id));
+    value.maxNewTokens = 1000;
+    engine.submit(std::move(value));
+    tickUntil(engine, now, [&] { return events.outputs[id].size() >= 2; },
+              "a request did not decode");
+  };
+  decode(1);
+  require(resources.snapshot().stateCache.entries == 1 &&
+              resources.snapshot().stateCache.inUse == 1,
+          "the older request did not cache its replay point");
+  // No snapshot slot is free for the newer request's point.
+  executor.deniedSnapshots = 1;
+  decode(2);
+  const auto snapshot = engine.snapshot();
+  require(snapshot.recycledStatePublications == 1 &&
+              snapshot.replayStatePublicationFailures == 0 &&
+              snapshot.resources.stateCache.entries == 1 &&
+              snapshot.resources.stateCache.inUse == 2 &&
+              snapshot.resources.stateCache.inUseEvictions == 1,
+          "the newer replay point did not recycle the older point in use");
+}
+
+// The pressure warning's speculative shrink keeps the point it kept before
+// states could be in use: a request that just finished outranks an older
+// running request's replay point, which goes, after the older ordinary
+// state, like any cache the shrink may take.
+void testWarningShrinkKeepsTheFinishedPoint() {
+  Storage storage(64);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  double now = 1;
+  engine.submit(request(1, std::vector<uint32_t>(65, 1)));
+  tickUntil(engine, now, [&] { return engine.idle(); }, "the older conversation did not finish");
+  executor.decodeFinishes = false;
+  auto running = request(2, std::vector<uint32_t>(65, 2));
+  running.maxNewTokens = 1000;
+  engine.submit(std::move(running));
+  tickUntil(engine, now, [&] { return events.outputs[2].size() >= 2; },
+            "the long decode did not start");
+  auto finished = request(3, std::vector<uint32_t>(65, 3));
+  finished.maxNewTokens = 2;
+  engine.submit(std::move(finished));
+  tickUntil(engine, now, [&] { return events.usage.contains(3); },
+            "the newer request did not finish");
+  require(resources.snapshot().stateCache.entries == 3 &&
+              resources.snapshot().stateCache.inUse == 1,
+          "the fixture did not cache three replay points, one in use");
+
+  static_cast<void>(engine.reclaimMemory({.reclaim = true,
+                                          .targetBytes = std::numeric_limits<uint64_t>::max(),
+                                          .keepResumePoint = true,
+                                          .keepServingFootprint = true}));
+  const auto cachedTokens = [&](uint32_t token) {
+    std::vector<uint32_t> next(65, token);
+    next.resize(80, 9);
+    return resources.probe(next).cachedTokens();
+  };
+  const auto state = resources.snapshot().stateCache;
+  require(state.entries == 1 && state.inUseEvictions == 1 && cachedTokens(3) == 64 &&
+              cachedTokens(1) == 0 && cachedTokens(2) == 0,
+          "the shrink did not keep the finished request's point over the running one");
+}
+
+// Every end of a decoding request releases its replay point: cancellation
+// and failure at once, before the request leaves the engine, the deadline
+// and capacity exhaustion when the engine ends it.
+void testEveryEndReleasesTheReplayPoint() {
+  enum class End { Cancel, Failure, Deadline, Capacity };
+  for (const End end : {End::Cancel, End::Failure, End::Deadline, End::Capacity}) {
+    // Without a peer or cached KV to take, the decode's growth past three
+    // pages exhausts the capacity, after it took the request's own point as
+    // the last thing left.
+    Storage storage(end == End::Capacity ? 3 : 64);
+    KvPool pool(storage);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    executor.decodeFinishes = false;
+    Events events;
+    engine::Engine engine({}, resources, executor, events);
+    auto value = request(1, std::vector<uint32_t>(65, 7));
+    value.maxNewTokens = 1000;
+    value.deadlineMilliseconds = end == End::Deadline ? 50 : 10000;
+    engine.submit(std::move(value));
+    double now = 1;
+    for (; now < 40 && (events.outputs[1].size() < 2 || engine.commandInFlight()); ++now)
+      static_cast<void>(engine.tick(now));
+    require(resources.snapshot().stateCache.inUse == 1,
+            "the decode did not use its replay point");
+    if (end == End::Cancel)
+      engine.cancel(1);
+    else if (end == End::Failure)
+      engine.failRequest(1, "test_failure", "the request failed");
+    require(end == End::Deadline || end == End::Capacity ||
+                resources.snapshot().stateCache.inUse == 0,
+            "the request's end did not release its replay point at once");
+    for (now = 100; now < 200 && !engine.idle(); ++now)
+      static_cast<void>(engine.tick(now));
+    const auto state = resources.snapshot().stateCache;
+    require(engine.idle() && state.inUse == 0 &&
+                state.entries == (end == End::Capacity ? 0U : 1U) &&
+                events.capacityExhaustedCount == (end == End::Capacity ? 1U : 0U),
+            "a request's end did not release its replay point");
+  }
+}
+
+// A suspended lane keeps its replay point while it waits for the disk copy
+// and after the copy fails to load. Cancellation or the deadline during the
+// read, and cancellation while it waits again, release the point.
+void testWaitingEndsReleaseTheReplayPoint() {
+  enum class End { CancelDuringRead, DeadlineDuringRead, CancelAfterFailedRead };
+  for (const End end : {End::CancelDuringRead, End::DeadlineDuringRead,
+                        End::CancelAfterFailedRead}) {
+    Storage storage(64);
+    KvPool pool(storage);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor executor;
+    executor.deniedSnapshots = 1000;
+    executor.stateTier = std::make_shared<OffloadControl>();
+    executor.stateTier->ready = true;
+    Events events;
+    engine::Engine engine({}, cache, executor, events);
+    storage.allocationFailure = metal::AllocationFailure::HostPressure;
+    auto value = request(290, std::vector<uint32_t>(129, 290));
+    value.deadlineMilliseconds = 1000;
+    engine.submit(std::move(value));
+    // The replay state at 128 goes to disk; the last prompt token's page
+    // suspends the request, and its resumption waits for the read.
+    require(engine.tick(1) && engine.tick(2) &&
+                engine.snapshot().diskStatePublications == 1,
+            "fixture did not write the replay state to disk");
+    storage.growthBlocked = true;
+    require(engine.tick(3) && engine.snapshot().resourceSuspensions == 1,
+            "the last prompt token's page did not suspend the request");
+    storage.growthBlocked = false;
+    static_cast<void>(engine.tick(103));
+    require(executor.diskReads == 1 && cache.snapshot().stateCache.inUse == 1,
+            "the resumption did not wait for its replay point");
+    executor.restoreControl->ready = true;
+    if (end == End::CancelDuringRead) {
+      engine.cancel(290);
+      static_cast<void>(engine.tick(104));
+    } else if (end == End::DeadlineDuringRead) {
+      static_cast<void>(engine.tick(1000));
+    } else {
+      executor.resumeDenied = true;
+      executor.restoreControl->success = false;
+      static_cast<void>(engine.tick(104));
+      require(!engine.idle() && !engine.commandInFlight() &&
+                  cache.snapshot().stateCache.inUse == 1,
+              "a failed read ended the replay point's use");
+      engine.cancel(290);
+      require(cache.snapshot().stateCache.inUse == 0,
+              "cancelling the waiting lane did not release its replay point");
+      static_cast<void>(engine.tick(105));
+    }
+    require(engine.idle() && cache.snapshot().stateCache.inUse == 0 &&
+                events.completedCount + events.failedCount == 1,
+            "a waiting request's end did not release its replay point");
+  }
+}
+
 int main() {
   try {
+    testRunningRequestKeepsItsReplayPoint();
+    testSuspendedRequestKeepsItsReplayPoint();
+    testResumedLaneKeepsThePromptReplayPoint();
+    testSharedReplayPointCountsEachRequest();
+    testRestoredEndpointIsInUse();
+    testReplayPointRecyclesAnOlderPointInUse();
+    testWarningShrinkKeepsTheFinishedPoint();
+    testEveryEndReleasesTheReplayPoint();
+    testWaitingEndsReleaseTheReplayPoint();
     testConcurrentColdPrefixesComputeOnce();
     testSharedPrefillRebuildsTheMissingJunctionOnce();
     testSharedPrefillReleasesDifferentJunctionsIndependently();

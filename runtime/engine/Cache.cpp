@@ -12,7 +12,8 @@ Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier,
              std::shared_ptr<const model::DiskBudget> diskBudget)
     : pool_(pool), tier_(kvTier), diskBudget_(std::move(diskBudget)),
       kv_(pool, cacheNamespace, recency_),
-      states_(kv_, recency_), makeRoom_([this] { return freeDiskSpace(); }) {}
+      states_(kv_, recency_),
+      makeRoom_([this](bool inUse) { return freeDiskSpace(inUse); }) {}
 
 void Cache::beginRequest(uint64_t requestId) {
   if (!requestId)
@@ -361,27 +362,34 @@ CacheReclaimResult Cache::evictOne(bool keepResumePoint) {
 
   // Then oldest first across both kinds. A state whose write must wait for
   // the one in flight stays, as does a KV leaf the tier cannot take now; the
-  // other kind may still give, and the next pass takes what waited.
-  std::optional<CacheEvictionCandidate> state =
-      states_.evictionCandidate(keepResumePoint, false);
-  std::optional<CacheEvictionCandidate> kv = oldestKvLeaf(0);
-  bool kvOpen = true;
-  while (state || (kvOpen && kv)) {
-    if (state && (!kvOpen || !kv || state->lastUsed <= kv->lastUsed)) {
-      if (const StateEviction eviction = reclaimState(state->id); eviction.evicted)
-        return {true, eviction.reclaimedBytes};
-      state.reset();
-      continue;
-    }
-    switch (reclaimKvLeaf(kv->id)) {
-    case LeafReclaim::Started:
-      return {true, 0};
-    case LeafReclaim::Pending:
-      kvOpen = false;
-      break;
-    case LeafReclaim::Impossible:
-      kv = oldestKvLeaf(kv->id);
-      break;
+  // other kind may still give, and the next pass takes what waited. States
+  // in use and the KV they need follow in a pass of their own, once no
+  // transfer in flight can return what is needed first.
+  for (const bool inUse : {false, true}) {
+    if (inUse && transfersInFlight())
+      return {false, 0, true};
+    std::optional<CacheEvictionCandidate> state =
+        inUse ? states_.inUseCandidate(keepResumePoint)
+              : states_.evictionCandidate(keepResumePoint, false);
+    std::optional<CacheEvictionCandidate> kv = oldestKvLeaf(0, inUse);
+    bool kvOpen = true;
+    while (state || (kvOpen && kv)) {
+      if (state && (!kvOpen || !kv || state->lastUsed <= kv->lastUsed)) {
+        if (const StateEviction eviction = reclaimState(state->id); eviction.evicted)
+          return {true, eviction.reclaimedBytes};
+        state.reset();
+        continue;
+      }
+      switch (reclaimKvLeaf(kv->id)) {
+      case LeafReclaim::Started:
+        return {true, 0};
+      case LeafReclaim::Pending:
+        kvOpen = false;
+        break;
+      case LeafReclaim::Impossible:
+        kv = oldestKvLeaf(kv->id, inUse);
+        break;
+      }
     }
   }
   // Nothing to reclaim now. Transfers land only in pollTransfers(), so what
@@ -389,15 +397,24 @@ CacheReclaimResult Cache::evictOne(bool keepResumePoint) {
   return {false, 0, transfersInFlight()};
 }
 
-bool Cache::reclaimOneState(bool checkpointsOnly) {
-  const std::optional<CacheEvictionCandidate> state =
-      states_.evictionCandidate();
-  return state && (!checkpointsOnly || states_.checkpoint(state->id)) &&
-         states_.reclaim(state->id, completionNotifier_, makeRoom_).evicted;
+bool Cache::reclaimOneState(bool checkpointsOnly, uint64_t forBlock) {
+  if (const auto state = states_.evictionCandidate())
+    return (!checkpointsOnly || states_.checkpoint(state->id)) &&
+           states_.reclaim(state->id, completionNotifier_, makeRoom_).evicted;
+  // Only a publication in use displaces a state in use. It is written when
+  // the tier takes it, never dropped because the one write slot is busy.
+  if (checkpointsOnly || !states_.inUse(forBlock))
+    return false;
+  const auto used = states_.inUseCandidate();
+  return used && states_.reclaim(used->id, completionNotifier_, makeRoom_, true).evicted;
 }
 
 CacheReclaimResult Cache::reclaimStateForLane() {
-  const std::optional<CacheEvictionCandidate> state = states_.evictionCandidate();
+  // A lane is running work: a state in use goes after every other, once no
+  // transfer in flight can return what is needed first.
+  std::optional<CacheEvictionCandidate> state = states_.evictionCandidate();
+  if (!state && !transfersInFlight())
+    state = states_.inUseCandidate();
   if (!state)
     return {false, 0, transfersInFlight()};
   const StateEviction eviction =
@@ -405,10 +422,10 @@ CacheReclaimResult Cache::reclaimStateForLane() {
   return {eviction.evicted, eviction.reclaimedBytes, eviction.pending};
 }
 
-std::optional<CacheEvictionCandidate> Cache::oldestKvLeaf(uint64_t after) const {
+std::optional<CacheEvictionCandidate> Cache::oldestKvLeaf(uint64_t after, bool inUse) const {
   while (auto candidate = kv_.evictionCandidate(after)) {
     after = candidate->id;
-    if (!states_.resident(candidate->id))
+    if (!states_.resident(candidate->id) && kvNeededByStateInUse(candidate->id) == inUse)
       return candidate;
   }
   return std::nullopt;
@@ -641,7 +658,7 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
   }
   // Room in the quota or the tier that transfers in flight will free is
   // worth waiting for; room that nothing will free is not, and the leaf goes.
-  std::shared_ptr<model::KvDiskSlot> slot = acquireDiskSlot();
+  std::shared_ptr<model::KvDiskSlot> slot = acquireDiskSlot(kvNeededByStateInUse(block));
   if (!slot)
     return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible;
   // Making room may have taken the states the leaf was kept for; it then
@@ -659,16 +676,16 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
   return LeafReclaim::Started;
 }
 
-std::shared_ptr<model::KvDiskSlot> Cache::acquireDiskSlot() {
+std::shared_ptr<model::KvDiskSlot> Cache::acquireDiskSlot(bool inUse) {
   for (;;) {
     if (auto slot = tier_->acquireSlot())
       return slot;
-    if (!freeDiskSpace())
+    if (!freeDiskSpace(inUse))
       return {};
   }
 }
 
-bool Cache::freeDiskSpace() {
+bool Cache::freeDiskSpace(bool inUse) {
   const auto older = [](const std::optional<CacheEvictionCandidate> &left,
                         const std::optional<CacheEvictionCandidate> &right) {
     return left && (!right || left->lastUsed < right->lastUsed);
@@ -685,13 +702,23 @@ bool Cache::freeDiskSpace() {
   }
   // A state in RAM sits on resident KV. Should a disk-only leaf hold one all
   // the same, the leaf stays: that state's own write may be what asks for
-  // the room, and its reclaim holds the entry.
+  // the room, and its reclaim holds the entry. A leaf holding a state in use
+  // stays with that state.
   auto kvLeaf = kv_.diskCandidate(false);
+  while (kvLeaf && kvNeededByStateInUse(kvLeaf->id))
+    kvLeaf = kv_.diskCandidate(false, kvLeaf->id);
   if (kvLeaf && states_.resident(kvLeaf->id))
     kvLeaf.reset();
   const auto stateOnly = states_.diskCandidate(false);
-  if (!kvLeaf && !stateOnly)
-    return false;
+  if (!kvLeaf && !stateOnly) {
+    // Last, and only for a copy in use: the only copy of a state in use. The
+    // leaf it held is ordinary then, and goes on a later call.
+    const auto used = inUse ? states_.inUseDiskCandidate() : std::nullopt;
+    if (!used)
+      return false;
+    static_cast<void>(states_.evict(used->id));
+    return true;
+  }
   if (older(stateOnly, kvLeaf)) {
     static_cast<void>(states_.evict(stateOnly->id));
     return true;

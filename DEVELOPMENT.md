@@ -885,6 +885,16 @@ cannot be replayed.
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
 next turn may render it differently, so a follow-up resumes from there.
+
+Until the request ends, suspended or not, that replay point is in use, and so
+is the KV it restores through. Cache victims come in three classes:
+checkpoints, then ordinary states and KV, then what is in use. No work
+displaces anything of a class above its own. Memory for running requests takes
+what is in use after everything else, a publication or disk copy in use may
+displace the oldest state in use, and ordinary or optional work never does.
+Nothing in use is pinned, so running work that needs the memory still takes it
+once nothing else is left.
+
 Requests sharing a cold prefix can wait for a resident request's planned recovery
 point, then enter through the ordinary cache restore path. Waiting requests hold
 no active state cell or KV pages and return to ordinary admission when no useful
@@ -944,6 +954,8 @@ must leave the other its share. When the tier takes no more, admission waits
 for a transfer instead of evicting additional victims.
 
 A state with no available RAM cache slot can be written directly from its lane.
+When every state in RAM is in use, a replay point takes the slot of the oldest
+by writing that one out, and goes unpublished while the staging buffer is busy.
 Rolling checkpoints replace the least recently used copies like any state, so
 a suspended request keeps its progress when the quota is full; they retire when
 replaced or no longer needed. With the disk tier enabled, a checkpoint less than one full
@@ -957,10 +969,12 @@ states remain usable even when there is no room to promote them into RAM cache.
 
 Two unlinked temporary files share one quota for live slots. A full quota
 replaces the oldest redundant copy first, then the oldest sole copy, across
-both KV and states. A quota smaller than the working set can cause repeated
-reads and writes; it is not a write-rate limit. Each file retains its allocated
-high-water mark until shutdown, so filesystem space can exceed the live-slot
-quota. Closing the server releases both files.
+both KV and states. Sole copies of states in use, and the KV they restore
+through, make room only for a copy that is itself in use, and last; an ordinary
+state that finds no other room is dropped. A quota smaller than the working set
+can cause repeated reads and writes; it is not a write-rate limit. Each file
+retains its allocated high-water mark until shutdown, so filesystem space can
+exceed the live-slot quota. Closing the server releases both files.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range
 moved through the file's own 1 MiB buffer. The KV tier takes no Metal memory.

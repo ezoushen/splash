@@ -188,6 +188,9 @@ public:
   // False when the tier cannot take the state now; nothing is published then.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
                                         bool checkpoint = false);
+  // The request holding the handle is unfinished and its conversation
+  // resumes from the state at this block: see StateCache::use.
+  [[nodiscard]] StateUse useState(uint64_t kvBlock) { return states_.use(kvBlock); }
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
   // The state at this block has a RAM copy.
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
@@ -199,15 +202,18 @@ public:
   // others once they cover the extent that holds the fewest pages, whose
   // pages move to them (compactExtent). Only then is anything evicted:
   // disposable checkpoints first, then ordinary states and resident KV
-  // leaves, which share one oldest-first access order. A chosen state
-  // keeps its disk copy when it has one, is written when the tier admits it
-  // and dropped otherwise; its RAM is free when the call returns. A chosen
-  // KV leaf frees its page at once when a disk copy exists, is dropped when
-  // nothing depends on it, and is otherwise written first: its page returns
-  // when the copy has landed, which ensureTokens() reports as Pending so
-  // callers wait instead of evicting more. A full disk quota replaces the
-  // oldest redundant copy of either kind, then the oldest copy that is the
-  // only one.
+  // leaves, which share one oldest-first access order. States that
+  // unfinished requests use and the KV they restore through follow in their
+  // own such order, once no transfer in flight can return what is needed
+  // first. A chosen state keeps its disk copy when it has one, is written
+  // when the tier admits it and dropped otherwise; its RAM is free when the
+  // call returns. A chosen KV leaf frees its page at once when a disk copy
+  // exists, is dropped when nothing depends on it, and is otherwise written
+  // first: its page returns when the copy has landed, which ensureTokens()
+  // reports as Pending so callers wait instead of evicting more. A full disk
+  // quota replaces the oldest redundant copy of either kind, then the oldest
+  // copy that is the only one. The only copies of states in use, and the KV
+  // they restore through, make room only for a copy that is itself in use.
   // Active requests and pinned restores are never selected. A pass releases
   // every extent it empties; one that evicts everything moves pages only
   // once it has, so that nothing is copied and then evicted.
@@ -237,12 +243,19 @@ public:
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseExtents,
       bool keepResumePoint = false, bool keepRunway = false);
-  // Recycles exactly one unpinned state, preferring checkpoints, for a
-  // required state publication; the disk tier keeps it when it admits it.
-  [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
-  // The same for a lane that takes the state's buffers: a state the tier
-  // could take once the write in flight has finished stays and is reported
-  // pending, as in reclaimOne. evictableStates() are those it can take.
+  // Recycles exactly one unpinned state, preferring checkpoints, for the
+  // publication of a state at forBlock; the disk tier keeps it when it
+  // admits it. checkpointsOnly serves an optional publication, which takes
+  // only a checkpoint. A state in use goes only for a publication that is
+  // itself in use, once no other state is left, and is never dropped for a
+  // busy write slot: while the write in flight holds it, nothing is recycled.
+  [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false, uint64_t forBlock = 0);
+  // Recycles one unpinned state, preferring checkpoints, for a lane that
+  // takes the state's buffers. The lane is running work: a state in use goes
+  // once no other state is left and no transfer in flight can return what is
+  // needed first. A state the tier could take once the write in flight has
+  // finished stays and is reported pending, as in reclaimOne.
+  // evictableStates() are those it can take.
   [[nodiscard]] CacheReclaimResult reclaimStateForLane();
   [[nodiscard]] uint32_t evictableStates() const noexcept {
     return states_.evictable();
@@ -288,9 +301,9 @@ private:
     // by transfers in flight.
     Pending,
     // reclaimKvLeaf: the leaf stays for now and scans move on to the next
-    // one, because a state on it is in use, a disk subtree depends on it
+    // one, because a state on it is pinned, a disk subtree depends on it
     // and the tier has no room that a transfer in flight will free, or a
-    // disk subtree below it cannot drop yet (in use, in transfer, or a
+    // disk subtree below it cannot drop yet (active, in transfer, or a
     // state write in flight). demoteKv: the leaf cannot be written, and may
     // go without a copy, because the tier takes no writes, has no such
     // room, or making room took the states the leaf was kept for.
@@ -299,10 +312,13 @@ private:
 
   [[nodiscard]] TokenAdmission admitPages(uint32_t count,
                                           std::vector<uint32_t> &pages);
-  // One eviction in the shared recency order, checkpoints first.
+  // One eviction: checkpoints first, then the shared recency order, then
+  // what is in use.
   [[nodiscard]] CacheReclaimResult evictOne(bool keepResumePoint);
-  // Oldest resident KV leaf after `after` whose state, if any, is not in RAM.
-  [[nodiscard]] std::optional<CacheEvictionCandidate> oldestKvLeaf(uint64_t after) const;
+  // Oldest resident KV leaf after `after` whose state, if any, is not in RAM,
+  // and whose KV a state in use needs exactly when inUse.
+  [[nodiscard]] std::optional<CacheEvictionCandidate> oldestKvLeaf(uint64_t after,
+                                                                   bool inUse) const;
   // Frees the RAM of one resident KV leaf: through its disk copy when it has
   // one, by demotion when a state on it or below it depends on it, by
   // erasure otherwise, with any disk copies below it. Pending when the tier
@@ -318,20 +334,28 @@ private:
   [[nodiscard]] bool kvNeededByState(uint64_t block) const {
     return states_.contains(block) || kv_.stateBelow(block);
   }
-  // Erases the disk-only subtree below a resident leaf and the states on it;
-  // false, erasing nothing, while a block of it is in transfer or in use (a
-  // lookup holding a state uses its block) or a state write is in flight.
+  // The same for a state in use: such KV is in use too.
+  [[nodiscard]] bool kvNeededByStateInUse(uint64_t block) const {
+    return (states_.inUse(block) && states_.contains(block)) || kv_.stateInUseBelow(block);
+  }
+  // Erases the disk-only subtree below a resident leaf and the states on it,
+  // in use or not; false, erasing nothing, while a block of it is in transfer
+  // or active (a lookup holding a state keeps its block active) or a state
+  // write is in flight.
   [[nodiscard]] bool dropDiskSubtree(uint64_t block);
   // Nothing below a block whose read failed matches any more. Once none of
-  // it is in transfer or in use, it is erased with the states on it, and
-  // the poisoned block leaves with its last user.
+  // it is in transfer or active, it is erased with the states on it, in use
+  // or not, and the poisoned block leaves with its last user.
   void dropPoisoned();
-  // A slot for a new KV copy, replacing older copies while the quota is full.
-  [[nodiscard]] std::shared_ptr<model::KvDiskSlot> acquireDiskSlot();
-  // Gives up one disk copy: the oldest redundant one, KV or state, else the
-  // oldest that is the only copy, never the KV of a state in RAM. False when
-  // the disk holds nothing to give.
-  [[nodiscard]] bool freeDiskSpace();
+  // A slot for a new KV copy, replacing older copies while the quota is full;
+  // inUse when a state in use needs the copy.
+  [[nodiscard]] std::shared_ptr<model::KvDiskSlot> acquireDiskSlot(bool inUse);
+  // Gives up one disk copy for a new copy, in use or not: the oldest
+  // redundant one, KV or state, else the oldest that is the only copy, never
+  // the KV of a state in RAM. The only copy of a state in use, and the KV it
+  // restores through, go only for a copy in use, and after every other.
+  // False when the disk holds nothing the new copy may displace.
+  [[nodiscard]] bool freeDiskSpace(bool inUse);
   void startRestore(uint64_t block);
   [[nodiscard]] uint64_t pendingBytes() const noexcept;
   [[nodiscard]] uint64_t
@@ -349,7 +373,7 @@ private:
   CacheRecency recency_;
   KvCache kv_;
   StateCache states_;
-  std::function<bool()> makeRoom_;
+  DiskRoom makeRoom_;
   std::unordered_map<uint64_t, Request> requests_;
   std::vector<Demotion> demotions_;
   // Block IDs increase from parent to child. Restores start in that order so

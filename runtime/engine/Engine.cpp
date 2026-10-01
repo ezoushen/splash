@@ -435,12 +435,14 @@ bool Engine::admitQueued(double now) {
 uint32_t Engine::replayStateBoundary(const Request &active) noexcept {
   // A later request may not share the generation prompt; generated history
   // that a resumed lane replays is its own.
-  const uint32_t tail =
-      active.replayTokens == active.promptTokens
-          ? std::max(active.request.generationPromptTokens, uint32_t{1})
-          : 1;
-  return (active.replayTokens - tail) / KvCache::pageTokens *
-         KvCache::pageTokens;
+  if (active.replayTokens == active.promptTokens)
+    return promptReplayBoundary(active);
+  return (active.replayTokens - 1) / KvCache::pageTokens * KvCache::pageTokens;
+}
+
+uint32_t Engine::promptReplayBoundary(const Request &active) noexcept {
+  const uint32_t tail = std::max(active.request.generationPromptTokens, uint32_t{1});
+  return (active.promptTokens - tail) / KvCache::pageTokens * KvCache::pageTokens;
 }
 
 uint32_t Engine::sharedPrefillBoundary(const Request &left,
@@ -660,6 +662,8 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
         ++counters_.deduplicatedStatePublications;
       active.latestCheckpoint = {};
     }
+    if (resumeBoundary == promptReplayBoundary(active))
+      active.replayPoint = cache_.useState(lookup.state->kvBlock());
   }
   model_.setDraftContextPlan(active.request.id, std::move(draft));
   if (resuming) {
@@ -928,6 +932,11 @@ void Engine::publishReachedStateBoundaries(Request &active,
     materialized = true;
     try {
       const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
+      // The conversation's next turn resumes here, whatever this boundary's
+      // purpose: the state is in use before any of the ways below keeps it,
+      // so each of them makes room as work in use.
+      if (objective.tokens == promptReplayBoundary(active))
+        active.replayPoint = cache_.useState(block);
       if (cache_.reuseCompositeState(block, checkpoint)) {
         ++counters_.deduplicatedStatePublications;
       } else {
@@ -953,7 +962,9 @@ void Engine::publishReachedStateBoundaries(Request &active,
         }
         if (!state)
           state = model_.snapshot(active.request.id);
-        if (!state && cache_.reclaimOneState(checkpoint)) {
+        // A state in use is recycled only for a block in use, and never
+        // dropped for a busy write slot: this publication gives way instead.
+        if (!state && cache_.reclaimOneState(checkpoint, block)) {
           state = model_.snapshot(active.request.id);
           if (state)
             ++counters_.recycledStatePublications;
@@ -1518,6 +1529,8 @@ void Engine::release(Request &active) {
     active.suspended = false;
     signalResourceProgress();
   }
+  // Every end comes here; this request's use of its replay point ends.
+  active.replayPoint.reset();
 }
 
 void Engine::sweepTerminal() {

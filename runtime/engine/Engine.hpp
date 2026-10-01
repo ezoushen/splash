@@ -157,6 +157,10 @@ private:
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;
+    // The block of the prompt's replay boundary, where the conversation's
+    // next turn resumes: its state is in use from the moment the request
+    // reaches, reuses or restores it until the request ends, suspended or not.
+    StateUse replayPoint;
     // The scheduler owns the terminal phase; this flag records that the
     // corresponding event was emitted and model/resource ownership ended.
     bool finalized = false;
@@ -201,6 +205,9 @@ private:
   // only its prompt, before the prompt's generation prompt.
   [[nodiscard]] static uint32_t
   replayStateBoundary(const Request &request) noexcept;
+  // replayStateBoundary while the lane replays only its prompt.
+  [[nodiscard]] static uint32_t
+  promptReplayBoundary(const Request &request) noexcept;
   [[nodiscard]] static uint32_t sharedPrefillBoundary(const Request &left,
                                                       const Request &right);
   [[nodiscard]] bool pendingSharedPrefill(const Request &request,
