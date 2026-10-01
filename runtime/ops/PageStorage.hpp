@@ -44,8 +44,11 @@ public:
   [[nodiscard]] uint64_t extentBytes() const noexcept {
     return uint64_t{extentPages_} * layout_.bytesPerModelPage();
   }
-  [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept;
-  [[nodiscard]] uint32_t residentPages() const noexcept;
+  // The extents that hold memory now, and their bytes.
+  [[nodiscard]] uint32_t allocatedExtents() const noexcept { return allocatedExtents_; }
+  [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept {
+    return uint64_t{allocatedExtents_} * extentBytes();
+  }
   [[nodiscard]] bool isResident(uint32_t page) const override;
   [[nodiscard]] metal::AllocationResult ensureResident(uint32_t page) override;
   // The caller must prove that no active, prefix, reserved, or in-flight
@@ -84,8 +87,7 @@ private:
   uint32_t extentPages_ = 0;
   // Empty while the extent has no backing.
   std::vector<metal::MetalBuffer> extents_;
-  uint64_t residentBackingBytes_ = 0;
-  uint32_t residentPages_ = 0;
+  uint32_t allocatedExtents_ = 0;
   uint64_t generation_ = 0;
 };
 

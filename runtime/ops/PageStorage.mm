@@ -41,14 +41,6 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
     }
 }
 
-uint64_t PageStorage::actualAllocatedBytes() const noexcept {
-    return residentBackingBytes_;
-}
-
-uint32_t PageStorage::residentPages() const noexcept {
-    return residentPages_;
-}
-
 size_t PageStorage::extentIndex(uint32_t page) const {
     if (page >= pageCount_) throw std::out_of_range("invalid KV page id");
     return page / extentPages_;
@@ -80,8 +72,7 @@ metal::AllocationResult PageStorage::ensureResident(uint32_t page) {
                     "KV extent address leaves no room for the page index");
             }
             extent = std::move(allocated);
-            residentBackingBytes_ += bytes;
-            residentPages_ += extentPages_;
+            ++allocatedExtents_;
             ++generation_;
         });
     } catch (const metal::MetalAllocationError &error) {
@@ -96,12 +87,8 @@ bool PageStorage::releaseBackingForPage(uint32_t page) {
         throw std::logic_error(
             "cannot release KV backing while a command is in flight");
     }
-    if (residentBackingBytes_ < extentBytes() || residentPages_ < extentPages_) {
-        throw std::logic_error("KV resident accounting underflowed");
-    }
     extent = {};
-    residentBackingBytes_ -= extentBytes();
-    residentPages_ -= extentPages_;
+    --allocatedExtents_;
     ++generation_;
     return true;
 }

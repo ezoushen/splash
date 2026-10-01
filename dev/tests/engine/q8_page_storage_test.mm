@@ -302,19 +302,19 @@ void run(const std::string &metallib) {
         [&elasticHostAvailable] { return elasticHostAvailable; });
     kv::PageStorage hostGatedStorage(
         backend, hostGated.allocationAdmission(), kvLayout, 256, 128);
-    if (hostGatedStorage.residentPages() != 128) {
+    if (hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages() != 128) {
         throw std::runtime_error(
             "elastic Q8 storage started with " +
-            std::to_string(hostGatedStorage.residentPages()) +
+            std::to_string(hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages()) +
             " resident blocks instead of 128");
     }
     elasticHostAvailable = 128ULL * 1024 * 1024;
     require(!hostGatedStorage.ensureResident(128) &&
-                hostGatedStorage.residentPages() == 128,
+                hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages() == 128,
             "host pressure did not reject the next KV extent transactionally");
     elasticHostAvailable = 4ULL * 1024 * 1024 * 1024;
     require(hostGatedStorage.ensureResident(128) &&
-                hostGatedStorage.residentPages() == 256,
+                hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages() == 256,
             "KV growth did not recover after host memory became available");
 
     MemoryGovernor governor(
@@ -335,7 +335,7 @@ void run(const std::string &metallib) {
                 storage.actualAllocatedBytes() == extentBytes &&
                 backend.memoryStats().allocatedBytes == before + extentBytes,
             "the runway extent was not allocated at exactly its size");
-    require(storage.residentPages() == 128 && storage.isResident(127) && !storage.isResident(128),
+    require(storage.allocatedExtents() * storage.extentPages() == 128 && storage.isResident(127) && !storage.isResident(128),
             "initial Q8 runway residency is incorrect");
     const auto layer = storage.layer(15);
     require(layer.format == kv::Format::Int8 && layer.kv.extent_pages == 128 &&
@@ -359,7 +359,7 @@ void run(const std::string &metallib) {
 
     const uint64_t generation = storage.generation();
     require(storage.ensureResident(200) && storage.generation() == generation + 1 &&
-                storage.residentPages() == 256 &&
+                storage.allocatedExtents() * storage.extentPages() == 256 &&
                 storage.actualAllocatedBytes() == 2 * extentBytes &&
                 backend.memoryStats().allocatedBytes == before + 2 * extentBytes,
             "growth did not add exactly one extent");
@@ -386,7 +386,7 @@ void run(const std::string &metallib) {
         (void)ticket.wait();
     }
     require(storage.releaseBackingForPage(200) && !storage.isResident(200) &&
-                storage.generation() == generation + 2 && storage.residentPages() == 128 &&
+                storage.generation() == generation + 2 && storage.allocatedExtents() * storage.extentPages() == 128 &&
                 backend.memoryStats().allocatedBytes == before + extentBytes,
             "a released extent did not return its memory at once");
     require(!storage.releaseBackingForPage(200), "an unbacked extent was released twice");
@@ -399,7 +399,7 @@ void run(const std::string &metallib) {
     require(compactStorage.layer(9).kv.extent_pages == 512 &&
                 compactStorage.layer(9).kv.offset ==
                     9 * 512 * compactLayout.bytesPerLayerPage() &&
-                compactStorage.residentPages() == 512 &&
+                compactStorage.allocatedExtents() * compactStorage.extentPages() == 512 &&
                 compactStorage.actualAllocatedBytes() ==
                     512 * compactLayout.bytesPerModelPage(),
             "model-provided compact Q8 geometry was not honored");
@@ -413,11 +413,11 @@ void run(const std::string &metallib) {
                     bf16Layer.kv.offset == (layout.attentionLayers - 1) * extent * 2 *
                                                layout.dataBytesPerLayerPage(),
                 "BF16 regions hold quantization scales or misplace a layer");
-        require(bf16.residentPages() == extent && !bf16.isResident(extent) &&
+        require(bf16.allocatedExtents() * bf16.extentPages() == extent && !bf16.isResident(extent) &&
                     bf16.actualAllocatedBytes() == extent * layout.bytesPerModelPage(),
                 "BF16 initial residency escaped its admitted extent");
         requireSpansTileExtent(bf16, 0);
-        require(bf16.ensureResident(extent) && bf16.residentPages() == 2 * extent &&
+        require(bf16.ensureResident(extent) && bf16.allocatedExtents() * bf16.extentPages() == 2 * extent &&
                     bf16.actualAllocatedBytes() == uint64_t{bf16.pageCount()} * bf16.bytesPerPage(),
                 "BF16 growth did not account for both extents");
         require(bf16.releaseBackingForPage(extent), "BF16 extent release failed");

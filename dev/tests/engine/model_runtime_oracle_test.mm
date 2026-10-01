@@ -966,7 +966,7 @@ int main(int argc, char **argv) {
       require(rejected && !states.metadata(0).assigned &&
                   executor.telemetry().targetPrefillRows == beforeWarmupRows &&
                   backend.submissionCount() == beforeCommands &&
-                  pages.residentPages() == 0,
+                  pages.allocatedExtents() == 0,
               "real warmup lost its KV refusal cause or executed/leaked work");
     }
     kvAdmissionFailure = metal::AllocationFailure::None;
