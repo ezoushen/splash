@@ -54,8 +54,6 @@ KvPool::KvPool(KvBacking &backing)
 KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
   if (!count)
     return {};
-  if (count > freePageCount())
-    return {{}, KvPageAcquireFailure::LogicalCapacity};
 
   std::vector<uint32_t> selected;
   selected.reserve(count);
@@ -68,8 +66,12 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
       selected.push_back(popFreeResident());
       continue;
     }
-    if (!freeUnbacked_.count)
-      throw std::logic_error("free KV lists disagree with accounting");
+    // Page ids cover every extent the budget could hold, so only a backing
+    // with fewer of them than its budget (a test's) runs out.
+    if (!freeUnbacked_.count) {
+      returnSelected();
+      return {{}, KvPageAcquireFailure::Denied, metal::AllocationFailure::Capacity};
+    }
     const uint32_t page = freeUnbacked_.head;
     const uint32_t extent = pages_[page].extent;
     metal::AllocationResult allocated = false;
@@ -86,7 +88,7 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
       // reclaim takes their pages first instead of allocating them again.
       // A reclaim pass returns them if they stay unused.
       returnSelected();
-      return {{}, KvPageAcquireFailure::PhysicalCapacity, allocated.failure};
+      return {{}, KvPageAcquireFailure::Denied, allocated.failure};
     }
     ++extentAllocations_;
     extentAllocateMaxMilliseconds_ =

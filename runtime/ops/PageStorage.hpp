@@ -43,7 +43,6 @@ public:
   [[nodiscard]] uint64_t extentBytes() const noexcept {
     return uint64_t{extentPages_} * layout_.bytesPerModelPage();
   }
-  [[nodiscard]] uint64_t capacityBytes() const noexcept;
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept;
   [[nodiscard]] uint32_t residentPages() const noexcept;
   [[nodiscard]] bool isResident(uint32_t page) const override;

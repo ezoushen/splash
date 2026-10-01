@@ -290,7 +290,7 @@ void run(const std::string &metallib) {
     const uint64_t before = backend.memoryStats().allocatedBytes;
     kv::PageStorage storage(backend, governor.allocationAdmission(), kvLayout, 384, 128);
     const uint64_t extentBytes = 128 * kvLayout.bytesPerModelPage();
-    require(storage.capacityBytes() == 3 * extentBytes && storage.extentBytes() == extentBytes &&
+    require(uint64_t{storage.pageCount()} * storage.bytesPerPage() == 3 * extentBytes && storage.extentBytes() == extentBytes &&
                 storage.actualAllocatedBytes() == extentBytes &&
                 backend.memoryStats().allocatedBytes == before + extentBytes,
             "the runway extent was not allocated at exactly its size");
@@ -373,7 +373,7 @@ void run(const std::string &metallib) {
                     bf16.actualAllocatedBytes() == extent * layout.bytesPerModelPage(),
                 "BF16 initial residency escaped its admitted extent");
         require(bf16.ensureResident(extent) && bf16.residentPages() == 2 * extent &&
-                    bf16.actualAllocatedBytes() == bf16.capacityBytes(),
+                    bf16.actualAllocatedBytes() == uint64_t{bf16.pageCount()} * bf16.bytesPerPage(),
                 "BF16 growth did not account for both extents");
         require(bf16.releaseBackingForPage(extent), "BF16 extent release failed");
         require(!bf16.isResident(extent) && bf16.ensureResident(extent),

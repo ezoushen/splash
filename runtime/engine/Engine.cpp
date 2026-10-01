@@ -1107,7 +1107,7 @@ Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attem
   bool pendingReclaim = false;
   TokenAdmission admission = attempt();
   while (!admission.granted() &&
-         admission.failure == KvPageAcquireFailure::PhysicalCapacity) {
+         admission.failure == KvPageAcquireFailure::Denied) {
     const bool paused = growthPaused() ||
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
     const CacheReclaimResult progress = paused

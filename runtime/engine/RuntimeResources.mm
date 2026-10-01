@@ -465,9 +465,14 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     }
 
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
+    // Page ids for every extent the hard budget could hold: the governor,
+    // never the id range, limits the pool.
+    const uint64_t poolExtents = std::min<uint64_t>(
+        (budget.hardBudgetBytes + budget.kvExtentBytes - 1) / budget.kvExtentBytes,
+        std::numeric_limits<uint32_t>::max() / budget.kvExtentPages);
     auto kvPages = std::make_unique<kv::PageStorage>(
         *backend, memoryGovernor->allocationAdmission(), package.targetKvLayout(config.kvFormat),
-        budget.kvCapacityPages, budget.kvExtentPages);
+        static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
     // One disk quota serves KV pages and states. Without room for a state,
     // disk KV cannot preserve a restorable prefix, so the tier stays off.
     std::shared_ptr<model::DiskBudget> diskBudget;
@@ -507,11 +512,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     auto cache = std::make_unique<engine::Cache>(*kvPool, cacheIdentity.cacheNamespace,
                                                  kvTier.get(), diskBudget);
 
-    if (kvPages->capacityBytes() != budget.kvCapacityBytes ||
-        kvPages->actualAllocatedBytes() > budget.kvCapacityBytes) {
-      throw std::runtime_error(
-          "actual KV page storage exceeds its planned category");
-    }
     if (stateStorage->actualAllocatedBytes() != 0) {
       throw std::runtime_error("state cells were allocated eagerly");
     }

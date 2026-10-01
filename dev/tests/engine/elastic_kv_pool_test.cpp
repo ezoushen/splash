@@ -126,7 +126,7 @@ void testFailedGrowthRollsBackAtomically() {
     auto pages = pool.acquirePages(5, false);
     require(!pages.granted() &&
                 pages.failure ==
-                    splash::engine::KvPageAcquireFailure::PhysicalCapacity,
+                    splash::engine::KvPageAcquireFailure::Denied,
             "failed physical growth was not reported as physical capacity");
     auto status = pool.snapshot();
     require(status.pagesFree == 12 && status.pagesActive == 0 &&
@@ -199,7 +199,7 @@ void testPressureReusesResidentPagesAndDeniesGrowth() {
     auto denied = pool.acquirePages(2, false);
     require(!denied.granted() &&
                 denied.failure ==
-                    splash::engine::KvPageAcquireFailure::PhysicalCapacity,
+                    splash::engine::KvPageAcquireFailure::Denied,
             "critical pressure admitted a new physical extent");
     require(pool.activeReferences(active.pages[0]) == 1 &&
                 pool.activeReferences(active.pages[1]) == 1 &&

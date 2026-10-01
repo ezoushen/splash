@@ -532,6 +532,19 @@ EngineRequest request(uint64_t id, const std::vector<uint32_t> &prompt) {
   return result;
 }
 
+// Ticks until every prompt (65 tokens of its request id) has published a
+// state, then holds a lookup on each, which keeps its state resident.
+std::vector<CacheLookup> runUntilStatesHeld(engine::Engine &engine, engine::Cache &cache,
+                                            std::initializer_list<uint64_t> ids) {
+  for (double now = 1; now < 100 && cache.snapshot().stateCache.entries < ids.size(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(cache.snapshot().stateCache.entries == ids.size(), "the prompts did not publish states");
+  std::vector<CacheLookup> held;
+  for (uint64_t id : ids)
+    held.push_back(cache.lookup(std::vector<uint32_t>(65, static_cast<uint32_t>(id))));
+  return held;
+}
+
 void runUntilIdle(engine::Engine &engine) {
   for (uint32_t step = 0; step < 32 && !engine.idle(); ++step) {
     static_cast<void>(engine.tick(step + 1));
@@ -2766,7 +2779,11 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
     value.maxNewTokens = 30;
     engine.submit(std::move(value));
   }
-  for (double now = 1; now < 300 && !engine.idle(); ++now)
+  // Lookups keep both prompts' states at 64 resident while the lanes contend
+  // for pages: the preempted lane then resumes from its own.
+  const std::vector<CacheLookup> held = runUntilStatesHeld(engine, resources, {260, 261});
+  const uint64_t lookups = engine.snapshot().resources.lookup.lookups;
+  for (double now = 100; now < 400 && !engine.idle(); ++now)
     static_cast<void>(engine.tick(now));
   require(engine.idle() && executor.suspensions == 1 &&
               executor.resumptions == 1 && executor.restored == 64 &&
@@ -2779,7 +2796,7 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
               events.outputs.at(260) == std::vector<uint32_t>(30, 42) &&
               events.outputs.at(261) == std::vector<uint32_t>(30, 42) &&
               events.usage.at(260) == std::pair<uint32_t, uint32_t>{65, 30} &&
-              engine.snapshot().resources.lookup.lookups == 2 &&
+              engine.snapshot().resources.lookup.lookups == lookups &&
               engine.snapshot().cacheHits == 0 &&
               engine.snapshot().coldMisses == 2,
           "internal cache restore changed output or request accounting");
@@ -2803,7 +2820,8 @@ void testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt() {
     value.maxNewTokens = 30;
     engine.submit(std::move(value));
   }
-  for (double now = 1; now < 300 && !engine.idle(); ++now)
+  const std::vector<CacheLookup> held = runUntilStatesHeld(engine, resources, {262, 263});
+  for (double now = 100; now < 400 && !engine.idle(); ++now)
     static_cast<void>(engine.tick(now));
   require(engine.idle() && executor.suspensions == 1 &&
               executor.resumedPrompts.size() == 1 &&

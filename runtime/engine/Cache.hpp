@@ -120,9 +120,9 @@ enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 
 // Owns active KV page leases, the content-addressed KV graph and cached
 // composite states. Physical recurrent-state cells remain model-owned.
-// A state in RAM always sits on a resident KV block: reclaimKvLeaf frees or
-// drops the state before the block's page, and endRequest, pollTransfers and
-// freeDiskSpace leave such a block its page.
+// A state in RAM always sits on a resident KV block: reclaim takes the state
+// before the block's page, and endRequest, pollTransfers and freeDiskSpace
+// leave such a block its page.
 class Cache final {
 public:
   // The disk budget is the quota the states' file shares with the KV tier;
@@ -271,13 +271,6 @@ private:
   // same thing: a transfer in flight holds what this needs, and it comes
   // back when the transfer lands. Only transfersInFlight() may report it:
   // a caller told to wait for nothing would wait for ever.
-  enum class Shortfall : uint8_t { Covered, Pending, Exhausted };
-  enum class Eviction : uint8_t {
-    Evicted,
-    // Every remaining leaf waits for the tier to take it.
-    Pending,
-    None,
-  };
   enum class LeafReclaim : uint8_t {
     Started,
     // The ring, the quota or the state write's staging buffer is held by
@@ -295,8 +288,6 @@ private:
 
   [[nodiscard]] TokenAdmission admitPages(uint32_t count,
                                           std::vector<uint32_t> &pages);
-  [[nodiscard]] Shortfall makeLogicalPages(uint32_t count);
-  [[nodiscard]] Eviction evictOneKvBlock();
   // Oldest resident KV leaf after `after` whose state, if any, is not in RAM.
   [[nodiscard]] std::optional<CacheEvictionCandidate> oldestKvLeaf(uint64_t after) const;
   // Frees the RAM of one resident KV leaf: through its disk copy when it has
