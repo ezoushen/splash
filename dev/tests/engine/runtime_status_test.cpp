@@ -96,6 +96,8 @@ void testCleanRuntimeStatus() {
   engine.resources.stateCache.checkpointBytes = 64;
   engine.resources.stateCache.checkpointEvictions = 4;
   engine.resources.stateCache.checkpointRetirements = 3;
+  engine.resources.stateCache.inUse = 2;
+  engine.resources.stateCache.inUseEvictions = 5;
   engine.resources.lookup = {.lookups = 3, .kvHitTokens = 128, .stateHitTokens = 64, .lazyJunctions = 1};
   engine.resources.activeRequests = 1;
   engine.resources.kvTier.restores = 3;
@@ -247,6 +249,9 @@ void testCleanRuntimeStatus() {
                     "\"checkpoint_evictions\":4,\"checkpoint_retirements\":3") !=
               std::string::npos,
           "temporary state occupancy and retirement are missing from status");
+  require(json.find("\"pinned\":0,\"in_use\":2,\"in_use_evictions\":5,") !=
+              std::string::npos,
+          "states unfinished requests use are missing from status");
   require(json.find("\"block_tokens\":32") != std::string::npos &&
               json.find("\"decode_batches_by_width\":{\"b1\":1,\"b2\":1,\"b3\":"
                         "1,\"b4\":1}") != std::string::npos,

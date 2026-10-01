@@ -1156,6 +1156,8 @@ class ServerTest(unittest.TestCase):
                     "state": {
                         "entries": 2,
                         "pinned": 1,
+                        "in_use": 1,
+                        "in_use_evictions": 3,
                         "bytes": 4096,
                         "active_cells": 2,
                         "hits": 7,
@@ -1229,6 +1231,8 @@ class ServerTest(unittest.TestCase):
         self.assertIn("splash_kv_pages_free 2", metrics)
         self.assertIn("splash_kv_allocated_bytes 8192", metrics)
         self.assertIn("splash_state_entries 2", metrics)
+        self.assertIn("splash_state_in_use 1", metrics)
+        self.assertIn("splash_state_in_use_evictions_total 3", metrics)
         self.assertIn("splash_state_hits_total 7", metrics)
         self.assertIn("splash_cache_hits_total 7", metrics)
         self.assertIn("splash_cache_cold_misses_total 4", metrics)

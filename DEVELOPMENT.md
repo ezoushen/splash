@@ -894,7 +894,9 @@ what is in use after everything else, a publication or disk copy in use may
 displace the oldest state in use, and ordinary or optional work never does.
 Nothing in use is pinned, so running work that needs the memory still takes it
 once nothing else is left. A resumed lane that lost its prompt's replay point
-rebuilds it on the way.
+rebuilds it on the way. `/status` reports under `state` the replay points
+unfinished requests hold (`in_use`, zero when idle) and those evicted all the
+same (`in_use_evictions`).
 
 Requests sharing a cold prefix can wait for a resident request's planned recovery
 point, then enter through the ordinary cache restore path. Waiting requests hold

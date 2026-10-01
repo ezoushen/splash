@@ -312,6 +312,7 @@ def idle_status():
             )
             and value["state"]["active_cells"] == 0
             and value["state"]["pinned"] == 0
+            and value["state"]["in_use"] == 0
             and value["kv"]["pages_active"] == 0
         ):
             return value

@@ -152,7 +152,8 @@ std::string runtimeStatusJson(
       << ",\"extent_compact_max_ms\":" << pool.extentCompactMaxMilliseconds
       << "}"
       << ",\"state\":{\"entries\":" << state.entries
-      << ",\"pinned\":" << state.pinned << ",\"bytes\":" << state.bytes
+      << ",\"pinned\":" << state.pinned << ",\"in_use\":" << state.inUse
+      << ",\"in_use_evictions\":" << state.inUseEvictions << ",\"bytes\":" << state.bytes
       << ",\"allocated_bytes\":" << executorTelemetry.stateAllocatedBytes
       << ",\"active_cells\":" << resources.activeRequests
       << ",\"warm_idle_cells\":" << executorTelemetry.warmIdleStateCells
