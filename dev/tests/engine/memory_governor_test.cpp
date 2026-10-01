@@ -321,53 +321,53 @@ void testExhaustedReclaimWaivesTheHold() {
           "an earlier episode's exhausted reclaim waived the hold");
 }
 
-// A pressure pass may release what a request is served from: one lane's
-// state and the KV runway. Growing back to that footprint needs only the
-// host's reserve, even while growth is held for the recovery margin, or an
-// idle server could start no request until other applications gave memory
-// back. Growth beyond it keeps the margin, and critical pressure refuses both.
-void testServingFootprintNeedsOnlyTheReserve() {
+// Host pressure holds back growth that nothing in flight depends on. What a
+// request in service needs is granted while the host is short, into its
+// reserve too: holding it back would strand the request and the memory it
+// already has. Only the engine's limit and critical pressure refuse it, and
+// without the mark the margins apply as before.
+void testRequestInServiceGrowsThroughHostPressure() {
   metal::statistics = {};
   metal::statistics.allocatedBytes = 14 * kGiB;
   metal::statistics.deviceCurrentAllocatedBytes = 14 * kGiB;
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB / 2;
-  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, [&available] { return available; });
+  MemoryGovernor governor(backend, 15 * kGiB, hostReserve, [&available] { return available; });
   governor.markServingFootprint();
   require(governor.snapshot().servingFootprintBytes == 14 * kGiB,
           "the snapshot did not report the serving footprint");
-  const auto resize = [](int64_t bytes) {
-    metal::statistics.allocatedBytes += bytes;
-    metal::statistics.deviceCurrentAllocatedBytes += bytes;
-  };
-  const auto grow = [&](uint64_t bytes) {
-    auto reservation = governor.tryReserve(bytes);
+  const auto grow = [&](uint64_t bytes, metal::AllocationFailure *failure = nullptr) {
+    auto reservation = governor.tryReserve(bytes, failure);
     if (!reservation)
       return false;
-    resize(static_cast<int64_t>(bytes));
+    metal::statistics.allocatedBytes += bytes;
+    metal::statistics.deviceCurrentAllocatedBytes += bytes;
     reservation->commit();
     return true;
   };
-  resize(-350 * static_cast<int64_t>(kMiB));
   metal::AllocationFailure failure;
-  require(!governor.tryReserve(400 * kMiB, &failure) &&
-              failure == metal::AllocationFailure::HostPressure &&
+  require(!grow(400 * kMiB, &failure) && failure == metal::AllocationFailure::HostPressure &&
               !governor.snapshot().hostGrowthAllowed,
-          "growth past the serving footprint cleared no warning margin");
-  require(grow(180 * kMiB) && grow(170 * kMiB),
-          "growth back to the serving footprint waited for the warning margin");
-  require(!governor.tryReserve(kMiB, &failure) &&
-              failure == metal::AllocationFailure::HostPressure,
-          "growth past the serving footprint was admitted without the margin");
-  resize(-350 * static_cast<int64_t>(kMiB));
-  available = hostReserve + 100 * kMiB;
-  require(!grow(180 * kMiB), "the serving footprint was regrown into the host's reserve");
-  available = hostReserve + kGiB / 2;
+          "growth that nothing in service needs cleared no warning margin");
+
+  governor.setServing(true);
+  require(grow(400 * kMiB) && !governor.snapshot().hostGrowthAllowed,
+          "a request in service waited for the warning margin");
+  available = hostReserve / 2;
+  require(grow(100 * kMiB), "a request in service waited for the host's reserve");
+  require(!grow(kGiB, &failure) && failure == metal::AllocationFailure::EngineBudget,
+          "a request in service grew past the engine's limit");
   governor.setPressure(MemoryPressure::Critical);
-  require(!grow(180 * kMiB), "critical pressure admitted the serving footprint");
+  require(!grow(100 * kMiB, &failure) && failure == metal::AllocationFailure::HostPressure,
+          "critical pressure admitted a request in service");
   governor.setPressure(MemoryPressure::Normal);
-  require(grow(180 * kMiB), "the serving footprint stayed refused after critical pressure");
+  require(grow(100 * kMiB), "a request in service stayed refused after critical pressure");
+
+  governor.setServing(false);
+  available = hostReserve + kGiB / 2;
+  require(!grow(100 * kMiB, &failure) && failure == metal::AllocationFailure::HostPressure,
+          "the mark of a request in service outlived it");
 }
 
 } // namespace
@@ -379,7 +379,7 @@ int main() {
     testHostRefusalStartsReclaim();
     testPolicyContinuesHeldBackTarget();
     testExhaustedReclaimWaivesTheHold();
-    testServingFootprintNeedsOnlyTheReserve();
+    testRequestInServiceGrowsThroughHostPressure();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

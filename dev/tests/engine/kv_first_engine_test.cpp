@@ -1758,6 +1758,10 @@ void testConcurrencyLimitDoesNotEvictCache() {
   runUntilIdle(engine);
 }
 
+// A lane the host refuses even as the only one in service, as under critical
+// pressure, waits for the host: one ordinary attempt and one as a request in
+// service per retry, and nothing evicted for an allocator that refuses all
+// the same.
 void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   Storage storage(32);
   KvPool pool(storage);
@@ -1774,12 +1778,13 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   const uint64_t coldMisses = engine.snapshot().coldMisses;
   const uint32_t attempts = executor.beginAttempts;
 
-  pressure = MemoryPressure::Warning;
-  executor.deniedBegins = 100;
+  pressure = MemoryPressure::Critical;
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return pressure != MemoryPressure::Normal; };
   engine.submit(request(201, {201}));
   static_cast<void>(engine.tick(20.0));
   static_cast<void>(engine.tick(50.0));
-  require(executor.beginAttempts == attempts + 1 &&
+  require(executor.beginAttempts == attempts + 2 &&
               resources.snapshot().stateCache.entries ==
                   cached.stateCache.entries &&
               resources.snapshot().kvCache.blocks == cached.kvCache.blocks &&
@@ -1789,7 +1794,6 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
           "paused state admission drained the cache or retried without backoff");
 
   pressure = MemoryPressure::Normal;
-  executor.deniedBegins = 0;
   for (double now = 120.0; now < 140.0 && !engine.idle(); ++now)
     static_cast<void>(engine.tick(now));
   require(engine.idle() && events.completedCount == 2 &&
@@ -1836,6 +1840,245 @@ void testHostPressureStillRecyclesLruStateForDeniedSnapshot() {
           "recycling under host pressure grew state or drained KV cache");
 }
 
+// The governor's host pause as the engine meets it: KV growth and a lane's
+// state are refused for the host unless the engine marks them as memory a
+// request in service needs.
+struct HostPause final {
+  bool paused = false;
+  bool serving = false;
+  // The pages no request held each time the pause let a request grow.
+  std::vector<uint32_t> reusableAtGrowth;
+
+  void attach(EngineConfig &config, Storage &storage, KvPool &pool) {
+    config.growthPaused = [this] { return paused; };
+    config.serving = [this](bool value) { serving = value; };
+    storage.allocationFailure = metal::AllocationFailure::HostPressure;
+    storage.growthAllowed = [this, &pool] {
+      if (paused && !serving)
+        return false;
+      if (paused) {
+        const KvPoolSnapshot pages = pool.snapshot();
+        reusableAtGrowth.push_back(pages.pagesAllocated - pages.pagesActive);
+      }
+      return true;
+    };
+  }
+  void attach(Executor &executor) {
+    executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+    executor.beginGrowthBlocked = [this] { return paused && !serving; };
+  }
+};
+
+// Host pressure pauses growth, not a request in service. Short of pages, it
+// first takes the cached pages no request holds; once none is left it grows
+// as it would without the pause, and it is never suspended for the host.
+void testRequestInServiceGrowsThroughTheHostPause() {
+  Storage storage(64);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  HostPause host;
+  EngineConfig config;
+  host.attach(config, storage, pool);
+  engine::Engine engine(config, resources, executor, events);
+  // A finished prompt leaves two cached blocks under a state.
+  engine.submit(request(1, std::vector<uint32_t>(65, 1)));
+  runUntilIdle(engine);
+  require(resources.snapshot().kvCache.blocks == 2 &&
+              resources.snapshot().stateCache.entries == 1,
+          "host pause fixture did not cache the first prompt");
+  executor.decodeFinishes = false;
+  auto running = request(2, std::vector<uint32_t>(65, 2));
+  running.maxNewTokens = 400;
+  running.deadlineMilliseconds = 1'000'000;
+  engine.submit(std::move(running));
+  double now = 1;
+  while (now < 100 && events.outputs[2].empty())
+    static_cast<void>(engine.tick(now++));
+  require(!events.outputs[2].empty(), "the request did not start decoding");
+
+  host.paused = true;
+  const uint32_t allocated = pool.snapshot().pagesAllocated;
+  while (now < 2000 && events.completedCount < 2)
+    static_cast<void>(engine.tick(now++));
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              events.outputs[2].size() == 400 && executor.suspensions == 0 &&
+              engine.snapshot().resourceSuspensions == 0,
+          "host pressure stopped a request in service");
+  require(pool.snapshot().pagesAllocated > allocated && !host.reusableAtGrowth.empty() &&
+              std::all_of(host.reusableAtGrowth.begin(), host.reusableAtGrowth.end(),
+                          [](uint32_t pages) { return pages == 0; }),
+          "the request grew while cached pages no request held could serve it");
+  require(resources.lookup(std::vector<uint32_t>(65, 1)).kvBoundary == 0,
+          "the paused request did not take the idle cached pages first");
+}
+
+// With nothing in service, the first request starts through the pause: its
+// lane and its pages grow. A request that arrives beside it waits for the
+// host without evicting anything, and starts once the first has finished.
+void testFirstRequestStartsThroughTheHostPause() {
+  Storage storage(64);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  HostPause host;
+  host.paused = true;
+  EngineConfig config;
+  host.attach(config, storage, pool);
+  host.attach(executor);
+  engine::Engine engine(config, resources, executor, events);
+  auto first = request(1, std::vector<uint32_t>(65, 1));
+  first.maxNewTokens = 40;
+  first.deadlineMilliseconds = 1'000'000;
+  engine.submit(std::move(first));
+  double now = 1;
+  while (now < 100 && events.outputs[1].empty())
+    static_cast<void>(engine.tick(now++));
+  require(!events.outputs[1].empty() && executor.beginAttempts == 2 &&
+              pool.snapshot().pagesAllocated >= 4,
+          "the first request did not start through the host pause");
+
+  auto second = request(2, std::vector<uint32_t>(65, 2));
+  second.deadlineMilliseconds = 1'000'000;
+  engine.submit(std::move(second));
+  const CacheSnapshot before = resources.snapshot();
+  static_cast<void>(engine.tick(now++));
+  static_cast<void>(engine.tick(now++));
+  require(!executor.requests.contains(2) && events.startIds.size() == 1 &&
+              engine.resourceWaitSnapshot(now).memory == 1 &&
+              resources.snapshot().kvCache.blocks >= before.kvCache.blocks &&
+              resources.snapshot().stateCache.evictions == before.stateCache.evictions,
+          "a second request grew, or evicted for the host, beside one in service");
+  while (now < 1000 && events.completedCount < 2)
+    static_cast<void>(engine.tick(now++));
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              events.startIds == std::vector<uint64_t>({1, 2}) &&
+              executor.suspensions == 0,
+          "the waiting request did not start once nothing was in service");
+}
+
+// A request whose start needs no new memory still starts beside one in
+// service, as before, and then grows like it.
+void testRequestThatNeedsNoGrowthStartsUnderTheHostPause() {
+  Storage storage(64);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  HostPause host;
+  EngineConfig config;
+  host.attach(config, storage, pool);
+  engine::Engine engine(config, resources, executor, events);
+  auto first = request(1, std::vector<uint32_t>(33, 1));
+  first.maxNewTokens = 300;
+  first.deadlineMilliseconds = 1'000'000;
+  engine.submit(std::move(first));
+  double now = 1;
+  while (now < 100 && events.outputs[1].empty())
+    static_cast<void>(engine.tick(now++));
+  host.paused = true;
+  // The lane's buffers are pooled and the first extent has free pages.
+  auto second = request(2, std::vector<uint32_t>(33, 2));
+  second.maxNewTokens = 300;
+  second.deadlineMilliseconds = 1'000'000;
+  engine.submit(std::move(second));
+  while (now < 100 && events.outputs[2].empty())
+    static_cast<void>(engine.tick(now++));
+  require(!events.outputs[2].empty() && host.reusableAtGrowth.empty(),
+          "a request that needed no new memory waited under the host pause");
+  while (now < 2000 && events.completedCount < 2)
+    static_cast<void>(engine.tick(now++));
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              executor.suspensions == 0 && !host.reusableAtGrowth.empty(),
+          "requests in service did not grow through the host pause");
+}
+
+// A suspended request resumes like a new one: beside a request in service
+// its pages wait for the host, and it resumes once that request has finished.
+void testSuspendedRequestWaitsForTheHostBesideOneInService() {
+  Storage storage(64);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  HostPause host;
+  EngineConfig config;
+  config.resourceWaitTimeoutMilliseconds = 100;
+  host.attach(config, storage, pool);
+  // Until the host runs short, the engine's limit is two extents.
+  storage.allocationFailure = metal::AllocationFailure::EngineBudget;
+  storage.growthAllowed = [&] {
+    return host.paused ? host.serving : pool.snapshot().pagesAllocated < 8;
+  };
+  engine::Engine engine(config, resources, executor, events);
+  for (uint64_t id : {1, 2}) {
+    auto value = request(id, std::vector<uint32_t>(id == 1 ? 65 : 33, id));
+    value.maxNewTokens = 150;
+    value.deadlineMilliseconds = 1'000'000;
+    engine.submit(std::move(value));
+  }
+  double now = 1;
+  while (now < 1000 && !executor.suspensions)
+    static_cast<void>(engine.tick(now += 5));
+  require(engine.snapshot().resourceSuspensions == 1 &&
+              !executor.requests.at(2).resident && executor.requests.at(1).resident,
+          "the limit did not suspend the shorter request");
+
+  host.paused = true;
+  storage.allocationFailure = metal::AllocationFailure::HostPressure;
+  while (now < 5000 && events.completedCount < 1) {
+    require(engine.snapshot().resourceResumptions == 0,
+            "a suspended request grew through the pause beside one in service");
+    static_cast<void>(engine.tick(now += 5));
+  }
+  // Its lane resumed and gave way again each time its pages were refused.
+  require(events.completedCount == 1 && executor.resumeAttempts > 0 &&
+              events.failedCount == 0 && events.outputs[1].size() == 150,
+          "the request in service did not finish, or the suspended one never retried");
+  while (now < 10000 && events.completedCount < 2)
+    static_cast<void>(engine.tick(now += 5));
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              engine.snapshot().resourceResumptions == 1 &&
+              events.outputs[2].size() == 150,
+          "the suspended request did not resume once nothing was in service");
+}
+
+// The engine's own limit still binds a request in service under the pause:
+// it reclaims as without the pause, and alone with nothing left to reclaim
+// it has hit the capacity, at once and not after a wait for the host.
+void testEngineLimitBindsThroughTheHostPause() {
+  Storage storage(8);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  bool paused = false;
+  EngineConfig config;
+  config.growthPaused = [&] { return paused; };
+  engine::Engine engine(config, resources, executor, events);
+  auto value = request(1, std::vector<uint32_t>(65, 1));
+  value.maxNewTokens = 1000;
+  value.deadlineMilliseconds = 1'000'000;
+  engine.submit(std::move(value));
+  double now = 1;
+  while (now < 100 && events.outputs[1].empty())
+    static_cast<void>(engine.tick(now++));
+  paused = true;
+  storage.allocationFailure = metal::AllocationFailure::EngineBudget;
+  storage.growthAllowed = [&] { return pool.snapshot().pagesAllocated < 8; };
+  while (now < 1000 && !events.failedCount && !events.completedCount)
+    static_cast<void>(engine.tick(now++));
+  require(events.failures == std::vector<std::string>{std::string(kCapacityExhausted)} &&
+              executor.suspensions == 0 && pool.snapshot().pagesAllocated == 8,
+          "a lone request at the engine's limit waited for the host instead of failing");
+}
+
 // A lone request short of pages under host pressure takes idle cached pages
 // of allocated extents instead of being suspended and replaying its prefix
 // later. Reuse only happens when it can cover the shortfall.
@@ -1858,6 +2101,7 @@ void testSingletonHostPressureReusesIdleCacheInsteadOfSuspending() {
 
   pressure = MemoryPressure::Warning;
   storage.growthBlocked = true;
+  storage.allocationFailure = metal::AllocationFailure::HostPressure;
   engine.submit(request(231, std::vector<uint32_t>(65, 231)));
   runUntilIdle(engine);
   require(engine.idle() && events.completedCount == 2 &&
@@ -2273,11 +2517,14 @@ void testFailedAdmissionDoesNotBlockOtherWork() {
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  // The host refuses the first request twice: as an ordinary allocation and
+  // as that of the only request in service.
   executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
-  executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 1; };
+  executor.beginGrowthBlocked = [&] { return executor.beginAttempts <= 2; };
   engine.submit(request(1, std::vector<uint32_t>(4097, 47)));
   engine.submit(request(2, std::vector<uint32_t>(8193, 48)));
-  require(engine.tick(1) && executor.requests.contains(2),
+  require(engine.tick(1) && executor.requests.contains(2) &&
+              !executor.requests.contains(1),
           "failed prefill admission blocked a runnable peer");
   runUntilIdle(engine);
   require(events.completedCount == 2 && events.failedCount == 0,
@@ -2465,6 +2712,7 @@ void testPressureRetryIsBackedOffWithoutProgress() {
   engine::Engine engine(config, resources, executor, events);
 
   storage.growthBlocked = true;
+  storage.allocationFailure = metal::AllocationFailure::HostPressure;
   engine.submit(request(52, {52}));
   engine.submit(request(53, {53}));
   require(engine.tick(1.0) && engine.tick(2.0),
@@ -2525,6 +2773,7 @@ void testAdmissionRetryWakesOnlyWhenTickCanRetry() {
     config.growthPaused = [&] { return paused; };
     engine::Engine engine(config, resources, executor, events);
     storage.growthBlocked = true;
+    storage.allocationFailure = metal::AllocationFailure::HostPressure;
     engine.submit(request(1, {1}));
     engine.submit(request(2, {2}));
     require(engine.tick(1) && executor.suspensions == 1 &&
@@ -2693,6 +2942,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   for (; now < 20'000 && executor.suspensions == 0; ++now) {
     if (events.emitted >= 4200) {
       storage.growthBlocked = true;
+      storage.allocationFailure = metal::AllocationFailure::HostPressure;
       pressure = MemoryPressure::Warning;
     }
     static_cast<void>(engine.tick(now));
@@ -2837,6 +3087,7 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
     config.growthPaused = [] { return true; };
     engine::Engine engine(config, resources, executor, events);
     storage.growthBlocked = true;
+    storage.allocationFailure = metal::AllocationFailure::HostPressure;
     auto value = request(270, {270});
     value.deadlineMilliseconds = 350;
     engine.submit(std::move(value));
@@ -3267,6 +3518,7 @@ void testAdmissionReopensAfterLastSuspendedRequestResumes() {
   engine::Engine engine(config, resources, executor, events);
 
   storage.growthBlocked = true;
+  storage.allocationFailure = metal::AllocationFailure::HostPressure;
   auto longRequest = request(271, {271});
   longRequest.maxNewTokens = 1000;
   engine.submit(std::move(longRequest));
@@ -3383,8 +3635,12 @@ void testRecoveryDrainEndsWithItsCause() {
     require(events.maskRequests.size() == 1 &&
                 engine.snapshot().scheduler.decoding == 1,
             "fixture lanes did not reach their mask wait and decode");
+    // The host refuses the lane's growth even as a request in service's,
+    // or, at the hard limit, the pool has no page left.
     paused = cause != Cause::HardLimit;
     storage.growthBlocked = true;
+    storage.allocationFailure = paused ? metal::AllocationFailure::HostPressure
+                                       : metal::AllocationFailure::Capacity;
     require(engine.tick(7) && executor.suspensions == 1 &&
                 executor.requests.at(1).resident,
             "denied growth did not suspend the lane beside the resident");
@@ -5351,6 +5607,11 @@ int main() {
     testConcurrencyLimitDoesNotEvictCache();
     testHostPressureDoesNotDrainCacheOnStateAdmission();
     testHostPressureStillRecyclesLruStateForDeniedSnapshot();
+    testRequestInServiceGrowsThroughTheHostPause();
+    testFirstRequestStartsThroughTheHostPause();
+    testRequestThatNeedsNoGrowthStartsUnderTheHostPause();
+    testSuspendedRequestWaitsForTheHostBesideOneInService();
+    testEngineLimitBindsThroughTheHostPause();
     testSingletonHostPressureReusesIdleCacheInsteadOfSuspending();
     testSingletonHostPressureWaitRecoversOrTerminates();
     testAdmissionWaitsOutEarlierLanes();

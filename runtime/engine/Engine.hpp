@@ -32,9 +32,13 @@ struct EngineConfig final {
   // zero alternates one command of each kind.
   double decodeShare = 0.5;
   // Host growth admission, supplied by the runtime governor. Queried only on
-  // failed allocation and, after a suspension the pause caused, while
-  // resident lanes drain; never on the ordinary decode path.
+  // failed allocation and, after a suspension, while resident lanes drain;
+  // never on the ordinary decode path.
   std::function<bool()> growthPaused;
+  // Marks the allocations that follow as memory a request in service needs,
+  // which the pause does not hold back, and clears the mark
+  // (MemoryGovernor::setServing).
+  std::function<void(bool)> serving;
 };
 
 struct ResourceWaitSnapshot final {
@@ -239,15 +243,18 @@ private:
   };
   // What a lane does about memory it could not get. Pending memory returns
   // by itself: the lane waits. Otherwise a lane fails only when it is alone
-  // with nothing left to reclaim; while other lanes hold memory, growth is
-  // paused or the host is short of memory, a running lane yields its memory
-  // and a lane being admitted waits.
+  // with nothing left to reclaim; while other lanes hold memory or the host
+  // refuses it, a running lane yields its memory and a lane being admitted
+  // waits.
   enum class Verdict : uint8_t { Wait, Yield, Fail };
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
   // Runs one page admission, reclaiming cache between attempts while that
-  // makes progress.
-  [[nodiscard]] KvAdmission admitKv(const std::function<TokenAdmission()> &attempt);
+  // makes progress. While host pressure pauses growth the request reuses
+  // what the engine holds; when that gives nothing, a request in service
+  // grows as it would without the pause.
+  [[nodiscard]] KvAdmission admitKv(const std::function<TokenAdmission()> &attempt,
+                                    bool inService);
   void suspendForGrowth(Request &request, uint64_t workEnd,
                         metal::AllocationFailure failure,
                         double nowMilliseconds);

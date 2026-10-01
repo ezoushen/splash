@@ -11,6 +11,26 @@ namespace {
 constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 
+// While an active one lives, allocations are memory a request in service
+// needs (EngineConfig::serving).
+class Serving final {
+public:
+  Serving(const std::function<void(bool)> &mark, bool active)
+      : mark_(active && mark ? &mark : nullptr) {
+    if (mark_)
+      (*mark_)(true);
+  }
+  ~Serving() {
+    if (mark_)
+      (*mark_)(false);
+  }
+  Serving(const Serving &) = delete;
+  Serving &operator=(const Serving &) = delete;
+
+private:
+  const std::function<void(bool)> *mark_;
+};
+
 } // namespace
 
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
@@ -487,15 +507,22 @@ bool Engine::admit(Request &active, double now) {
   bool executorStarted = false;
   bool resourcesStarted = false;
   try {
+    // Host pressure pauses growth, not a request in service. A request that
+    // no resident lane precedes is in service once nothing the engine holds
+    // can start it: from then on only the host's refusal holds it, and the
+    // engine's limit is met by reclaim as without the pause.
+    bool serving = false;
     const auto activate = [&] {
+      const Serving mark(config_.serving, serving);
       return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest);
     };
     StateAdmission admission = activate();
     Denial denial;
     while (!admission.granted() &&
            admission.failure == StateFailure::MemoryPressure) {
-      const bool paused = growthPaused() ||
-          admission.allocationFailure == metal::AllocationFailure::HostPressure;
+      const bool paused =
+          admission.allocationFailure == metal::AllocationFailure::HostPressure ||
+          (!serving && growthPaused());
       const CacheReclaimResult reclaimed =
           paused ? reuseCachedStateWhilePaused() : reclaimForGrowth(Growth::State);
       if (reclaimed.madeProgress) {
@@ -503,12 +530,17 @@ bool Engine::admit(Request &active, double now) {
         continue;
       }
       denial.pending = reclaimed.pending;
-      if (paused)
-        break;
+      if (paused) {
+        if (serving || reclaimed.pending || anotherResident(active.request.id))
+          break;
+        serving = true;
+        admission = activate();
+        continue;
+      }
       // A useful restore remains pinned throughout ordinary eviction. If
       // that pin is the last obstacle to admitting even one lane, prefer
       // cold recomputation over waiting forever for our own cache lease.
-      if (!growthPaused() && lookup.state) {
+      if (lookup.state) {
         lookup = {};
         continue;
       }
@@ -545,15 +577,17 @@ bool Engine::admit(Request &active, double now) {
     // will not go through ordinary prefill admission before it runs: one
     // that resumes, or one that waits for a restore.
     KvAdmission kv;
+    // As for its lane: beside a resident request its pages wait for the host.
+    const bool inService = !anotherResident(requestId);
     if (lookup.state)
-      kv = admitKv([&] { return cache_.restoreRequest(requestId, lookup); });
+      kv = admitKv([&] { return cache_.restoreRequest(requestId, lookup); }, inService);
     const bool restoring =
         lookup.state && (!lookup.state->state()->residentBytes() ||
                          cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
     if (kv.allocation.granted() && (resuming || restoring)) {
       const uint64_t workEnd =
           resuming ? active.resumeKvTargetTokens : uint64_t{resumeBoundary} + 1;
-      kv = admitKv([&] { return cache_.ensureTokens(requestId, workEnd); });
+      kv = admitKv([&] { return cache_.ensureTokens(requestId, workEnd); }, inService);
     }
     if (!kv.allocation.granted()) {
       // The host continuation survives this failed admission. No recurrent
@@ -989,8 +1023,9 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
         plan.kind == WorkKind::Prefill
             ? position + scheduled.tokenCount
             : position + model::ExecutionLimits::targetVerifyRows;
-    const KvAdmission kv =
-        admitKv([&] { return cache_.ensureTokens(active.request.id, workEnd); });
+    // A scheduled lane is resident: it is in service.
+    const KvAdmission kv = admitKv(
+        [&] { return cache_.ensureTokens(active.request.id, workEnd); }, true);
     if (!kv.allocation.granted()) {
       denied.push_back(Denied{active.request.id, kv.allocation, workEnd, kv.denial});
       continue;
@@ -1088,29 +1123,45 @@ bool Engine::anotherResident(uint64_t requestId) const {
 Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
   if (denial.pending)
     return Verdict::Wait;
-  // Pages held by resident lanes come back when they finish; only a lane
-  // that cannot fit on its own has hit the capacity.
-  if (growthPaused() || anotherResident(requestId) ||
+  // Pages held by resident lanes come back when they finish, and memory the
+  // host refuses when its pressure lifts; only a lane that cannot fit on its
+  // own has hit the capacity.
+  if (anotherResident(requestId) ||
       denial.allocationFailure == metal::AllocationFailure::HostPressure)
     return Verdict::Yield;
   return Verdict::Fail;
 }
 
-Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attempt) {
+Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attempt,
+                                    bool inService) {
   bool pendingReclaim = false;
-  TokenAdmission admission = attempt();
+  // Set once a request in service has nothing held left to reuse: from then
+  // on only the host's refusal holds it (admit()).
+  bool serving = false;
+  const auto admit = [&] {
+    const Serving mark(config_.serving, serving);
+    return attempt();
+  };
+  TokenAdmission admission = admit();
   while (!admission.granted() &&
          admission.failure == KvPageAcquireFailure::Denied) {
-    const bool paused = growthPaused() ||
-        admission.allocationFailure == metal::AllocationFailure::HostPressure;
+    const bool paused =
+        admission.allocationFailure == metal::AllocationFailure::HostPressure ||
+        (!serving && growthPaused());
     const CacheReclaimResult progress = paused
         ? reuseCachedPagesWhilePaused(admission)
         : reclaimForGrowth(Growth::Kv);
-    if (!progress.madeProgress) {
-      pendingReclaim = progress.pending;
-      break;
+    if (progress.madeProgress) {
+      admission = admit();
+      continue;
     }
-    admission = attempt();
+    if (paused && inService && !serving && !progress.pending) {
+      serving = true;
+      admission = admit();
+      continue;
+    }
+    pendingReclaim = progress.pending;
+    break;
   }
   Denial denial;
   if (!admission.granted()) {
@@ -1128,19 +1179,18 @@ bool Engine::growthPaused() const {
   return config_.growthPaused && config_.growthPaused();
 }
 
-// One reclaim step for an allocation the governor denied. Idle memory of the
-// kind it takes stays for it to reuse: the pooled buffers a lane starts from
-// for a lane's state, which its activation takes, and allocated extents for
-// KV. Idle memory of the other kind goes first, then one victim of the cache.
+// One reclaim step for an allocation the engine's limit denied. Idle memory
+// of the kind it takes stays for it to reuse: the pooled buffers a lane
+// starts from for a lane's state, which its activation takes, and allocated
+// extents for KV. Idle memory of the other kind goes first, then one victim
+// of the cache. Growth the host's pressure pauses does not come here: the
+// pressure controller owns that shrink, and evicting for an allocator that
+// refuses all the same would drain the cache before macOS can acknowledge
+// any reclaimed bytes.
 CacheReclaimResult Engine::reclaimForGrowth(Growth growth) {
   const bool state = growth == Growth::State;
   if (reclaimIdleState(state))
     return {true, 0};
-  // The background pressure controller owns the shrink. Retrying a paused
-  // allocator here would drain the cache before macOS can acknowledge any
-  // reclaimed bytes.
-  if (growthPaused())
-    return {};
   const CacheReclaimResult reclaimed = cache_.reclaimOne(
       state ? CacheReclaimMode::ReleaseExtents : CacheReclaimMode::KeepExtents);
   if (reclaimed.madeProgress)
@@ -1159,7 +1209,8 @@ bool Engine::reclaimIdleState(bool keepLane) noexcept {
 // state's, as a request short of pages takes idle cached pages below:
 // evicting the state returns its cell and ring to the pool the lane draws
 // from, and nothing is allocated. A state goes only when those in RAM cover
-// what the pool lacks; otherwise the request yields and the cache survives.
+// what the pool lacks; otherwise the cache survives, and the request grows
+// if it is in service and waits if it is not.
 CacheReclaimResult Engine::reuseCachedStateWhilePaused() {
   if (reclaimIdleState(true))
     return {true, 0};
@@ -1174,12 +1225,11 @@ CacheReclaimResult Engine::reuseCachedStateWhilePaused() {
 
 // Host pressure pauses growth, and the pressure controller owns the shrink.
 // Extents that stay allocated are outside that accounting: a request short
-// of pages may take idle cached pages instead of being suspended and
-// replaying its whole prefix once the pause lifts. Cache is only evicted when
-// the pages no request holds can actually cover the shortfall; otherwise the
-// request yields as before and the cache survives for later hits. A reclaim
-// that must wait for the transfer in flight makes the request wait with it,
-// as it does without the pause.
+// of pages takes idle cached pages before it grows or waits. Cache is only
+// evicted when the pages no request holds can actually cover the shortfall;
+// otherwise it survives for later hits, and the request grows if it is in
+// service and waits if it is not. A reclaim that must wait for the transfer
+// in flight makes the request wait with it, as it does without the pause.
 CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &admission) {
   if (reclaimIdleState(false))
     return {true, 0};
@@ -1215,12 +1265,11 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
   active.stateCell.reset();
   active.suspended = true;
   active.resumeKvTargetTokens = workEnd;
-  // Resident lanes drain before admission resumes. Growth denied by the
-  // host's pressure resumes when the pause lifts; any other limit only once
-  // memory is freed, so it counts as a failure the drain waits out.
+  // Resident lanes drain before admission resumes. Growth the host refused
+  // resumes when its pressure lifts; any other limit only once memory is
+  // freed, so it counts as a failure the drain waits out.
   drainEndMilliseconds_ = now + config_.resourceWaitTimeoutMilliseconds;
-  allocationFailed_ = !growthPaused() &&
-                      failure != metal::AllocationFailure::HostPressure;
+  allocationFailed_ = failure != metal::AllocationFailure::HostPressure;
   active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
   scheduler_.suspendForResources(active.request.id);
   deferResourceRetry(active, now, {.allocationFailure = failure});

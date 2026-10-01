@@ -753,8 +753,14 @@ preserves visible history without recovering the private reasoning.
 
 `/status.admission` distinguishes memory and concurrency waits, reports suspended
 requests, recovery draining and the oldest current wait age. Memory transitions
-also appear in the console. Warning pressure can pause growth while `/ready`
-remains healthy for work that fits existing allocations.
+also appear in the console. When macOS runs short of memory, growth that no
+request in service needs pauses and the cache gives memory back, a paced pass at
+a time, down to one lane's state buffers and one KV extent. A request in service
+keeps growing within `--max-memory`, first into cached pages no request holds.
+A new request waits while another is in service unless it can start from what
+the engine already holds, and with none in service it starts. Critical pressure
+evicts every unpinned cache entry and stops all growth. `/ready` remains healthy
+throughout.
 
 PDF input supports base64 documents within a shared 64 MiB source/rendering
 budget and the native 64-image limit (one image per page). Model context and

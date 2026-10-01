@@ -205,22 +205,18 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
       hostAvailable, reservedBytes_);
   bool engineFits = !overflows && observed <= limitBytes_ &&
                     requested <= limitBytes_ - observed;
-  // Growth leaves the warning margin free above the host's reserve, except
-  // back to the serving footprint: that is what a request is served from,
-  // and a pressure pass that released it must not leave the server unable
-  // to start one while other applications hold the margin.
-  const bool withinServingFootprint =
-      !overflows && observed <= servingFootprintBytes_ &&
-      requested <= servingFootprintBytes_ - observed;
+  // Growth leaves the warning margin free above the host's reserve and waits
+  // for the recovery margin once the host has run short, unless a request
+  // in service needs it (setServing).
   const uint64_t hostRoom = hostHeadroomBytes(hostAvailable, 0);
-  const uint64_t hostMargin = withinServingFootprint ? 0 : kHostWarningMarginBytes;
-  bool hostFits = requested <= hostRoom && hostRoom - requested >= hostMargin;
+  bool hostFits = serving_ || (requested <= hostRoom &&
+                               hostRoom - requested >= kHostWarningMarginBytes);
   // A request that only the host headroom refuses waits for host memory
   // while the idle headroom may still clear the margin. Hold host pressure
   // so the paced reclaim frees toward the recovery margin for it.
   if (engineFits && !hostFits)
     hostConstrained_ = true;
-  if (!engineFits || !hostFits || (hostHeld() && !withinServingFootprint) ||
+  if (!engineFits || !hostFits || (hostHeld() && !serving_) ||
       pressure == MemoryPressure::Critical) {
     if (failure)
       *failure = !engineFits ? metal::AllocationFailure::EngineBudget
@@ -250,6 +246,11 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
     reservation->commit();
     return true;
   };
+}
+
+void MemoryGovernor::setServing(bool serving) noexcept {
+  std::lock_guard lock(mutex_);
+  serving_ = serving;
 }
 
 void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {

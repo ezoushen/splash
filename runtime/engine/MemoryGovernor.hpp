@@ -62,8 +62,9 @@ memoryPressureName(MemoryPressure pressure) noexcept {
 [[nodiscard]] std::optional<MemoryPressure> querySystemMemoryPressure() noexcept;
 
 // Allocation and recovery use separate watermarks to avoid oscillation.
-// Low availability causes paced reclaim; unavailable telemetry pauses growth;
-// the OS critical signal causes full eviction of unpinned cache entries.
+// Low availability causes paced reclaim and pauses growth that no request in
+// service needs; unavailable telemetry does the same; the OS critical signal
+// causes full eviction of unpinned cache entries and stops all growth.
 inline constexpr uint64_t kHostWarningMarginBytes = 1ULL << 30;
 inline constexpr uint64_t kHostRecoveryMarginBytes = 2ULL << 30;
 
@@ -86,9 +87,9 @@ struct MemoryGovernorSnapshot {
   uint64_t hostHeadroomBytes = 0;
   MemoryPressure systemPressure = MemoryPressure::Normal;
   bool growthAllowed = true;
-  // Whether the host has room for growth beyond the serving footprint.
-  // Growth back to that footprint needs only the host's reserve, so
-  // tryReserve can grant it while this is false.
+  // Whether the host has room for growth that no request in service needs.
+  // tryReserve still grants what such a request needs while this is false,
+  // short of critical pressure.
   bool hostGrowthAllowed = true;
 };
 
@@ -100,9 +101,8 @@ struct MemoryReclaimDirective {
   // from. Only a shrink that nothing is waiting for can afford to.
   bool keepResumePoint = false;
   // Keep what a request starts from without growing: one lane's pooled state
-  // buffers and one empty KV extent. Growth is paused under pressure, so
-  // without them no request could start until the pressure lifted; only
-  // critical pressure takes them.
+  // buffers and one empty KV extent, so the next request starts without
+  // allocating while the host is short. Only critical pressure takes them.
   bool keepServingFootprint = false;
 };
 
@@ -191,6 +191,12 @@ public:
   // callback, so allocation stays governed without introducing a
   // reverse dependency on engine policy.
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
+  // Marks the reservations that follow as memory a request in service needs,
+  // until it is cleared. The host's margins do not refuse those: holding
+  // them back would strand the request and the memory it already has, while
+  // the cache it could give up instead is what the paced reclaim returns.
+  // The limit and critical pressure refuse them like any other.
+  void setServing(bool serving) noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
   // The outcome of the engine's last reclaim pass with a target. While one
   // finds nothing left to release, the hold for the recovery margin is
@@ -200,8 +206,8 @@ public:
   // ends the waiver.
   void reclaimed(ReclaimOutcome outcome) noexcept;
   // Records what is charged once warmup has released all but one lane's
-  // state and the KV runway: the footprint a request is served from. Growth
-  // back to it needs only the host's reserve (tryReserve).
+  // state and the KV runway: the footprint an idle server keeps through
+  // warning pressure, which /status reports.
   void markServingFootprint() noexcept;
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
 
@@ -228,6 +234,7 @@ private:
   uint64_t untrackedReserveBytes_ = 0;
   mutable std::mutex mutex_;
   uint64_t reservedBytes_ = 0;
+  bool serving_ = false;
   uint64_t servingFootprintBytes_ = 0;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
