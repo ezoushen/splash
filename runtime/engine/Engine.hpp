@@ -223,6 +223,7 @@ private:
   enum class Growth : uint8_t { State, Kv };
   [[nodiscard]] CacheReclaimResult reclaimForGrowth(Growth growth);
   [[nodiscard]] bool reclaimIdleState(bool keepLane) noexcept;
+  [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused();
   [[nodiscard]] CacheReclaimResult reuseIdleBackingWhilePaused(
       const TokenAdmission &admission);
   [[nodiscard]] bool growthPaused() const;

@@ -501,17 +501,16 @@ bool Engine::admit(Request &active, double now) {
     Denial denial;
     while (!admission.granted() &&
            admission.failure == StateFailure::MemoryPressure) {
-      const bool hostPressure =
+      const bool paused = growthPaused() ||
           admission.allocationFailure == metal::AllocationFailure::HostPressure;
       const CacheReclaimResult reclaimed =
-          hostPressure ? CacheReclaimResult{reclaimIdleState(true)}
-                       : reclaimForGrowth(Growth::State);
+          paused ? reuseCachedStateWhilePaused() : reclaimForGrowth(Growth::State);
       if (reclaimed.madeProgress) {
         admission = activate();
         continue;
       }
       denial.pending = reclaimed.pending;
-      if (hostPressure)
+      if (paused)
         break;
       // A useful restore remains pinned throughout ordinary eviction. If
       // that pin is the last obstacle to admitting even one lane, prefer
@@ -1161,6 +1160,23 @@ bool Engine::reclaimIdleState(bool keepLane) noexcept {
     return false;
   signalResourceProgress();
   return true;
+}
+
+// While growth is paused a lane short of state buffers takes a cached
+// state's, as a request short of pages takes idle cached pages below:
+// evicting the state returns its cell and ring to the pool the lane draws
+// from, and nothing is allocated. A state goes only when those in RAM cover
+// what the pool lacks; otherwise the request yields and the cache survives.
+CacheReclaimResult Engine::reuseCachedStateWhilePaused() {
+  if (reclaimIdleState(true))
+    return {true, 0};
+  const uint32_t lacked = model_.statesToActivate();
+  if (!lacked || cache_.evictableStates() < lacked)
+    return {};
+  const CacheReclaimResult reused = cache_.reclaimStateForLane();
+  if (reused.madeProgress)
+    signalResourceProgress();
+  return reused;
 }
 
 // Host pressure pauses growth, and the pressure controller owns physical

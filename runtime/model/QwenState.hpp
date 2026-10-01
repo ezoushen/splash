@@ -201,6 +201,9 @@ public:
   [[nodiscard]] uint64_t releaseOneIdle(bool keepLane) noexcept;
   [[nodiscard]] uint32_t idleCells() const noexcept;
   [[nodiscard]] uint32_t idleRings() const noexcept;
+  // What activating a slot lacks in the idle pool, in cached states: each
+  // holds one GDN cell and one draft ring, a lane two cells and a ring.
+  [[nodiscard]] uint32_t statesToActivate() const noexcept;
 
   // Hot-path metadata operations; neither performs a buffer copy.
   void updateLengths(uint32_t slot, QwenLogicalLengths lengths);

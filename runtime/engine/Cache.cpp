@@ -378,6 +378,15 @@ bool Cache::reclaimOneState(bool checkpointsOnly) {
          states_.reclaim(state->id, completionNotifier_, makeRoom_).evicted;
 }
 
+CacheReclaimResult Cache::reclaimStateForLane() {
+  const std::optional<CacheEvictionCandidate> state = states_.evictionCandidate();
+  if (!state)
+    return {false, 0, transfersInFlight()};
+  const StateEviction eviction =
+      states_.reclaim(state->id, completionNotifier_, makeRoom_, true);
+  return {eviction.evicted, eviction.reclaimedBytes, eviction.pending};
+}
+
 std::optional<CacheEvictionCandidate> Cache::oldestKvLeaf(uint64_t after) const {
   while (auto candidate = kv_.evictionCandidate(after)) {
     after = candidate->id;

@@ -512,6 +512,10 @@ public:
   // quota cannot admit another state: the caller may free quota and retry.
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
+  // The cached states whose buffers a lane's activation would still have to
+  // allocate: each one evicted returns to the pool what a lane takes. Zero
+  // when the pool holds a lane's buffers.
+  [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
   // Releases one unit of idle model state (an unused buffer, then caches
   // that can be rebuilt) and returns its bytes; zero when nothing is idle.
   // A denied allocation retries between calls, so it frees only what it

@@ -332,6 +332,12 @@ uint64_t QwenStateStorage::missingBytes(uint32_t cells) const noexcept {
          (pool_->rings.empty() ? layout_.draft.ringBytes() : 0);
 }
 
+uint32_t QwenStateStorage::statesToActivate() const noexcept {
+  const uint32_t cells = kLaneCells - std::min(idleCells(), kLaneCells);
+  const uint32_t rings = idleRings() ? 0 : 1;
+  return std::max(cells, rings);
+}
+
 void QwenStateStorage::updateLengths(uint32_t index,
                                      QwenLogicalLengths lengths) {
   validateLengths(lengths, false);

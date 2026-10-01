@@ -233,6 +233,13 @@ public:
   // Recycles exactly one unpinned state, preferring checkpoints, for a
   // required state publication; the disk tier keeps it when it admits it.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
+  // The same for a lane that takes the state's buffers: a state the tier
+  // could take once the write in flight has finished stays and is reported
+  // pending, as in reclaimOne. evictableStates() are those it can take.
+  [[nodiscard]] CacheReclaimResult reclaimStateForLane();
+  [[nodiscard]] uint32_t evictableStates() const noexcept {
+    return states_.evictable();
+  }
   [[nodiscard]] CacheSnapshot snapshot() const;
 
 private:

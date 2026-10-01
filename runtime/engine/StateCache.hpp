@@ -139,6 +139,10 @@ public:
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
   // A RAM copy exists.
   [[nodiscard]] bool resident(uint64_t kvBlock) const noexcept;
+  // The RAM copies a reclaim may free: the unpinned ones.
+  [[nodiscard]] uint32_t evictable() const noexcept {
+    return static_cast<uint32_t>(ordinary_.size() + checkpoints_.size());
+  }
   // Oldest RAM copy to free; unpinned checkpoints precede ordinary states
   // regardless of recency. Without checkpoints, the oldest ordinary state.
   [[nodiscard]] std::optional<CacheEvictionCandidate>

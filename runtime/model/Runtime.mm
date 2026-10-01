@@ -2363,6 +2363,10 @@ Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
   return impl_->states.snapshotToDisk(committedStateSlot(requestId), std::move(completion));
 }
 
+uint32_t Runtime::statesToActivate() const noexcept {
+  return impl_->states.statesToActivate();
+}
+
 uint64_t Runtime::reclaimIdleState(bool keepLane) noexcept {
   // One idle buffer per call, so a denied allocation frees only what it
   // needs; rebuildable caches go once the pool has nothing more to give.

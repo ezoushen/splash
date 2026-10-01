@@ -508,7 +508,7 @@ void run(const std::string &metallib) {
     require(!storage.metadata(0).assigned && storage.metadata(0).requestId == 0,
             "cancellation did not release metadata");
     require(storage.idleCells() == 2 && storage.idleRings() == 1 &&
-                storage.actualSlotBytes(0) == 0,
+                storage.actualSlotBytes(0) == 0 && storage.statesToActivate() == 0,
             "released lane buffers did not return to the pool");
     requireThrows<std::logic_error>([&] { storage.swapParity(0); },
                                     "unassigned slot accepted a parity update");
@@ -628,14 +628,15 @@ void run(const std::string &metallib) {
             "idle lane buffers were not reclaimed");
     require(storage.idleCells() == 0 && storage.idleRings() == 0,
             "reclaimed buffers remain pooled");
-    require(storage.actualAllocatedBytes() == 0,
+    require(storage.actualAllocatedBytes() == 0 && storage.statesToActivate() == 2,
             "reclaimed state cells remain accounted");
 
     // An activation asks the governor once for everything the pool lacks:
     // a refusal allocates nothing and leaves the pool as it was.
     admitNewAllocations = false;
     require(!storage.tryActivateSlot(0, 505) && !storage.metadata(0).assigned &&
-                storage.actualAllocatedBytes() == 0,
+                storage.actualAllocatedBytes() == 0 &&
+                storage.statesToActivate() == 2,
             "a denied activation allocated part of its lane");
     admitNewAllocations = true;
     uint32_t admitted = admissions;
@@ -647,7 +648,7 @@ void run(const std::string &metallib) {
     // leaves both pooled, and the retry is admitted that cell alone.
     storage.releaseSlot(0, 505);
     require(storage.releaseOneIdle(false) != 0 && storage.idleCells() == 1 &&
-                storage.idleRings() == 1,
+                storage.idleRings() == 1 && storage.statesToActivate() == 1,
             "fixture pool does not hold one cell and the ring");
     const uint64_t pooledBytes = storage.actualAllocatedBytes();
     admitNewAllocations = false;

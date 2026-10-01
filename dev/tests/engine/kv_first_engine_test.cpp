@@ -383,6 +383,9 @@ public:
     ++diskSnapshots;
     return std::make_unique<OffloadTicket>(stateTier);
   }
+  uint32_t statesToActivate() const noexcept override {
+    return statesLacked ? statesLacked() : 0;
+  }
   uint64_t reclaimIdleState(bool keepLane) noexcept override {
     keptLane = keepLane;
     if (!keepLane && pooledLaneBytes)
@@ -454,6 +457,8 @@ public:
   // The pooled buffers a lane starts from; only a reclaim that does not keep
   // the lane releases them.
   uint64_t pooledLaneBytes = 0;
+  // The cached states whose buffers the pool lacks for one activation.
+  std::function<uint32_t()> statesLacked;
   uint64_t reclaimedIdleStateBytes = 0;
   bool keptLane = false;
   bool *physicalGrowthBlocked = nullptr;
@@ -2966,6 +2971,50 @@ void testStateAdmissionKeepsThePooledLaneBuffers() {
   }
 }
 
+// While growth is paused, a lane short of state buffers takes a cached
+// state's: the oldest in RAM goes when those in RAM cover what the pool
+// lacks, and none goes when they do not.
+void testPausedStateAdmissionReusesCachedStates() {
+  for (uint32_t lacked : {1U, 2U}) {
+    Backing backing(64);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor executor;
+    Events events;
+    bool paused = false;
+    EngineConfig config;
+    config.growthPaused = [&] { return paused; };
+    engine::Engine engine(config, cache, executor, events);
+    engine.submit(request(287, std::vector<uint32_t>(65, 287)));
+    runUntilIdle(engine);
+    const auto cached = cache.snapshot().stateCache;
+    require(cached.entries == 1, "fixture did not cache one state");
+
+    paused = true;
+    // Each state the cache gives up returns what the pool lacks of one.
+    executor.statesLacked = [&] {
+      const uint64_t given = cache.snapshot().stateCache.evictions - cached.evictions;
+      return lacked > given ? static_cast<uint32_t>(lacked - given) : 0;
+    };
+    executor.beginGrowthBlocked = [&] { return executor.statesLacked() != 0; };
+    executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+    engine.submit(request(288, {288}));
+    for (double now = 10; now < 20 && !engine.idle(); ++now)
+      static_cast<void>(engine.tick(now));
+    const auto after = cache.snapshot().stateCache;
+    if (lacked == 1) {
+      require(engine.idle() && events.completedCount == 2 && events.failedCount == 0 &&
+                  after.evictions == cached.evictions + 1,
+              "a paused admission did not take the cached state's buffers");
+    } else {
+      require(!engine.idle() && events.completedCount == 1 &&
+                  engine.snapshot().scheduler.waitingResources == 1 &&
+                  after.entries == 1 && after.evictions == cached.evictions,
+              "a paused admission evicted a state that could not cover its lane");
+    }
+  }
+}
+
 void testDeniedGrowthAllocatesEachExtentOnce() {
   constexpr uint32_t cachedExtents = 24;
   constexpr uint32_t budgetExtents = 32;
@@ -5373,6 +5422,7 @@ int main() {
     testFailedResumeRestoreKeepsTheKvTarget();
     testBudgetDenialRetriesAfterRelease();
     testStateAdmissionKeepsThePooledLaneBuffers();
+    testPausedStateAdmissionReusesCachedStates();
     testDeniedGrowthAllocatesEachExtentOnce();
     testGrowthBeyondTheBudgetFailsAtOnce();
     testReclaimPassReleasesEveryEmptyExtent();
