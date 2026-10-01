@@ -73,7 +73,7 @@ struct StateCacheSnapshot {
   uint32_t checkpointEntries = 0;
   uint64_t checkpointBytes = 0;
   uint64_t checkpointRetirements = 0;
-  // Pressure and logical eviction; rolling retirements are counted separately.
+  // Evictions by a reclaim; rolling retirements are counted separately.
   uint64_t checkpointEvictions = 0;
 };
 
@@ -103,7 +103,7 @@ public:
 
   [[nodiscard]] std::optional<CompositeStateLease>
   acquireDeepest(std::span<const uint64_t> kvChain);
-  // Acquisition pins backing; accounting occurs only when admission succeeds.
+  // Acquisition pins the state; accounting occurs only when admission succeeds.
   void recordLookup(bool hit, bool disk = false) noexcept;
 
   // Reuses a RAM copy without a restore pin or lookup accounting. A normal

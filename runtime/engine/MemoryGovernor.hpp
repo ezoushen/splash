@@ -69,11 +69,11 @@ inline constexpr uint64_t kHostRecoveryMarginBytes = 2ULL << 30;
 
 struct MemoryGovernorSnapshot {
   uint64_t limitBytes = 0;
-  // Charged against the limit: the backend's resident buffers plus the
+  // Charged against the limit: the backend's allocated buffers plus the
   // untracked reserve, or the device's allocation when that is larger.
-  uint64_t observedResidentBytes = 0;
-  // The observed resident bytes once warmup released all but one lane's
-  // state and the KV runway (markServingFootprint); zero until then.
+  uint64_t chargedBytes = 0;
+  // The charged bytes once warmup released all but one lane's state and the
+  // KV runway (markServingFootprint); zero until then.
   uint64_t servingFootprintBytes = 0;
   uint64_t reservedBytes = 0;
   uint64_t headroomBytes = 0;
@@ -93,14 +93,14 @@ struct MemoryGovernorSnapshot {
 };
 
 struct MemoryReclaimDirective {
-  bool reclaimEmptyKvExtents = false;
+  bool reclaim = false;
   bool evictAllUnpinnedPrefixes = false;
   uint64_t targetBytes = 0;
   // Keep the newest state publication, the point a follow-up request resumes
   // from. Only a shrink that nothing is waiting for can afford to.
   bool keepResumePoint = false;
   // Keep what a request starts from without growing: one lane's pooled state
-  // buffers and one resident KV extent. Growth is paused under pressure, so
+  // buffers and one empty KV extent. Growth is paused under pressure, so
   // without them no request could start until the pressure lifted; only
   // critical pressure takes them.
   bool keepServingFootprint = false;
@@ -108,7 +108,7 @@ struct MemoryReclaimDirective {
 
 // What a reclaim pass made of its directive's target.
 enum class ReclaimOutcome : uint8_t {
-  // The directive set none; the pass returned only empty backing.
+  // The directive set none; the pass returned only empty extents.
   Untargeted,
   // Released, counting the pages whose copies are being written.
   Met,
@@ -144,7 +144,7 @@ private:
   std::optional<MemoryReclaimDirective> continued_;
 };
 
-// The sole physical-memory admission ledger. It does not allocate, evict, or
+// The sole memory admission ledger. It does not allocate, evict, or
 // schedule work; it only gives a short-lived byte reservation to a caller that
 // is about to allocate Metal memory. That keeps policy out of MetalBackend
 // and makes every growth operation transactional.
@@ -188,7 +188,7 @@ public:
   [[nodiscard]] std::optional<Reservation> tryReserve(
       uint64_t bytes, metal::AllocationFailure *failure = nullptr);
   // Low-level storage/model components receive only this transactional
-  // callback, so physical allocation stays governed without introducing a
+  // callback, so allocation stays governed without introducing a
   // reverse dependency on engine policy.
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
@@ -199,7 +199,7 @@ public:
   // A pass that releases or waits for memory again, or the host's recovery,
   // ends the waiver.
   void reclaimed(ReclaimOutcome outcome) noexcept;
-  // Records what is resident once warmup has released all but one lane's
+  // Records what is charged once warmup has released all but one lane's
   // state and the KV runway: the footprint a request is served from. Growth
   // back to it needs only the host's reserve (tryReserve).
   void markServingFootprint() noexcept;
@@ -207,7 +207,7 @@ public:
 
 private:
   [[nodiscard]] uint64_t
-  observedResidentBytes(bool refreshDevice = false) const noexcept;
+  chargedBytes(bool refreshDevice = false) const noexcept;
   [[nodiscard]] std::optional<uint64_t> sampleHostAvailable() const noexcept;
   [[nodiscard]] uint64_t
   hostHeadroomBytes(const std::optional<uint64_t> &hostAvailable,

@@ -144,7 +144,7 @@ private:
 };
 
 // Owns every process-wide native resource exactly once. Destruction order is
-// Cache -> logical KV pool -> state -> KV backing -> governor ->
+// Cache -> KV pool -> state -> KV page storage -> governor ->
 // model package -> Metal backend.
 class RuntimeResources final {
 public:

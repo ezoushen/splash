@@ -236,7 +236,7 @@ int main(int argc, char **argv) {
       kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout,
                             pageCount, extentPages);
       for (uint32_t page = 0; page < pageCount; ++page) {
-        if (!pages.ensureResident(page))
+        if (!pages.ensureAllocated(page))
           throw std::runtime_error("could not back the KV pages");
       }
       model::QwenStateStorage states(backend,

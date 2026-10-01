@@ -565,13 +565,13 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   report.targetWeightsBytes = model_.targetActualAllocatedBytes();
   report.draftWeightsBytes = model_.draft.actualAllocatedBytes;
   report.visionWeightsBytes = model_.vision.actualAllocatedBytes;
-  report.stateResidentBytes = modelMemory.stateActualAllocatedBytes;
+  report.stateAllocatedBytes = modelMemory.stateActualAllocatedBytes;
   report.sharedPrefillBytes = modelMemory.sharedPrefillActualAllocatedBytes;
   report.sharedDecodeBytes = modelMemory.sharedDecodeActualAllocatedBytes;
-  report.kvResidentBytes = kvPages_->actualAllocatedBytes();
+  report.kvAllocatedBytes = kvPages_->actualAllocatedBytes();
   report.stateStagingBytes = stateStorage_->stagingBytes();
   // Optional warmup may end with a rolled-back allocation and no subsequent
-  // command. Refresh current residency after that rollback; peaks stay intact.
+  // command. Refresh the current counts after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();
   report.backendAllocatedBytes = memory.allocatedBytes;
   report.deviceCurrentAllocatedBytes = memory.deviceCurrentAllocatedBytes;

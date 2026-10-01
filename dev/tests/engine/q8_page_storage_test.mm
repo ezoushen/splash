@@ -163,7 +163,7 @@ void run(const std::string &metallib) {
             "critical pressure did not stop new growth");
     bounded.setPressure(MemoryPressure::Normal);
     require(bounded.tryReserve(1).has_value(),
-            "normal pressure did not reopen physical admission");
+            "normal pressure did not reopen admission");
     fakeHostAvailable = hostReserve;
     require(!bounded.tryReserve(1).has_value(),
             "host reserve did not stop unified-memory growth");
@@ -186,7 +186,7 @@ void run(const std::string &metallib) {
     fakeHostAvailable = hostReserve + 3 * giB;
     require(bounded.snapshot().pressure == MemoryPressure::Normal &&
                 bounded.snapshot().growthAllowed,
-            "host recovery did not reopen physical admission");
+            "host recovery did not reopen admission");
     {
         auto reservation = bounded.tryReserve(64 * 1024);
         require(reservation.has_value(), "engine capacity reservation failed");
@@ -213,7 +213,7 @@ void run(const std::string &metallib) {
     require(bounded.snapshot().hostHeadroomBytes == 3 * giB,
             "host memory headroom accounting is wrong");
 
-    // Low reclaimable memory must not reopen physical growth or suppress
+    // Low reclaimable memory must not reopen growth or suppress
     // the existing pressure reclaimer. Reclaimable file cache can.
     HostMemoryPages pressurePages{.free = hostReserve, .fileBacked = giB / 2};
     fakeHostAvailable = estimateHostAvailableMemory(pressurePages, 1);
@@ -221,7 +221,7 @@ void run(const std::string &metallib) {
     auto hostDirective = hostPolicy.update(bounded.snapshot(), 0.0, false);
     require(!bounded.tryReserve(1).has_value() &&
                 bounded.snapshot().pressure == MemoryPressure::Warning &&
-                hostDirective.reclaimEmptyKvExtents &&
+                hostDirective.reclaim &&
                 !hostDirective.evictAllUnpinnedPrefixes &&
                 hostDirective.targetBytes == giB,
             "low reclaimable memory bypassed bounded pressure recovery");
@@ -229,7 +229,7 @@ void run(const std::string &metallib) {
     fakeHostAvailable = estimateHostAvailableMemory(pressurePages, 1);
     require(bounded.snapshot().growthAllowed &&
                 bounded.tryReserve(1).has_value() &&
-                !hostPolicy.update(bounded.snapshot(), 1000.0, false).reclaimEmptyKvExtents,
+                !hostPolicy.update(bounded.snapshot(), 1000.0, false).reclaim,
             "reclaimable host recovery did not reopen normal admission");
     bounded.setPressure(MemoryPressure::Warning);
     require(bounded.snapshot().pressure == MemoryPressure::Warning &&
@@ -249,7 +249,7 @@ void run(const std::string &metallib) {
     policySnapshot.systemPressure = MemoryPressure::Warning;
     policySnapshot.hostHeadroomBytes = 3 * giB / 2;
     auto firstDirective = policy.update(policySnapshot, 0.0, false);
-    require(firstDirective.reclaimEmptyKvExtents &&
+    require(firstDirective.reclaim &&
                 !firstDirective.evictAllUnpinnedPrefixes &&
                 firstDirective.targetBytes == giB / 2,
             "warning pressure ignored measured headroom");
@@ -266,7 +266,7 @@ void run(const std::string &metallib) {
     require(policy.update(policySnapshot, 2000.0, false).targetBytes == giB / 4,
             "pressure recovery ignored the current smaller deficit");
     policySnapshot.pressure = MemoryPressure::Normal;
-    require(!policy.update(policySnapshot, 2100.0, false).reclaimEmptyKvExtents,
+    require(!policy.update(policySnapshot, 2100.0, false).reclaim,
             "normal pressure requested cache reclaim");
     policySnapshot.pressure = MemoryPressure::Warning;
     require(policy.update(policySnapshot, 2101.0, false).targetBytes == giB / 4,
@@ -274,7 +274,7 @@ void run(const std::string &metallib) {
     policySnapshot.systemPressure = MemoryPressure::Warning;
     policySnapshot.hostHeadroomBytes = 3 * giB;
     const auto advisory = policy.update(policySnapshot, 3101.0, false);
-    require(advisory.reclaimEmptyKvExtents && !advisory.evictAllUnpinnedPrefixes &&
+    require(advisory.reclaim && !advisory.evictAllUnpinnedPrefixes &&
                 advisory.targetBytes == 0,
             "system warning discarded live cache despite sufficient headroom");
     // The newest publication is what a follow-up resumes from; rebuilding it
@@ -290,7 +290,7 @@ void run(const std::string &metallib) {
             "a waiting request could not reach the resume point");
     policySnapshot.pressure = MemoryPressure::Critical;
     auto criticalDirective = policy.update(policySnapshot, 2102.0, false);
-    require(criticalDirective.reclaimEmptyKvExtents &&
+    require(criticalDirective.reclaim &&
                 criticalDirective.evictAllUnpinnedPrefixes &&
                 !criticalDirective.keepResumePoint,
             "critical pressure did not request aggressive reclaim");
@@ -306,14 +306,14 @@ void run(const std::string &metallib) {
         throw std::runtime_error(
             "elastic Q8 storage started with " +
             std::to_string(hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages()) +
-            " resident blocks instead of 128");
+            " allocated pages instead of 128");
     }
     elasticHostAvailable = 128ULL * 1024 * 1024;
-    require(!hostGatedStorage.ensureResident(128) &&
+    require(!hostGatedStorage.ensureAllocated(128) &&
                 hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages() == 128,
             "host pressure did not reject the next KV extent transactionally");
     elasticHostAvailable = 4ULL * 1024 * 1024 * 1024;
-    require(hostGatedStorage.ensureResident(128) &&
+    require(hostGatedStorage.ensureAllocated(128) &&
                 hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages() == 256,
             "KV growth did not recover after host memory became available");
 
@@ -335,8 +335,8 @@ void run(const std::string &metallib) {
                 storage.actualAllocatedBytes() == extentBytes &&
                 backend.memoryStats().allocatedBytes == before + extentBytes,
             "the runway extent was not allocated at exactly its size");
-    require(storage.allocatedExtents() * storage.extentPages() == 128 && storage.isResident(127) && !storage.isResident(128),
-            "initial Q8 runway residency is incorrect");
+    require(storage.allocatedExtents() * storage.extentPages() == 128 && storage.isAllocated(127) && !storage.isAllocated(128),
+            "the first Q8 extent is not the allocated runway");
     const auto layer = storage.layer(15);
     require(layer.format == kv::Format::Int8 && layer.kv.extent_pages == 128 &&
                 layer.kv.offset == 15 * 128 * kvLayout.bytesPerLayerPage(),
@@ -346,19 +346,19 @@ void run(const std::string &metallib) {
     require(runwayPage && (runwayPage & SPLASH_KV_PAGE_INDEX_MASK) == 5,
             "a page entry does not carry the page's index in its extent");
     requireThrows<std::logic_error>([&] { (void)storage.entry(200); },
-                                    "an unbacked page received an entry");
+                                    "a page of an unallocated extent received an entry");
     requireThrows<std::logic_error>([&] { (void)storage.spans(200); },
-                                    "an unbacked page received host memory");
+                                    "a page of an unallocated extent received host memory");
     requireSpansTileExtent(storage, 0);
     requireThrows<std::logic_error>(
         [&] { storage.writeEntries(std::array<uint32_t, 1>{200}, table); },
-        "a table was written with an unbacked page");
+        "a table was written with a page of an unallocated extent");
     requireThrows<std::logic_error>(
         [&] { storage.writeEntries(std::array<uint32_t, 5>{0, 1, 2, 3, 4}, table); },
         "a table too small for its entries was written");
 
     const uint64_t generation = storage.generation();
-    require(storage.ensureResident(200) && storage.generation() == generation + 1 &&
+    require(storage.ensureAllocated(200) && storage.generation() == generation + 1 &&
                 storage.allocatedExtents() * storage.extentPages() == 256 &&
                 storage.actualAllocatedBytes() == 2 * extentBytes &&
                 backend.memoryStats().allocatedBytes == before + 2 * extentBytes,
@@ -378,19 +378,19 @@ void run(const std::string &metallib) {
         const metal::ComputeDispatch kick{"residency_kick", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
         auto ticket = backend.submitAsync(kick);
         requireThrows<std::logic_error>(
-            [&] { (void)storage.releaseBackingForPage(200); },
+            [&] { (void)storage.releaseExtentOf(200); },
             "an extent was released while a command was in flight");
-        require(storage.isResident(200) && storage.entry(200) == entries[0] &&
+        require(storage.isAllocated(200) && storage.entry(200) == entries[0] &&
                     storage.generation() == generation + 1,
                 "a refused release changed the extent");
         (void)ticket.wait();
     }
-    require(storage.releaseBackingForPage(200) && !storage.isResident(200) &&
+    require(storage.releaseExtentOf(200) && !storage.isAllocated(200) &&
                 storage.generation() == generation + 2 && storage.allocatedExtents() * storage.extentPages() == 128 &&
                 backend.memoryStats().allocatedBytes == before + extentBytes,
             "a released extent did not return its memory at once");
-    require(!storage.releaseBackingForPage(200), "an unbacked extent was released twice");
-    require(storage.ensureResident(255) && storage.generation() == generation + 3 &&
+    require(!storage.releaseExtentOf(200), "an unallocated extent was released again");
+    require(storage.ensureAllocated(255) && storage.generation() == generation + 3 &&
                 (storage.entry(255) & SPLASH_KV_PAGE_INDEX_MASK) == 127,
             "a released extent could not be allocated again");
 
@@ -413,15 +413,15 @@ void run(const std::string &metallib) {
                     bf16Layer.kv.offset == (layout.attentionLayers - 1) * extent * 2 *
                                                layout.dataBytesPerLayerPage(),
                 "BF16 regions hold quantization scales or misplace a layer");
-        require(bf16.allocatedExtents() * bf16.extentPages() == extent && !bf16.isResident(extent) &&
+        require(bf16.allocatedExtents() * bf16.extentPages() == extent && !bf16.isAllocated(extent) &&
                     bf16.actualAllocatedBytes() == extent * layout.bytesPerModelPage(),
-                "BF16 initial residency escaped its admitted extent");
+                "BF16 allocated more than its first admitted extent");
         requireSpansTileExtent(bf16, 0);
-        require(bf16.ensureResident(extent) && bf16.allocatedExtents() * bf16.extentPages() == 2 * extent &&
+        require(bf16.ensureAllocated(extent) && bf16.allocatedExtents() * bf16.extentPages() == 2 * extent &&
                     bf16.actualAllocatedBytes() == uint64_t{bf16.pageCount()} * bf16.bytesPerPage(),
                 "BF16 growth did not account for both extents");
-        require(bf16.releaseBackingForPage(extent), "BF16 extent release failed");
-        require(!bf16.isResident(extent) && bf16.ensureResident(extent),
+        require(bf16.releaseExtentOf(extent), "BF16 extent release failed");
+        require(!bf16.isAllocated(extent) && bf16.ensureAllocated(extent),
                 "BF16 extent could not be allocated again after release");
     }
     std::cout << "KV page storage tests passed\n";

@@ -243,7 +243,7 @@ void testHostRefusalStartsReclaim() {
   MemoryPressurePolicy policy;
   const MemoryReclaimDirective directive = policy.update(refused, 0.0, true);
   require(refused.pressure == MemoryPressure::Warning &&
-              !refused.hostGrowthAllowed && directive.reclaimEmptyKvExtents &&
+              !refused.hostGrowthAllowed && directive.reclaim &&
               !directive.evictAllUnpinnedPrefixes &&
               !directive.keepResumePoint && directive.keepServingFootprint &&
               directive.targetBytes == kGiB - 200 * kMiB,

@@ -141,7 +141,7 @@ MemoryGovernor::MemoryGovernor(
     throw std::invalid_argument(
         "host available-memory provider must be present");
   }
-  if (observedResidentBytes(true) > limitBytes_) {
+  if (chargedBytes(true) > limitBytes_) {
     throw metal::MetalAllocationError(
         "existing Metal allocations exceed memory governor limit",
         metal::AllocationFailure::EngineBudget);
@@ -155,7 +155,7 @@ MemoryGovernor::MemoryGovernor(
 }
 
 uint64_t
-MemoryGovernor::observedResidentBytes(bool refreshDevice) const noexcept {
+MemoryGovernor::chargedBytes(bool refreshDevice) const noexcept {
   metal::MetalMemoryStats memory = refreshDevice
       ? backend_.refreshMemoryStats()
       : backend_.memoryStats();
@@ -195,7 +195,7 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
     throw std::invalid_argument("memory reservation must be positive");
   }
   std::lock_guard lock(mutex_);
-  uint64_t observed = observedResidentBytes(true);
+  uint64_t observed = chargedBytes(true);
   bool overflows =
       reservedBytes_ > std::numeric_limits<uint64_t>::max() - bytes;
   uint64_t requested =
@@ -259,7 +259,7 @@ void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
 
 void MemoryGovernor::markServingFootprint() noexcept {
   std::lock_guard lock(mutex_);
-  servingFootprintBytes_ = observedResidentBytes(true);
+  servingFootprintBytes_ = chargedBytes(true);
 }
 
 void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
@@ -271,7 +271,7 @@ void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
 
 MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   std::lock_guard lock(mutex_);
-  uint64_t observed = observedResidentBytes();
+  uint64_t observed = chargedBytes();
   uint64_t used = observed;
   if (reservedBytes_ <= std::numeric_limits<uint64_t>::max() - used) {
     used += reservedBytes_;
@@ -340,23 +340,23 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
     return {};
   }
   if (snapshot.pressure == MemoryPressure::Critical) {
-    return {.reclaimEmptyKvExtents = true,
+    return {.reclaim = true,
             .evictAllUnpinnedPrefixes = true,
             .targetBytes = std::numeric_limits<uint64_t>::max()};
   }
   if (nowMilliseconds < nextReclaimMilliseconds_)
     return continued_.value_or(MemoryReclaimDirective{
-        .reclaimEmptyKvExtents = true, .keepServingFootprint = true});
+        .reclaim = true, .keepServingFootprint = true});
   // The host samples every 500 ms. Allow counters to settle between batches,
   // but keep responding if another application continues consuming memory.
   nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
   continued_.reset();
 
   // Missing telemetry pauses allocation, but is not evidence that live
-  // cache must be discarded. Empty backing can still be returned.
+  // cache must be discarded. Empty extents can still be returned.
   if (!snapshot.hostMeasurementValid &&
       snapshot.systemPressure == MemoryPressure::Normal)
-    return {.reclaimEmptyKvExtents = true, .keepServingFootprint = true};
+    return {.reclaim = true, .keepServingFootprint = true};
 
   uint64_t desired = snapshot.hostHeadroomBytes < kHostRecoveryMarginBytes
       ? kHostRecoveryMarginBytes - snapshot.hostHeadroomBytes
@@ -364,7 +364,7 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // Recovering the last stretch to the watermark is worth far less than the
   // resume point it would otherwise discard, so a pass with nothing waiting
   // keeps that publication and takes the rest. A waiting request outranks it.
-  return {.reclaimEmptyKvExtents = true,
+  return {.reclaim = true,
           .targetBytes = std::min(desired, kHostWarningMarginBytes),
           .keepResumePoint = !requestWaiting,
           .keepServingFootprint = true};

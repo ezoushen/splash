@@ -24,24 +24,24 @@ using namespace splash::engine;
 
 namespace {
 
-class Backing final : public KvBacking {
+class Storage final : public kv::ExtentStorage {
 public:
-  Backing() : resident_(8, true) {}
-  uint32_t pageCount() const noexcept override { return resident_.size(); }
+  Storage() : allocated_(8, true) {}
+  uint32_t pageCount() const noexcept override { return allocated_.size(); }
   uint64_t bytesPerPage() const noexcept override { return 4096; }
-  bool isResident(uint32_t page) const override { return resident_.at(page); }
-  splash::metal::AllocationResult ensureResident(uint32_t page) override {
-    resident_.at(page) = true;
+  bool isAllocated(uint32_t page) const override { return allocated_.at(page); }
+  splash::metal::AllocationResult ensureAllocated(uint32_t page) override {
+    allocated_.at(page) = true;
     return true;
   }
-  bool releaseBackingForPage(uint32_t page) override {
-    resident_.at(page) = false;
+  bool releaseExtentOf(uint32_t page) override {
+    allocated_.at(page) = false;
     return true;
   }
   uint32_t extentFirstPage(uint32_t page) const override { return page; }
   uint32_t extentPageCount(uint32_t) const override { return 1; }
 private:
-  std::vector<bool> resident_;
+  std::vector<bool> allocated_;
 };
 
 class Executor final : public model::Model {
@@ -120,8 +120,8 @@ struct Harness final {
       : transport(inputFd < 0 ? pipes.input[0] : inputFd, pipes.output[1],
                   inputQueueBytes) {}
   Pipes pipes;
-  Backing backing;
-  KvPool pool{backing};
+  Storage storage;
+  KvPool pool{storage};
   engine::Cache resources{pool, CacheNamespace{}};
   Executor executor;
   engine::FdTransport transport;
@@ -304,8 +304,8 @@ void testLoopRecordsItsLongestTick() {
 // engine's next deadline and then fails the request that reached it.
 void testLoopWakesForAnEngineDeadline() {
   Pipes pipes;
-  Backing backing;
-  KvPool pool{backing};
+  Storage storage;
+  KvPool pool{storage};
   engine::Cache resources{pool, CacheNamespace{}};
   Executor executor;
   engine::FdTransport transport{pipes.input[0], pipes.output[1]};

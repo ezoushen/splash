@@ -46,15 +46,15 @@ MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
   actual.targetWeightsBytes = b.targetWeightsBytes;
   actual.draftWeightsBytes = b.draftWeightsBytes;
   actual.visionWeightsBytes = b.visionWeightsBytes;
-  actual.stateResidentBytes = b.activeStateCellBytes;
+  actual.stateAllocatedBytes = b.activeStateCellBytes;
   actual.sharedPrefillBytes = b.sharedPrefillBytes;
   actual.sharedDecodeBytes = b.sharedDecodeBytes;
-  actual.kvResidentBytes = b.kvExtentBytes;
+  actual.kvAllocatedBytes = b.kvExtentBytes;
   actual.backendAllocatedBytes =
       actual.targetWeightsBytes + actual.draftWeightsBytes +
-      actual.visionWeightsBytes + actual.stateResidentBytes +
+      actual.visionWeightsBytes + actual.stateAllocatedBytes +
       actual.sharedPrefillBytes + actual.sharedDecodeBytes +
-      actual.kvResidentBytes;
+      actual.kvAllocatedBytes;
   actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
   actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes;
   // Model warmup estimates add the pipeline and runtime reserves.
@@ -88,7 +88,7 @@ void testCleanRuntimeStatus() {
   engine.scheduler.decodeBatches = 4;
   engine.scheduler.decodeBatchesByWidth = {1, 1, 1, 1};
   engine.scheduler.decodeMixedGreedySamplingBatches = 2;
-  engine.resources.pool = {256, 200, 24, 32, 128, 72, 1, 128 * 4096ULL,
+  engine.resources.pool = {128, 72, 24, 32, 1, 128 * 4096ULL,
                            32 * 4096ULL, 5, 3, 2.5, 0.75};
   engine.resources.kvCache = {32, 32 * 4096ULL};
   engine.resources.stateCache = {2, 0, 128, 1, 1, 2, 0};
@@ -133,9 +133,9 @@ void testCleanRuntimeStatus() {
 
   MemoryGovernorSnapshot governor;
   governor.limitBytes = memoryPlan.breakdown().hardBudgetBytes;
-  governor.observedResidentBytes = metal.allocatedBytes;
+  governor.chargedBytes = metal.allocatedBytes;
   governor.servingFootprintBytes = 3 * kGiB;
-  governor.headroomBytes = governor.limitBytes - governor.observedResidentBytes;
+  governor.headroomBytes = governor.limitBytes - governor.chargedBytes;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
@@ -143,7 +143,7 @@ void testCleanRuntimeStatus() {
   governor.growthAllowed = true;
 
   model::ModelTelemetry executorTelemetry;
-  executorTelemetry.stateResidentBytes = 350'224'384;
+  executorTelemetry.stateAllocatedBytes = 350'224'384;
   executorTelemetry.warmIdleStateCells = 1;
   executorTelemetry.targetPrefillRows = 10000;
   executorTelemetry.draftContextRowsActive = 2048;
@@ -217,9 +217,10 @@ void testCleanRuntimeStatus() {
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0}}") !=
               std::string::npos,
           "status invented model timings from request metrics");
-  require(json.find("\"pages_free\":200,\"pages_free_resident\":72,") !=
+  require(json.find("\"pages_allocated\":128,\"pages_active\":24,"
+                    "\"pages_cache\":32,\"pages_free\":72,") !=
               std::string::npos,
-          "status confused free virtual KV pages with resident free pages");
+          "status lost the KV pool's page counts");
   require(json.find("\"extent_allocations\":5,\"extent_releases\":3,"
                     "\"extent_allocate_max_ms\":2.5,\"extent_release_max_ms\":0.75}") !=
               std::string::npos,
@@ -236,10 +237,10 @@ void testCleanRuntimeStatus() {
   require(json.find("\"serving_footprint_bytes\":" + std::to_string(3 * kGiB)) !=
               std::string::npos,
           "status omitted the serving footprint");
-  require(json.find("\"resident_bytes\":350224384") != std::string::npos &&
+  require(json.find("\"allocated_bytes\":350224384") != std::string::npos &&
               json.find("\"warm_idle_cells\":1") != std::string::npos &&
               json.find("\"scope\":\"startup_warmup\"") != std::string::npos,
-          "live state residency or audit scope is missing from status");
+          "live state memory or audit scope is missing from status");
   require(json.find("\"checkpoint_entries\":1,\"checkpoint_bytes\":64,"
                     "\"checkpoint_evictions\":4,\"checkpoint_retirements\":3") !=
               std::string::npos,

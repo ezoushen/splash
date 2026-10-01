@@ -13,35 +13,35 @@ using namespace splash::engine;
 
 namespace {
 
-class Backing final : public KvBacking {
+class Storage final : public kv::ExtentStorage {
 public:
-  explicit Backing(uint32_t pages, uint32_t maximumResidentPages =
+  explicit Storage(uint32_t pages, uint32_t maximumAllocatedPages =
                                        std::numeric_limits<uint32_t>::max())
-      : resident_(pages), maximumResidentPages_(maximumResidentPages) {}
-  uint32_t pageCount() const noexcept override { return resident_.size(); }
+      : allocated_(pages), maximumAllocatedPages_(maximumAllocatedPages) {}
+  uint32_t pageCount() const noexcept override { return allocated_.size(); }
   uint64_t bytesPerPage() const noexcept override { return 4096; }
-  bool isResident(uint32_t page) const override { return resident_.at(page); }
-  splash::metal::AllocationResult ensureResident(uint32_t page) override {
+  bool isAllocated(uint32_t page) const override { return allocated_.at(page); }
+  splash::metal::AllocationResult ensureAllocated(uint32_t page) override {
     const uint32_t first = extentFirstPage(page);
     const uint32_t count = extentPageCount(page);
     uint32_t additional = 0;
     for (uint32_t index = first; index < first + count; ++index)
-      additional += !resident_.at(index);
-    if (uint64_t{residentPages()} + additional > maximumResidentPages_) {
+      additional += !allocated_.at(index);
+    if (uint64_t{allocatedPages()} + additional > maximumAllocatedPages_) {
       return false;
     }
     for (uint32_t index = first; index < first + count; ++index) {
-      resident_.at(index) = true;
+      allocated_.at(index) = true;
     }
     if (additional)
       ++allocatedExtents;
     return true;
   }
-  bool releaseBackingForPage(uint32_t page) override {
+  bool releaseExtentOf(uint32_t page) override {
     const uint32_t first = extentFirstPage(page);
     const uint32_t count = extentPageCount(page);
     for (uint32_t index = first; index < first + count; ++index) {
-      resident_.at(index) = false;
+      allocated_.at(index) = false;
     }
     const auto start = std::chrono::steady_clock::now();
     std::this_thread::sleep_for(releaseTime);
@@ -57,11 +57,11 @@ public:
     return page - page % 4;
   }
   uint32_t extentPageCount(uint32_t page) const override {
-    return std::min<uint32_t>(4, resident_.size() - extentFirstPage(page));
+    return std::min<uint32_t>(4, allocated_.size() - extentFirstPage(page));
   }
-  uint32_t residentPages() const noexcept {
+  uint32_t allocatedPages() const noexcept {
     uint32_t count = 0;
-    for (bool value : resident_)
+    for (bool value : allocated_)
       count += value;
     return count;
   }
@@ -74,8 +74,8 @@ public:
   double longestRelease = 0.0;
   double totalRelease = 0.0;
 private:
-  std::vector<bool> resident_;
-  uint32_t maximumResidentPages_;
+  std::vector<bool> allocated_;
+  uint32_t maximumAllocatedPages_;
 };
 
 class State final : public CompositeState {
@@ -111,8 +111,8 @@ std::vector<uint32_t> tokens(uint32_t count, uint32_t salt = 0) {
 }
 
 void testCanonicalPagesAndSparseState() {
-  Backing backing(16);
-  KvPool pool(backing);
+  Storage storage(16);
+  KvPool pool(storage);
   engine::Cache resources(pool, cacheNamespace());
   auto prompt = tokens(65);
   resources.beginRequest(1);
@@ -136,8 +136,8 @@ void testCanonicalPagesAndSparseState() {
 }
 
 void testKvDeeperThanStateAndDependencyEviction() {
-  Backing backing(8);
-  KvPool pool(backing);
+  Storage storage(8);
+  KvPool pool(storage);
   engine::Cache resources(pool, cacheNamespace());
   auto prompt = tokens(97);
   resources.beginRequest(1);
@@ -156,14 +156,14 @@ void testKvDeeperThanStateAndDependencyEviction() {
   require(resources.snapshot().kvCache.blocks == 2,
           "LRU reclaim did not remove the older fragmented KV leaf first");
   require(resources.reclaimCache(1, false) != 0,
-          "KV backing was not reclaimed after cached state");
+          "KV was not reclaimed after cached state");
   require(resources.snapshot().stateCache.entries == 0,
           "composite state outlived its KV dependency");
 }
 
 void testActiveTipProtectsTheContentChain() {
-  Backing backing(4);
-  KvPool pool(backing);
+  Storage storage(4);
+  KvPool pool(storage);
   engine::Cache resources(pool, cacheNamespace());
   auto prompt = tokens(97, 1000);
   resources.beginRequest(1);
@@ -174,20 +174,20 @@ void testActiveTipProtectsTheContentChain() {
 
   engine::TokenAdmission blocked = resources.ensureTokens(2, 96);
   require(!blocked.granted() &&
-              !resources.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress &&
+              !resources.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress &&
               resources.snapshot().kvCache.blocks == 2,
           "memory pressure evicted an active request KV tip");
 
   resources.endRequest(1);
-  require(resources.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress &&
+  require(resources.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress &&
               resources.ensureTokens(2, 96).granted(),
           "released KV tip did not become reclaimable");
   resources.endRequest(2);
 }
 
-void testPhysicalGrowthReclaimsOneWholeCachedExtent() {
-  Backing backing(8, 4);
-  KvPool pool(backing);
+void testGrowthReclaimsOneWholeCachedExtent() {
+  Storage storage(8, 4);
+  KvPool pool(storage);
   engine::Cache resources(pool, cacheNamespace());
   auto prompt = tokens(129, 2000);
   resources.beginRequest(1);
@@ -196,25 +196,25 @@ void testPhysicalGrowthReclaimsOneWholeCachedExtent() {
   static_cast<void>(resources.publishCommittedBlocks(1, prompt, 128));
   resources.endRequest(1);
   require(resources.snapshot().kvCache.blocks == 4 &&
-              resources.snapshot().pool.pagesResident == 4,
+              resources.snapshot().pool.pagesAllocated == 4,
           "cached extent setup is wrong");
 
   resources.beginRequest(2);
   require(!resources.ensureTokens(2, 1).granted(),
-          "physical growth bypassed engine-coordinated reclaim");
+          "growth bypassed engine-coordinated reclaim");
   require(resources.reclaimCache(1, false) != 0 &&
               resources.ensureTokens(2, 1).granted(),
-          "explicit backend reclaim did not release cached KV backing");
+          "explicit reclaim did not release the cached KV extent");
   const auto snapshot = resources.snapshot();
-  require(snapshot.kvCache.blocks == 0 && snapshot.pool.pagesResident == 4 &&
+  require(snapshot.kvCache.blocks == 0 && snapshot.pool.pagesAllocated == 4 &&
               snapshot.pool.pagesActive == 1,
           "growth reclaim did not atomically replace the cached extent");
   resources.endRequest(2);
 }
 
 void testFragmentedColdKvPrecedesNewerState() {
-  Backing backing(8, 4);
-  KvPool pool(backing);
+  Storage storage(8, 4);
+  KvPool pool(storage);
   engine::Cache resources(pool, cacheNamespace());
   const auto prompt = tokens(129);
   resources.beginRequest(1);
@@ -228,13 +228,13 @@ void testFragmentedColdKvPrecedesNewerState() {
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
               resources.snapshot().kvCache.blocks == 3 &&
               resources.snapshot().stateCache.entries == 1 &&
-              backing.releasedExtents == 0,
-          "physical-byte preference evicted newer state before cold KV");
+              storage.releasedExtents == 0,
+          "released-byte preference evicted newer state before cold KV");
 }
 
-void testReplacementPreservesBackingEvenWhenExtentBecomesEmpty() {
-  Backing backing(8, 4);
-  KvPool pool(backing);
+void testReplacementKeepsTheExtentItEmpties() {
+  Storage storage(8, 4);
+  KvPool pool(storage);
   engine::Cache resources(pool, cacheNamespace());
   resources.beginRequest(1);
   const auto prompt = tokens(33);
@@ -242,27 +242,27 @@ void testReplacementPreservesBackingEvenWhenExtentBecomesEmpty() {
   static_cast<void>(resources.publishCommittedBlocks(1, prompt, 32));
   resources.endRequest(1);
 
-  const auto reclaimed = resources.reclaimOne(CacheReclaimMode::ReuseBacking);
+  const auto reclaimed = resources.reclaimOne(CacheReclaimMode::KeepExtents);
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
               resources.snapshot().kvCache.blocks == 0 &&
-              backing.residentPages() == 4 && backing.releasedExtents == 0,
+              storage.allocatedPages() == 4 && storage.releasedExtents == 0,
           "replacement released the newly reusable extent");
   resources.beginRequest(2);
   require(resources.ensureTokens(2, 128).granted() &&
-              backing.allocatedExtents == 1 && backing.releasedExtents == 0,
-          "replacement allocated reusable backing again");
+              storage.allocatedExtents == 1 && storage.releasedExtents == 0,
+          "replacement allocated the reusable extent again");
   resources.endRequest(2);
   require(resources.reclaimCache(0, false) == 4 * 4096 &&
-              backing.residentPages() == 0 && backing.releasedExtents == 1,
-          "zero-target physical shrink did not release the empty extent");
+              storage.allocatedPages() == 0 && storage.releasedExtents == 1,
+          "zero-target shrink did not release the empty extent");
 }
 
 // One reclaim pass releases every empty extent first, however many there
 // are, then evicts the cache and releases the extents that empties.
 void testReclaimPassReleasesEveryEmptyExtent() {
   constexpr uint32_t empty = 200;
-  Backing backing(4 * (empty + 1));
-  KvPool pool(backing);
+  Storage storage(4 * (empty + 1));
+  KvPool pool(storage);
   engine::Cache resources(pool, cacheNamespace());
   const auto prompt = tokens(33);
   resources.beginRequest(1);
@@ -281,13 +281,13 @@ void testReclaimPassReleasesEveryEmptyExtent() {
 
   require(resources.reclaimCache(uint64_t{empty} * 4 * 4096, false) ==
                   uint64_t{empty} * 4 * 4096 &&
-              backing.releasedExtents == empty &&
+              storage.releasedExtents == empty &&
               resources.snapshot().pool.reclaimableExtents == 0 &&
               resources.snapshot().kvCache.blocks == 1,
           "a pass did not release every empty extent before evicting");
   require(resources.reclaimCache(1ULL << 40, false) == 4 * 4096 &&
-              backing.releasedExtents == empty + 1 &&
-              backing.residentPages() == 0 &&
+              storage.releasedExtents == empty + 1 &&
+              storage.allocatedPages() == 0 &&
               resources.snapshot().kvCache.blocks == 0,
           "a pass did not evict the cache and release its extent");
 }
@@ -297,9 +297,9 @@ void testReclaimPassReleasesEveryEmptyExtent() {
 // one; the loop's longest tick covers the whole pass.
 void testReleaseTimeCoversOneExtent() {
   constexpr uint32_t extents = 6;
-  Backing backing(4 * extents);
-  backing.releaseTime = std::chrono::milliseconds(5);
-  KvPool pool(backing);
+  Storage storage(4 * extents);
+  storage.releaseTime = std::chrono::milliseconds(5);
+  KvPool pool(storage);
   engine::Cache resources(pool, cacheNamespace());
   for (uint32_t chain = 0; chain < extents; ++chain) {
     const uint64_t id = chain + 1;
@@ -319,8 +319,8 @@ void testReleaseTimeCoversOneExtent() {
   // its longest release take, and less than all of them took together. No
   // bound in milliseconds holds on a loaded machine.
   const double longest = resources.snapshot().pool.extentReleaseMaxMilliseconds;
-  require(backing.releasedExtents == extents && longest >= backing.longestRelease &&
-              longest < backing.totalRelease,
+  require(storage.releasedExtents == extents && longest >= storage.longestRelease &&
+              longest < storage.totalRelease,
           "the release time is not one extent's");
 }
 
@@ -333,9 +333,9 @@ int main() {
     testCanonicalPagesAndSparseState();
     testKvDeeperThanStateAndDependencyEviction();
     testActiveTipProtectsTheContentChain();
-    testPhysicalGrowthReclaimsOneWholeCachedExtent();
+    testGrowthReclaimsOneWholeCachedExtent();
     testFragmentedColdKvPrecedesNewerState();
-    testReplacementPreservesBackingEvenWhenExtentBecomesEmpty();
+    testReplacementKeepsTheExtentItEmpties();
     std::cout << "engine cache tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

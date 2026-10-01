@@ -2419,9 +2419,9 @@ std::vector<uint32_t> warmupPages(kv::PageStorage &storage, uint32_t first,
   std::vector<uint32_t> result(count);
   for (uint32_t index = 0; index < count; ++index) {
     const uint32_t page = first + index;
-    if (auto admission = storage.ensureResident(page); !admission) {
+    if (auto admission = storage.ensureAllocated(page); !admission) {
       throw metal::MetalAllocationError(
-          std::string("warmup could not reserve KV page backing: ") +
+          std::string("warmup could not allocate its KV extents: ") +
               metal::allocationFailureName(admission.failure), admission.failure);
     }
     result[index] = page;
@@ -2725,7 +2725,7 @@ ModelMemoryActual Runtime::actualRuntimeMemory() const {
 
 ModelTelemetry Runtime::telemetry() const noexcept {
   ModelTelemetry result = impl_->counters;
-  result.stateResidentBytes = impl_->states.actualAllocatedBytes();
+  result.stateAllocatedBytes = impl_->states.actualAllocatedBytes();
   result.warmIdleStateCells = impl_->states.idleCells();
   return result;
 }

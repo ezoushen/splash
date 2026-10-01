@@ -165,7 +165,7 @@ private:
   friend class QwenStateStorage;
 };
 
-// Live cells retain stable backing; only idle buffers may be reclaimed.
+// Live cells keep their buffers; only idle buffers may be reclaimed.
 class QwenStateStorage final : public model::StateStorage {
 public:
   // The GDN cells a lane holds, with one draft ring.

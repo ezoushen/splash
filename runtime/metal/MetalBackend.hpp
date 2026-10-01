@@ -17,7 +17,7 @@ namespace splash::metal {
 
 enum class AllocationFailure : uint8_t {
   None,
-  Capacity, // Unclassified capacity refusal from an alternate backing.
+  Capacity, // A refusal that names no cause, as from a storage without a governor.
   EngineBudget,
   HostPressure,
   DriverRejected,
@@ -47,7 +47,7 @@ struct AllocationResult final {
   return "unknown allocation failure";
 }
 
-// Physical allocators use this callback to obtain engine-governed headroom
+// Allocators use this callback to obtain engine-governed headroom
 // without depending on the engine policy type. The operation runs while the
 // caller's reservation is held and returns false without side effects when
 // admission is denied.

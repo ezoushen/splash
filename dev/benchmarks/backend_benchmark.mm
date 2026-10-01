@@ -478,7 +478,7 @@ void evictAllCompositeState(engine::Cache &resources) {
     static_cast<void>(resources.reclaimCache(1, false));
     const engine::CacheSnapshot after = resources.snapshot();
     if (after.stateCache.entries >= before.stateCache.entries &&
-        after.pool.residentBackingBytes >= before.pool.residentBackingBytes) {
+        after.pool.allocatedBytes >= before.pool.allocatedBytes) {
       throw std::logic_error("native benchmark state cache made no progress");
     }
   }

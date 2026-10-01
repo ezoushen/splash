@@ -402,7 +402,7 @@ int runNative(const NativeArguments &arguments) {
       writeStderrLine(diagnostic);
     engine::MemoryReclaimDirective directive =
         pressurePolicy.update(memory, now, wait.memory || wait.suspended);
-    if (!directive.reclaimEmptyKvExtents)
+    if (!directive.reclaim)
       return false;
     const engine::MemoryReclaimResult reclaim =
         published->nativeLoop().reclaimMemory(directive);

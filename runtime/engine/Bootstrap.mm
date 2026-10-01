@@ -370,7 +370,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
       [resourcesPointer, modelPointer](uint64_t estimatedPeakBytes) {
         resourcesPointer->backend().checkOperation();
         // Audit every attempted warmup before reclaiming idle buffers.
-        // Wider batches and cache backing grow on demand after Ready.
+        // Wider batches and cache memory grow on demand after Ready.
         ActualMemoryReport report = resourcesPointer->actualMemoryReport(
             modelPointer->actualRuntimeMemory(), estimatedPeakBytes);
         // Keep what the first request starts from: one lane's state buffers

@@ -14,7 +14,7 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
       layout_(layout), pageCount_(pageCount), extentPages_(extentPages) {
     if (!admitAllocation_) {
         throw std::invalid_argument(
-            "KV page storage requires physical allocation admission");
+            "KV page storage requires allocation admission");
     }
     if (!layout_.valid()) {
         throw std::invalid_argument("KV page storage layout is invalid");
@@ -34,9 +34,9 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
     extents_.resize(pageCount_ / extentPages_);
     // One small runway makes startup warmup and the first requests allocation
     // free. Every later extent is allocated when real tokens need it.
-    if (auto result = ensureResident(0); !result) {
+    if (auto result = ensureAllocated(0); !result) {
         throw metal::MetalAllocationError(
-            std::string("unable to allocate initial KV backing extent: ") +
+            std::string("unable to allocate the first KV extent: ") +
                 metal::allocationFailureName(result.failure), result.failure);
     }
 }
@@ -55,11 +55,11 @@ uint32_t PageStorage::extentPageCount(uint32_t page) const {
     return extentPages_;
 }
 
-bool PageStorage::isResident(uint32_t page) const {
+bool PageStorage::isAllocated(uint32_t page) const {
     return static_cast<bool>(extents_[extentIndex(page)]);
 }
 
-metal::AllocationResult PageStorage::ensureResident(uint32_t page) {
+metal::AllocationResult PageStorage::ensureAllocated(uint32_t page) {
     metal::MetalBuffer &extent = extents_[extentIndex(page)];
     if (extent) return true;
     const uint64_t bytes = extentBytes();
@@ -80,12 +80,12 @@ metal::AllocationResult PageStorage::ensureResident(uint32_t page) {
     }
 }
 
-bool PageStorage::releaseBackingForPage(uint32_t page) {
+bool PageStorage::releaseExtentOf(uint32_t page) {
     metal::MetalBuffer &extent = extents_[extentIndex(page)];
     if (!extent) return false;
     if (backend_.commandInFlight()) {
         throw std::logic_error(
-            "cannot release KV backing while a command is in flight");
+            "cannot release a KV extent while a command is in flight");
     }
     extent = {};
     --allocatedExtents_;
@@ -108,7 +108,7 @@ SplashKvPage PageStorage::entry(uint32_t page) const {
     const metal::MetalBuffer &extent = extents_[extentIndex(page)];
     if (!extent) {
         throw std::logic_error("KV page " + std::to_string(page) +
-                               " has no backing");
+                               " is in an extent that is not allocated");
     }
     return extent.gpuAddress() | (page % extentPages_);
 }
@@ -129,7 +129,7 @@ std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
         static_cast<std::byte *>(extents_[extentIndex(page)].contents());
     if (!extent) {
         throw std::logic_error("KV page " + std::to_string(page) +
-                               " has no backing");
+                               " is in an extent that is not allocated");
     }
     const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
     const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());

@@ -116,11 +116,11 @@ std::string runtimeStatusJson(
     out << ",\"q8\":" << kvIdentity.str();
   out << "},"
       << "\"memory_plan\":" << plan.toStatusJson()
-      << ",\"memory_actual\":{\"dense_bytes\":" << metalMemory.allocatedBytes
+      << ",\"memory_actual\":{\"allocated_bytes\":" << metalMemory.allocatedBytes
       << ",\"current_bytes\":" << currentBytes
       << ",\"peak_bytes\":" << peakBytes << "}"
       << ",\"memory_governor\":{\"limit_bytes\":" << memoryGovernor.limitBytes
-      << ",\"observed_resident_bytes\":" << memoryGovernor.observedResidentBytes
+      << ",\"charged_bytes\":" << memoryGovernor.chargedBytes
       << ",\"serving_footprint_bytes\":" << memoryGovernor.servingFootprintBytes
       << ",\"reserved_bytes\":" << memoryGovernor.reservedBytes
       << ",\"headroom_bytes\":" << memoryGovernor.headroomBytes
@@ -137,14 +137,12 @@ std::string runtimeStatusJson(
       << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens
       << ",\"blocks\":" << resources.kvCache.blocks
       << ",\"cache_bytes\":" << resources.kvCache.bytes
-      << ",\"pages_total\":" << pool.pagesTotal
+      << ",\"pages_allocated\":" << pool.pagesAllocated
       << ",\"pages_active\":" << pool.pagesActive
       << ",\"pages_cache\":" << pool.pagesPrefix
       << ",\"pages_free\":" << pool.pagesFree
-      << ",\"pages_free_resident\":" << pool.pagesFreeResident
-      << ",\"pages_resident\":" << pool.pagesResident
-      << ",\"resident_backing_bytes\":" << pool.residentBackingBytes
-      << ",\"reclaimable_backing_bytes\":" << pool.reclaimableBackingBytes
+      << ",\"allocated_bytes\":" << pool.allocatedBytes
+      << ",\"reclaimable_bytes\":" << pool.reclaimableBytes
       << ",\"extent_allocations\":" << pool.extentAllocations
       << ",\"extent_releases\":" << pool.extentReleases
       << ",\"extent_allocate_max_ms\":" << pool.extentAllocateMaxMilliseconds
@@ -152,7 +150,7 @@ std::string runtimeStatusJson(
       << "}"
       << ",\"state\":{\"entries\":" << state.entries
       << ",\"pinned\":" << state.pinned << ",\"bytes\":" << state.bytes
-      << ",\"resident_bytes\":" << executorTelemetry.stateResidentBytes
+      << ",\"allocated_bytes\":" << executorTelemetry.stateAllocatedBytes
       << ",\"active_cells\":" << resources.activeRequests
       << ",\"warm_idle_cells\":" << executorTelemetry.warmIdleStateCells
       << ",\"cell_ceiling\":" << model::ExecutionLimits::maximumBatchWidth

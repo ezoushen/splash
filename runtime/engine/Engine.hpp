@@ -100,7 +100,7 @@ public:
 
   // Runs only at a command-completion safe point. Reclaim order follows
   // ownership and preserves reusable prefixes for as long as possible: idle
-  // model state, unused KV backing, disposable checkpoints, then ordinary
+  // model state, empty KV extents, disposable checkpoints, then ordinary
   // state/KV in LRU order.
   // Live command buffers are never eviction candidates. The result says
   // whether the directive's target is met, waits for transfers in flight, or
@@ -223,7 +223,7 @@ private:
   [[nodiscard]] CacheReclaimResult reclaimForGrowth(Growth growth);
   [[nodiscard]] bool reclaimIdleState(bool keepLane) noexcept;
   [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused();
-  [[nodiscard]] CacheReclaimResult reuseIdleBackingWhilePaused(
+  [[nodiscard]] CacheReclaimResult reuseCachedPagesWhilePaused(
       const TokenAdmission &admission);
   [[nodiscard]] bool growthPaused() const;
   // Memory a lane could not get, and what the engine knows about its return.

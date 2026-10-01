@@ -10,7 +10,7 @@
 
 namespace splash::kv {
 
-// Physical storage for paged KV in extents: ordinary shared Metal buffers of
+// Storage for paged KV in extents: ordinary shared Metal buffers of
 // extentPages pages each, allocated when the pool needs one of their pages and
 // released when the last of them is free. Inside an extent every attention
 // layer has a region that holds the keys of all its pages, then their key
@@ -20,7 +20,7 @@ namespace splash::kv {
 // reaches the same bytes through the page's spans(). Active requests may
 // overwrite slots at or beyond their logical commit index. Cached KV blocks
 // reference only fully committed pages, which are immutable while shared.
-class PageStorage final : public Backing {
+class PageStorage final : public ExtentStorage {
 public:
   // pageCount must be a whole number of extents of extentPages pages, a
   // whole number of the layout's alignment units (Layout::extentPagesFor).
@@ -49,19 +49,20 @@ public:
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept {
     return uint64_t{allocatedExtents_} * extentBytes();
   }
-  [[nodiscard]] bool isResident(uint32_t page) const override;
-  [[nodiscard]] metal::AllocationResult ensureResident(uint32_t page) override;
+  [[nodiscard]] bool isAllocated(uint32_t page) const override;
+  [[nodiscard]] metal::AllocationResult ensureAllocated(uint32_t page) override;
   // The caller must prove that no active, prefix, reserved, or in-flight
   // reference remains anywhere in this extent. A command reaches extents
   // through its tables without retaining them, so releasing one while a
   // command is in flight throws std::logic_error and leaves it intact.
-  [[nodiscard]] bool releaseBackingForPage(uint32_t page) override;
+  [[nodiscard]] bool releaseExtentOf(uint32_t page) override;
   [[nodiscard]] uint32_t extentFirstPage(uint32_t page) const override;
   [[nodiscard]] uint32_t extentPageCount(uint32_t page) const override;
   [[nodiscard]] LayerStorage layer(uint32_t index) const;
 
   // The entry kernels reach a page by. Throws std::logic_error for a page
-  // whose extent has no backing: a GPU table holds only backed pages.
+  // whose extent is not allocated: a GPU table holds only pages of allocated
+  // extents.
   [[nodiscard]] SplashKvPage entry(uint32_t page) const;
   // Writes the entries of `pages` to the start of a CPU-visible GPU page
   // table, which must hold all of them; throws std::logic_error otherwise.
@@ -71,7 +72,7 @@ public:
   // it: the page's bytes of each tensor in every layer's region, layer by
   // layer as keys, key scales, values and value scales, where
   // splash_kv_offset places them for the kernels. BF16 pages have no scale
-  // bytes. Throws std::logic_error for a page whose extent has no backing.
+  // bytes. Throws std::logic_error for a page whose extent is not allocated.
   [[nodiscard]] std::vector<std::span<std::byte>> spans(uint32_t page) const;
   // Advances whenever an extent is allocated or released. A GPU table
   // written at an earlier generation may hold an entry of a released extent.
@@ -85,7 +86,7 @@ private:
   Layout layout_;
   uint32_t pageCount_ = 0;
   uint32_t extentPages_ = 0;
-  // Empty while the extent has no backing.
+  // Empty while the extent is not allocated.
   std::vector<metal::MetalBuffer> extents_;
   uint32_t allocatedExtents_ = 0;
   uint64_t generation_ = 0;

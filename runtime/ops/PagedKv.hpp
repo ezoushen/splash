@@ -39,16 +39,17 @@ enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
   return "invalid";
 }
 
-// Physical backing for the engine's page pool, in extents of whole pages.
-// Implementations provide Metal storage or deterministic test storage.
-class Backing {
+// The memory of the engine's page pool: extents of whole pages, each
+// allocated or not. Implementations provide Metal storage or deterministic
+// test storage.
+class ExtentStorage {
 public:
-  virtual ~Backing() = default;
+  virtual ~ExtentStorage() = default;
   [[nodiscard]] virtual uint32_t pageCount() const noexcept = 0;
   [[nodiscard]] virtual uint64_t bytesPerPage() const noexcept = 0;
-  [[nodiscard]] virtual bool isResident(uint32_t page) const = 0;
-  [[nodiscard]] virtual metal::AllocationResult ensureResident(uint32_t page) = 0;
-  [[nodiscard]] virtual bool releaseBackingForPage(uint32_t page) = 0;
+  [[nodiscard]] virtual bool isAllocated(uint32_t page) const = 0;
+  [[nodiscard]] virtual metal::AllocationResult ensureAllocated(uint32_t page) = 0;
+  [[nodiscard]] virtual bool releaseExtentOf(uint32_t page) = 0;
   [[nodiscard]] virtual uint32_t extentFirstPage(uint32_t page) const = 0;
   [[nodiscard]] virtual uint32_t extentPageCount(uint32_t page) const = 0;
 };
@@ -141,7 +142,7 @@ struct Layout final {
   // An extent holds a whole number of these pages, so that every tensor
   // region starts 64 KiB-aligned. The INT8 scales are the tightest
   // constraint: 4 heads require 128 pages and 2 heads require 256. BF16
-  // needs only 1 or 2 pages. This is physical allocation geometry; prefix
+  // needs only 1 or 2 pages. This is allocation geometry only; prefix
   // matching remains Page32 in both cases.
   [[nodiscard]] constexpr uint32_t extentAlignmentPages() const noexcept {
     if (format == Format::BFloat16)

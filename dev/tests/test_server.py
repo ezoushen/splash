@@ -1147,12 +1147,11 @@ class ServerTest(unittest.TestCase):
                     },
                     "kv": {
                         "blocks": 6,
-                        "pages_total": 32,
-                        "pages_free": 24,
+                        "pages_allocated": 8,
                         "pages_active": 4,
                         "pages_cache": 4,
-                        "pages_resident": 8,
-                        "resident_backing_bytes": 8192,
+                        "pages_free": 2,
+                        "allocated_bytes": 8192,
                     },
                     "state": {
                         "entries": 2,
@@ -1226,7 +1225,9 @@ class ServerTest(unittest.TestCase):
             "splash_scheduler_decode_mixed_greedy_sampling_batches_total 2",
             metrics,
         )
-        self.assertIn("splash_kv_pages_free 24", metrics)
+        self.assertIn("splash_kv_pages_allocated 8", metrics)
+        self.assertIn("splash_kv_pages_free 2", metrics)
+        self.assertIn("splash_kv_allocated_bytes 8192", metrics)
         self.assertIn("splash_state_entries 2", metrics)
         self.assertIn("splash_state_hits_total 7", metrics)
         self.assertIn("splash_cache_hits_total 7", metrics)

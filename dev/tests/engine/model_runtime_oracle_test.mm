@@ -949,7 +949,7 @@ int main(int argc, char **argv) {
     arenaReservation->commit();
     // Fault only physical KV admission, after actual state activation. This
     // exercises Runtime::warmupPrefill's failure propagation and cleanup.
-    require(pages.releaseBackingForPage(0), "warmup refusal fixture was not resident");
+    require(pages.releaseExtentOf(0), "warmup refusal fixture was not allocated");
     const uint64_t beforeWarmupRows = executor.telemetry().targetPrefillRows;
     for (auto failure : {metal::AllocationFailure::HostPressure,
                          metal::AllocationFailure::EngineBudget,
@@ -961,7 +961,7 @@ int main(int argc, char **argv) {
         static_cast<void>(executor.warmupPrefill(1));
       } catch (const metal::MetalAllocationError &error) {
         rejected = error.failure() == failure &&
-            std::string(error.what()).find("KV page backing") != std::string::npos;
+            std::string(error.what()).find("its KV extents") != std::string::npos;
       }
       require(rejected && !states.metadata(0).assigned &&
                   executor.telemetry().targetPrefillRows == beforeWarmupRows &&
@@ -970,7 +970,7 @@ int main(int argc, char **argv) {
               "real warmup lost its KV refusal cause or executed/leaked work");
     }
     kvAdmissionFailure = metal::AllocationFailure::None;
-    require(static_cast<bool>(pages.ensureResident(0)),
+    require(static_cast<bool>(pages.ensureAllocated(0)),
             "warmup refusal fixture failed to recover KV admission");
     static_cast<void>(states.releaseIdle(false));
     // The engine refuses image requests to a model without vision before they
@@ -978,7 +978,7 @@ int main(int argc, char **argv) {
     if (model.descriptor.hasVision()) {
       requireAtomicImageAdmission(executor, backend, model, allocationFault);
       for (uint32_t page : pageRange(120, 4))
-        require(static_cast<bool>(pages.ensureResident(page)), "image oracle KV backing is unavailable");
+        require(static_cast<bool>(pages.ensureAllocated(page)), "image oracle KV extent is unavailable");
       requireImageRowsAfterReclaim(executor, backend, states, model, allocationFault);
       requireRepeatedImagePlacements(executor, backend, states, allocationFault);
     } else {

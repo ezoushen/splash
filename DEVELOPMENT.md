@@ -524,9 +524,12 @@ address in its request's page table, so no command binds KV; the residency
 set makes extents resident for every command. The host reaches the same
 memory (`PageStorage::spans`), which is how the disk tier moves pages. A
 reclaim pass releases every extent that is empty or that its evictions empty.
-`/status` reports under `kv` the extents allocated and released and the longest
-allocation and release of one; how long a whole pass holds the loop shows in
-`loop.max_tick_ms`.
+`/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
+those requests and the cache hold (`pages_active`, `pages_cache`) and those
+nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
+(`allocated_bytes`, `reclaimable_bytes`), the extents allocated and released and
+the longest allocation and release of one; how long a whole pass holds the loop
+shows in `loop.max_tick_ms`.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
 (`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or

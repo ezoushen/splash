@@ -399,7 +399,7 @@ struct ModelMemoryActual final {
 };
 
 struct ModelTelemetry final {
-  uint64_t stateResidentBytes = 0;
+  uint64_t stateAllocatedBytes = 0;
   uint32_t warmIdleStateCells = 0;
   uint64_t targetPrefillRows = 0;
   uint64_t draftContextRowsActive = 0;
@@ -471,8 +471,8 @@ public:
   virtual ~Model() = default;
   virtual void checkHealth() {}
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
-  // Safe-point preemption releases execution backing, retaining only the
-  // request's host-side sampling/constraint continuation. Resume replays the
+  // Safe-point preemption returns the request's state buffers, retaining
+  // only its host-side sampling/constraint continuation. Resume replays the
   // supplied committed history through the ordinary packed-prefill path.
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;

@@ -225,15 +225,15 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
   actual.targetWeightsBytes = budget.targetWeightsBytes;
   actual.draftWeightsBytes = budget.draftWeightsBytes;
   actual.visionWeightsBytes = budget.visionWeightsBytes;
-  actual.stateResidentBytes = budget.activeStateCellBytes;
+  actual.stateAllocatedBytes = budget.activeStateCellBytes;
   actual.sharedPrefillBytes = budget.sharedPrefillBytes;
   actual.sharedDecodeBytes = budget.sharedDecodeBytes;
-  actual.kvResidentBytes = budget.kvExtentBytes;
+  actual.kvAllocatedBytes = budget.kvExtentBytes;
   actual.backendAllocatedBytes =
       actual.targetWeightsBytes + actual.draftWeightsBytes +
       actual.visionWeightsBytes +
-      actual.stateResidentBytes + actual.sharedPrefillBytes +
-      actual.sharedDecodeBytes + actual.kvResidentBytes;
+      actual.stateAllocatedBytes + actual.sharedPrefillBytes +
+      actual.sharedDecodeBytes + actual.kvAllocatedBytes;
   actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
   actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes;
   // Model warmup estimates add the pipeline and runtime reserves.
@@ -243,29 +243,29 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
   return actual;
 }
 
-class Backing final : public KvBacking {
+class Storage final : public kv::ExtentStorage {
 public:
-  explicit Backing(uint32_t pages) : resident_(pages, true) {}
-  uint32_t pageCount() const noexcept override { return resident_.size(); }
+  explicit Storage(uint32_t pages) : allocated_(pages, true) {}
+  uint32_t pageCount() const noexcept override { return allocated_.size(); }
   uint64_t bytesPerPage() const noexcept override { return 4096; }
-  bool isResident(uint32_t page) const override { return resident_.at(page); }
-  splash::metal::AllocationResult ensureResident(uint32_t page) override {
-    resident_.at(page) = true;
+  bool isAllocated(uint32_t page) const override { return allocated_.at(page); }
+  splash::metal::AllocationResult ensureAllocated(uint32_t page) override {
+    allocated_.at(page) = true;
     return true;
   }
-  bool releaseBackingForPage(uint32_t page) override {
-    const bool resident = resident_.at(page);
-    resident_.at(page) = false;
-    return resident;
+  bool releaseExtentOf(uint32_t page) override {
+    const bool allocated = allocated_.at(page);
+    allocated_.at(page) = false;
+    return allocated;
   }
   uint32_t extentFirstPage(uint32_t page) const override {
     return page - page % 4;
   }
   uint32_t extentPageCount(uint32_t page) const override {
-    return std::min<uint32_t>(4, resident_.size() - extentFirstPage(page));
+    return std::min<uint32_t>(4, allocated_.size() - extentFirstPage(page));
   }
 private:
-  std::vector<bool> resident_;
+  std::vector<bool> allocated_;
 };
 
 class State final : public CompositeState {
@@ -389,7 +389,7 @@ private:
     return config;
   }
 
-  Backing backing_;
+  Storage backing_;
   KvPool pool_;
   engine::Cache resources_;
   Executor executor_;

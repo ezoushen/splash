@@ -1104,7 +1104,7 @@ Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attem
     const bool paused = growthPaused() ||
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
     const CacheReclaimResult progress = paused
-        ? reuseIdleBackingWhilePaused(admission)
+        ? reuseCachedPagesWhilePaused(admission)
         : reclaimForGrowth(Growth::Kv);
     if (!progress.madeProgress) {
       pendingReclaim = progress.pending;
@@ -1130,19 +1130,19 @@ bool Engine::growthPaused() const {
 
 // One reclaim step for an allocation the governor denied. Idle memory of the
 // kind it takes stays for it to reuse: the pooled buffers a lane starts from
-// for a lane's state, which its activation takes, and resident extents for
+// for a lane's state, which its activation takes, and allocated extents for
 // KV. Idle memory of the other kind goes first, then one victim of the cache.
 CacheReclaimResult Engine::reclaimForGrowth(Growth growth) {
   const bool state = growth == Growth::State;
   if (reclaimIdleState(state))
     return {true, 0};
-  // The background pressure controller owns physical shrink. Retrying a
-  // paused allocator here would drain the cache before macOS can acknowledge
-  // any reclaimed bytes.
+  // The background pressure controller owns the shrink. Retrying a paused
+  // allocator here would drain the cache before macOS can acknowledge any
+  // reclaimed bytes.
   if (growthPaused())
     return {};
   const CacheReclaimResult reclaimed = cache_.reclaimOne(
-      state ? CacheReclaimMode::ReleaseBacking : CacheReclaimMode::ReuseBacking);
+      state ? CacheReclaimMode::ReleaseExtents : CacheReclaimMode::KeepExtents);
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed;
@@ -1172,24 +1172,24 @@ CacheReclaimResult Engine::reuseCachedStateWhilePaused() {
   return reused;
 }
 
-// Host pressure pauses growth, and the pressure controller owns physical
-// shrink. Backing that stays resident is outside that accounting: a request
-// short of pages may take idle cached pages instead of being suspended and
+// Host pressure pauses growth, and the pressure controller owns the shrink.
+// Extents that stay allocated are outside that accounting: a request short
+// of pages may take idle cached pages instead of being suspended and
 // replaying its whole prefix once the pause lifts. Cache is only evicted when
-// the resident idle pages can actually cover the shortfall; otherwise the
+// the pages no request holds can actually cover the shortfall; otherwise the
 // request yields as before and the cache survives for later hits. A reclaim
 // that must wait for the transfer in flight makes the request wait with it,
 // as it does without the pause.
-CacheReclaimResult Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
+CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &admission) {
   if (reclaimIdleState(false))
     return {true, 0};
   const KvPoolSnapshot pool = cache_.snapshot().pool;
   // Cached prefixes can also have active owners; those pages cannot be reused.
-  const uint32_t reusable = pool.pagesResident - pool.pagesActive;
+  const uint32_t reusable = pool.pagesAllocated - pool.pagesActive;
   if (reusable < admission.additionalPages)
     return {};
   const CacheReclaimResult reused =
-      cache_.reclaimOne(CacheReclaimMode::ReuseBacking);
+      cache_.reclaimOne(CacheReclaimMode::KeepExtents);
   if (reused.madeProgress) {
     // An evicted state parks its buffers in the model's pool; under pressure
     // that memory goes back to the host now rather than waiting for the
@@ -1228,7 +1228,7 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
 }
 
 MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
-  if (!directive.reclaimEmptyKvExtents)
+  if (!directive.reclaim)
     return {};
 
   const bool keep = directive.keepServingFootprint;

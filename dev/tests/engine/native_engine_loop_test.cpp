@@ -20,28 +20,28 @@ using namespace splash::engine;
 
 namespace {
 
-class Backing final : public KvBacking {
+class Storage final : public kv::ExtentStorage {
 public:
-  explicit Backing(uint32_t pages) : resident_(pages, true) {}
-  uint32_t pageCount() const noexcept override { return resident_.size(); }
+  explicit Storage(uint32_t pages) : allocated_(pages, true) {}
+  uint32_t pageCount() const noexcept override { return allocated_.size(); }
   uint64_t bytesPerPage() const noexcept override { return 4096; }
-  bool isResident(uint32_t page) const override { return resident_.at(page); }
-  splash::metal::AllocationResult ensureResident(uint32_t page) override {
-    resident_.at(page) = true;
+  bool isAllocated(uint32_t page) const override { return allocated_.at(page); }
+  splash::metal::AllocationResult ensureAllocated(uint32_t page) override {
+    allocated_.at(page) = true;
     return true;
   }
-  bool releaseBackingForPage(uint32_t page) override {
-    resident_.at(page) = false;
+  bool releaseExtentOf(uint32_t page) override {
+    allocated_.at(page) = false;
     return true;
   }
   uint32_t extentFirstPage(uint32_t page) const override {
     return page - page % 4;
   }
   uint32_t extentPageCount(uint32_t page) const override {
-    return std::min<uint32_t>(4, resident_.size() - extentFirstPage(page));
+    return std::min<uint32_t>(4, allocated_.size() - extentFirstPage(page));
   }
 private:
-  std::vector<bool> resident_;
+  std::vector<bool> allocated_;
 };
 
 class State final : public CompositeState {
@@ -247,8 +247,8 @@ void runUntilIdle(engine::NativeRuntime &loop) {
 }
 
 void testPromptProgress() {
-  Backing backing(512);
-  KvPool pool(backing);
+  Storage storage(512);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -351,8 +351,8 @@ void testPromptProgress() {
 }
 
 void testWireLifecycleAndCacheHit() {
-  Backing backing(32);
-  KvPool pool(backing);
+  Storage storage(32);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -426,8 +426,8 @@ void testWireLifecycleAndCacheHit() {
 // The request's generation prompt reaches the engine: its replay state, which
 // an identical retry resumes from, ends before it.
 void testGenerationPromptBoundsTheReplayState() {
-  Backing backing(32);
-  KvPool pool(backing);
+  Storage storage(32);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -461,8 +461,8 @@ void testGenerationPromptBoundsTheReplayState() {
 
 // A request's flags reach the model with the rest of its request.
 void testRequestFlagsReachTheModel() {
-  Backing backing(32);
-  KvPool pool(backing);
+  Storage storage(32);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   double monotonic = 100.0;
@@ -487,8 +487,8 @@ void testRequestFlagsReachTheModel() {
 }
 
 void testFatalFramingClosesConnection() {
-  Backing backing(8);
-  KvPool pool(backing);
+  Storage storage(8);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -508,8 +508,8 @@ void testFatalFramingClosesConnection() {
 // frames behind it in the same read, whole or cut by the read boundary, must
 // still be processed.
 void testRequestErrorKeepsFraming() {
-  Backing backing(32);
-  KvPool pool(backing);
+  Storage storage(32);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -572,8 +572,8 @@ void testRequestErrorKeepsFraming() {
 }
 
 void testCapacityFailureHasOneTerminalFrame() {
-  Backing backing(1);
-  KvPool pool(backing);
+  Storage storage(1);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -625,8 +625,8 @@ void testCommandWatchdogAndPendingHealthWake() {
           "stale completion cleared a newer command deadline");
 
   for (bool gpuCompleted : {false, true}) {
-    Backing backing(32);
-    KvPool pool(backing);
+    Storage storage(32);
+    KvPool pool(storage);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     executor.ticketReady = std::make_shared<bool>(false);
@@ -686,8 +686,8 @@ void testCommandWatchdogAndPendingHealthWake() {
     }
   }
 
-  Backing backing(32);
-  KvPool pool(backing);
+  Storage storage(32);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   engine::NativeRuntime loop({}, resources, executor,
@@ -699,8 +699,8 @@ void testCommandWatchdogAndPendingHealthWake() {
 
 void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
   for (bool malformed : {false, true}) {
-    Backing backing(32);
-    KvPool pool(backing);
+    Storage storage(32);
+    KvPool pool(storage);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     std::vector<uint8_t> output;
@@ -737,8 +737,8 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
 
 void testControlFailureUsesExecutionBoundary() {
   for (bool metalFailure : {false, true}) {
-    Backing backing(32);
-    KvPool pool(backing);
+    Storage storage(32);
+    KvPool pool(storage);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     std::vector<uint8_t> output;
@@ -776,8 +776,8 @@ void testControlFailureUsesExecutionBoundary() {
 // only the ones that report through engineError().
 void testEngineFailureNamesItsReason() {
   {
-    Backing backing(8);
-    KvPool pool(backing);
+    Storage storage(8);
+    KvPool pool(storage);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     const std::system_error closed(EPIPE, std::generic_category(),
@@ -802,8 +802,8 @@ void testEngineFailureNamesItsReason() {
             "a failed output write left the engine failure unnamed");
   }
   {
-    Backing backing(8);
-    KvPool pool(backing);
+    Storage storage(8);
+    KvPool pool(storage);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     std::vector<uint8_t> output;
@@ -843,8 +843,8 @@ void testEngineFailureNamesItsReason() {
 }
 
 void testInvalidPromptTokensStayRequestScoped() {
-  Backing backing(32);
-  KvPool pool(backing);
+  Storage storage(32);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -890,8 +890,8 @@ void testInvalidPromptTokensStayRequestScoped() {
 // The feature bits Ready announces for an engine admitting images of up to
 // `maxImagePatches` patches.
 uint64_t announcedFeatures(uint32_t maxImagePatches) {
-  Backing backing(32);
-  KvPool pool(backing);
+  Storage storage(32);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -925,8 +925,8 @@ void testReadyAnnouncesVisionWhenImagesAreAdmitted() {
 // Without vision an image request fails by itself and the engine keeps
 // serving.
 void testImageRequestWithoutVisionStaysRequestScoped() {
-  Backing backing(32);
-  KvPool pool(backing);
+  Storage storage(32);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -968,8 +968,8 @@ void testImageRequestWithoutVisionStaysRequestScoped() {
 
 void testStepTokensFitTheWire() {
   for (uint32_t limit : {model::ExecutionLimits::maximumStepTokens, 1U}) {
-    Backing backing(32);
-    KvPool pool(backing);
+    Storage storage(32);
+    KvPool pool(storage);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     executor.stepTokens = model::ExecutionLimits::maximumStepTokens;
@@ -1030,8 +1030,8 @@ protocol::RequestFrame scoreRequest(uint64_t id, uint32_t promptTokens) {
 }
 
 void testScoreRequestCompletesAfterFullPrompt() {
-  Backing backing(512);
-  KvPool pool(backing);
+  Storage storage(512);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -1074,8 +1074,8 @@ void testScoreRequestCompletesAfterFullPrompt() {
 }
 
 void testCancelledScoreReturnsEmptyLogits() {
-  Backing backing(32);
-  KvPool pool(backing);
+  Storage storage(32);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   executor.ticketReady = std::make_shared<bool>(false);
@@ -1134,8 +1134,8 @@ struct ScoreBesideChat final {
 // then a third request afterwards. The score's final prompt chunk either
 // returns logits or reports a non-finite one.
 ScoreBesideChat runScoreBesideChat(bool invalidScore) {
-  Backing backing(512);
-  KvPool pool(backing);
+  Storage storage(512);
+  KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   if (invalidScore)
@@ -1239,8 +1239,8 @@ void testConstrainedMaskExchange() {
   };
   for (Reply reply : {Reply::Valid, Reply::WrongMaskId, Reply::WrongWordCount,
                       Reply::EmptyRow, Reply::Malformed, Reply::AfterCancel}) {
-    Backing backing(32);
-    KvPool pool(backing);
+    Storage storage(32);
+    KvPool pool(storage);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     std::vector<uint8_t> output;

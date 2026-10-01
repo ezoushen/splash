@@ -44,15 +44,15 @@ ActualMemoryReport report(const EngineMemoryPlan &memoryPlan,
   result.targetWeightsBytes = b.targetWeightsBytes;
   result.draftWeightsBytes = b.draftWeightsBytes;
   result.visionWeightsBytes = b.visionWeightsBytes;
-  result.stateResidentBytes = b.activeStateCellBytes * 3;
+  result.stateAllocatedBytes = b.activeStateCellBytes * 3;
   result.sharedPrefillBytes = b.sharedPrefillBytes;
   result.sharedDecodeBytes = b.sharedDecodeBytes;
-  result.kvResidentBytes = b.kvExtentBytes;
+  result.kvAllocatedBytes = b.kvExtentBytes;
   result.backendAllocatedBytes =
       result.targetWeightsBytes + result.draftWeightsBytes +
-      result.visionWeightsBytes + result.stateResidentBytes +
+      result.visionWeightsBytes + result.stateAllocatedBytes +
       result.sharedPrefillBytes + result.sharedDecodeBytes +
-      result.kvResidentBytes + unclassifiedBytes;
+      result.kvAllocatedBytes + unclassifiedBytes;
   result.deviceCurrentAllocatedBytes = result.backendAllocatedBytes;
   result.devicePeakAllocatedBytes = result.backendAllocatedBytes + 16 * kMiB;
   // Warmup estimates the categories' peak and adds the reserves.
@@ -73,9 +73,9 @@ void testUnifiedDynamicAudit() {
           "memory audit status does not identify its startup scope");
 
   ActualMemoryReport overflow = actual;
-  overflow.backendAllocatedBytes -= overflow.stateResidentBytes;
-  overflow.stateResidentBytes = memoryPlan.breakdown().dynamicBudgetBytes;
-  overflow.backendAllocatedBytes += overflow.stateResidentBytes;
+  overflow.backendAllocatedBytes -= overflow.stateAllocatedBytes;
+  overflow.stateAllocatedBytes = memoryPlan.breakdown().dynamicBudgetBytes;
+  overflow.backendAllocatedBytes += overflow.stateAllocatedBytes;
   overflow.deviceCurrentAllocatedBytes = overflow.backendAllocatedBytes;
   overflow.devicePeakAllocatedBytes = overflow.backendAllocatedBytes;
   overflow.estimatedWarmupPeakBytes = overflow.backendAllocatedBytes;
@@ -182,14 +182,14 @@ void testWarmupDeviationExcludesReserves() {
       ActualMemoryReport actual;
       actual.targetWeightsBytes = b.targetWeightsBytes;
       actual.draftWeightsBytes = b.draftWeightsBytes;
-      actual.stateResidentBytes = 4 * b.activeStateCellBytes;
+      actual.stateAllocatedBytes = 4 * b.activeStateCellBytes;
       actual.sharedPrefillBytes = b.sharedPrefillBytes;
       actual.sharedDecodeBytes = b.sharedDecodeBytes;
-      actual.kvResidentBytes = b.kvExtentBytes;
+      actual.kvAllocatedBytes = b.kvExtentBytes;
       actual.backendAllocatedBytes =
           actual.targetWeightsBytes + actual.draftWeightsBytes +
-          actual.stateResidentBytes + actual.sharedPrefillBytes +
-          actual.sharedDecodeBytes + actual.kvResidentBytes;
+          actual.stateAllocatedBytes + actual.sharedPrefillBytes +
+          actual.sharedDecodeBytes + actual.kvAllocatedBytes;
       actual.deviceCurrentAllocatedBytes =
           actual.backendAllocatedBytes + untrackedMiB * kMiB;
       actual.devicePeakAllocatedBytes = actual.deviceCurrentAllocatedBytes;

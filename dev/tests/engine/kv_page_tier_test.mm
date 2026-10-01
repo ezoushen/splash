@@ -97,7 +97,7 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                         extent);
   const uint32_t pageA = extent - 1;
   const uint32_t pageB = extent;
-  require(pages.isResident(pageA) && pages.ensureResident(pageB) && pages.isResident(pageB),
+  require(pages.isAllocated(pageA) && pages.ensureAllocated(pageB) && pages.isAllocated(pageB),
           "test pages were not mapped");
   const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
   const uint64_t payload = pages.bytesPerPage();

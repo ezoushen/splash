@@ -9,27 +9,27 @@
 namespace {
 
 using splash::engine::KvPool;
-using splash::engine::KvBacking;
+using splash::kv::ExtentStorage;
 
 void require(bool condition, const char *message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-class TestBacking final : public KvBacking {
+class TestStorage final : public ExtentStorage {
 public:
-    TestBacking(uint32_t pages, uint32_t extentPages,
-                uint32_t residentExtents = 0)
-        : TestBacking(std::vector<uint32_t>((pages + extentPages - 1) /
+    TestStorage(uint32_t pages, uint32_t extentPages,
+                uint32_t allocatedExtents = 0)
+        : TestStorage(std::vector<uint32_t>((pages + extentPages - 1) /
                                                 extentPages,
                                             extentPages),
-                      residentExtents) {
+                      allocatedExtents) {
         if (!pages || !extentPages || pages % extentPages) {
-            throw std::invalid_argument("invalid test backing geometry");
+            throw std::invalid_argument("invalid test extent geometry");
         }
     }
     // Explicit extent sizes: the pool accepts extents of different sizes.
-    TestBacking(std::vector<uint32_t> extentSizes, uint32_t residentExtents)
-        : resident_(extentSizes.size(), false) {
+    TestStorage(std::vector<uint32_t> extentSizes, uint32_t allocatedExtents)
+        : allocated_(extentSizes.size(), false) {
         for (uint32_t size : extentSizes) {
             if (!size) throw std::invalid_argument("empty test extent");
             for (uint32_t page = 0; page < size; ++page) {
@@ -40,30 +40,30 @@ public:
             pages_ += size;
         }
         for (uint32_t index = 0;
-             index < residentExtents && index < resident_.size(); ++index) {
-            resident_[index] = true;
+             index < allocatedExtents && index < allocated_.size(); ++index) {
+            allocated_[index] = true;
         }
     }
 
     uint32_t pageCount() const noexcept override { return pages_; }
     uint64_t bytesPerPage() const noexcept override { return 100; }
-    bool isResident(uint32_t page) const override {
-        return resident_.at(extentOf_.at(page));
+    bool isAllocated(uint32_t page) const override {
+        return allocated_.at(extentOf_.at(page));
     }
-    splash::metal::AllocationResult ensureResident(uint32_t page) override {
+    splash::metal::AllocationResult ensureAllocated(uint32_t page) override {
         uint32_t extent = extentOf_.at(page);
         ++allocationAttempts;
         if (!admission) return false;
         if (failExtent && extent == *failExtent) return false;
         if (throwExtent && extent == *throwExtent)
             throw std::runtime_error("test allocation failure");
-        resident_.at(extent) = true;
+        allocated_.at(extent) = true;
         return true;
     }
-    bool releaseBackingForPage(uint32_t page) override {
+    bool releaseExtentOf(uint32_t page) override {
         uint32_t extent = extentOf_.at(page);
-        if (!resident_.at(extent)) return false;
-        resident_[extent] = false;
+        if (!allocated_.at(extent)) return false;
+        allocated_[extent] = false;
         ++releasedExtents;
         return true;
     }
@@ -84,7 +84,7 @@ private:
     std::vector<uint32_t> extentPages_;
     std::vector<uint32_t> firstPage_;
     std::vector<uint32_t> extentOf_;
-    std::vector<bool> resident_;
+    std::vector<bool> allocated_;
 };
 
 void release(KvPool &pool, const std::vector<uint32_t> &pages,
@@ -92,82 +92,83 @@ void release(KvPool &pool, const std::vector<uint32_t> &pages,
     for (uint32_t page : pages) pool.releasePage(page, prefix);
 }
 
-void testGrowthPacksResidentExtents() {
-    TestBacking backing(12, 4, 1);
-    KvPool pool(backing);
+void testGrowthPacksAllocatedExtents() {
+    TestStorage storage(12, 4, 1);
+    KvPool pool(storage);
     auto pages = pool.acquirePages(5, false);
     require(pages.granted() && pages.pages.size() == 5,
             "elastic pool did not acquire requested pages");
     require(pages.pages[0] == 0 && pages.pages[3] == 3 &&
                 pages.pages[4] == 4,
-            "elastic pool did not fill its resident runway first");
+            "elastic pool did not fill its allocated runway first");
     auto live = pool.snapshot();
-    require(live.pagesResident == 8 && live.pagesActive == 5 &&
-                live.pagesFreeResident == 3 &&
-                live.residentBackingBytes == 800,
+    require(live.pagesAllocated == 8 && live.pagesActive == 5 &&
+                live.pagesFree == 3 &&
+                live.allocatedBytes == 800,
             "elastic growth accounting is incorrect");
 
     release(pool, pages.pages);
     require(pool.reclaimEmptyExtents(true) == 1,
             "reclaim did not retain exactly one warm runway");
     auto reclaimed = pool.snapshot();
-    require(reclaimed.pagesResident == 4 &&
+    require(reclaimed.pagesAllocated == 4 &&
                 reclaimed.reclaimableExtents == 1 &&
-                backing.releasedExtents == 1,
-            "empty physical extent was not returned exactly");
+                storage.releasedExtents == 1,
+            "empty extent was not returned exactly");
     require(reclaimed.extentAllocations == 1 && reclaimed.extentReleases == 1,
             "the pool did not count its growth and release");
 }
 
 void testFailedGrowthRollsBackAtomically() {
-    TestBacking backing(12, 4);
-    backing.failExtent = 1;
-    KvPool pool(backing);
+    TestStorage storage(12, 4);
+    storage.failExtent = 1;
+    KvPool pool(storage);
     auto pages = pool.acquirePages(5, false);
     require(!pages.granted() &&
                 pages.failure ==
                     splash::engine::KvPageAcquireFailure::Denied,
-            "failed physical growth was not reported as physical capacity");
+            "failed growth was not reported as denied");
     auto status = pool.snapshot();
-    require(status.pagesFree == 12 && status.pagesActive == 0 &&
-                status.pagesPrefix == 0 && backing.allocationAttempts == 2,
-            "failed physical growth leaked references");
+    require(status.pagesAllocated == 4 && status.pagesFree == 4 &&
+                status.pagesActive == 0 && status.pagesPrefix == 0 &&
+                storage.allocationAttempts == 2,
+            "failed growth leaked references");
 }
 
-// A failed acquisition keeps the extents it allocated, resident and
-// reclaimable: the retry takes their pages instead of allocating them
-// again, and a reclaim pass returns them if nothing does.
+// A failed acquisition keeps the extents it allocated, reclaimable: the
+// retry takes their pages instead of allocating them again, and a reclaim
+// pass returns them if nothing does.
 void testFailedGrowthKeepsItsExtentsForTheRetry() {
-    TestBacking backing(16, 4);
-    backing.failExtent = 2;
-    KvPool pool(backing);
+    TestStorage storage(16, 4);
+    storage.failExtent = 2;
+    KvPool pool(storage);
     const auto before = pool.snapshot().extentReleases;
     auto pages = pool.acquirePages(9, false);
     auto status = pool.snapshot();
-    require(!pages.granted() && backing.releasedExtents == 0 &&
+    require(!pages.granted() && storage.releasedExtents == 0 &&
                 pool.snapshot().extentReleases == before &&
-                status.pagesResident == 8 && status.reclaimableExtents == 2 &&
-                status.pagesFreeResident == 8 && status.pagesActive == 0 &&
+                status.pagesAllocated == 8 && status.reclaimableExtents == 2 &&
+                status.pagesFree == 8 && status.pagesActive == 0 &&
                 status.extentAllocations == 2,
             "a failed acquisition did not keep the extents it allocated");
-    backing.failExtent.reset();
+    storage.failExtent.reset();
     pages = pool.acquirePages(9, false);
     require(pages.granted() && pool.snapshot().extentAllocations == 3 &&
-                backing.releasedExtents == 0,
+                storage.releasedExtents == 0,
             "the retry allocated again the extents it was denied with");
     release(pool, pages.pages);
     require(pool.reclaimEmptyExtents(false) == 3 &&
-                pool.snapshot().pagesResident == 0,
+                pool.snapshot().pagesAllocated == 0,
             "a reclaim pass did not return the extents the retry left");
 }
 
-// A backing that throws while allocating leaves every page free and the
-// accounting whole; the extent mapped before it stays resident and
-// reclaimable, and the pool keeps serving.
-void testThrowingBackingKeepsAccounting() {
-    TestBacking backing(12, 4);
-    backing.throwExtent = 1;
-    KvPool pool(backing);
+// A storage that throws while allocating leaves every page free and the
+// accounting whole; the extent allocated before it stays, reclaimable, and
+// the pool keeps serving.
+void testThrowingStorageKeepsAccounting() {
+    TestStorage storage(12, 4);
+    storage.throwExtent = 1;
+    KvPool pool(storage);
     bool threw = false;
     try {
         static_cast<void>(pool.acquirePages(5, false));
@@ -175,41 +176,40 @@ void testThrowingBackingKeepsAccounting() {
         threw = true;
     }
     auto status = pool.snapshot();
-    require(threw && status.pagesFree == 12 && status.pagesActive == 0 &&
-                status.pagesFreeResident == 4 && status.pagesResident == 4 &&
-                status.reclaimableExtents == 1,
-            "throwing backing leaked pages or broke residency accounting");
-    backing.throwExtent.reset();
+    require(threw && status.pagesActive == 0 && status.pagesFree == 4 &&
+                status.pagesAllocated == 4 && status.reclaimableExtents == 1,
+            "throwing storage leaked pages or broke the extent accounting");
+    storage.throwExtent.reset();
     auto pages = pool.acquirePages(5, false);
     require(pages.granted() && pool.snapshot().pagesActive == 5,
-            "pool did not serve after a throwing backing");
+            "pool did not serve after a throwing storage");
 }
 
-void testPressureReusesResidentPagesAndDeniesGrowth() {
-    TestBacking backing(8, 4, 1);
-    KvPool pool(backing);
+void testPressureReusesFreePagesAndDeniesGrowth() {
+    TestStorage storage(8, 4, 1);
+    KvPool pool(storage);
     auto active = pool.acquirePages(2, false);
     require(active.granted() && active.pages.size() == 2,
             "pressure setup did not acquire active pages");
-    backing.admission = false;
-    auto resident = pool.acquirePages(1, false);
-    require(resident.granted() && resident.pages.size() == 1 &&
-                resident.pages.front() == 2,
-            "critical pressure rejected an already-resident free page");
+    storage.admission = false;
+    auto reused = pool.acquirePages(1, false);
+    require(reused.granted() && reused.pages.size() == 1 &&
+                reused.pages.front() == 2,
+            "critical pressure rejected a free page of an allocated extent");
     auto denied = pool.acquirePages(2, false);
     require(!denied.granted() &&
                 denied.failure ==
                     splash::engine::KvPageAcquireFailure::Denied,
-            "critical pressure admitted a new physical extent");
+            "critical pressure admitted a new extent");
     require(pool.activeReferences(active.pages[0]) == 1 &&
                 pool.activeReferences(active.pages[1]) == 1 &&
-                pool.activeReferences(resident.pages.front()) == 1 &&
+                pool.activeReferences(reused.pages.front()) == 1 &&
                 pool.snapshot().pagesActive == 3,
             "critical pressure corrupted existing active references");
-    release(pool, resident.pages);
+    release(pool, reused.pages);
     release(pool, active.pages);
     require(pool.reclaimEmptyExtents(false) == 1 &&
-                pool.snapshot().pagesResident == 0,
+                pool.snapshot().pagesAllocated == 0,
             "pressure cleanup did not reclaim the empty extent");
 }
 
@@ -217,35 +217,35 @@ void testPressureReusesResidentPagesAndDeniesGrowth() {
 // are; a pass without the runway releases that one too.
 void testPassReleasesEveryEmptyExtent() {
     constexpr uint32_t extents = 200;
-    TestBacking backing(4 * extents, 4, extents);
-    KvPool pool(backing);
+    TestStorage storage(4 * extents, 4, extents);
+    KvPool pool(storage);
     auto pages = pool.acquirePages(4 * extents, false);
-    require(pages.granted() && pool.snapshot().pagesResident == 4 * extents,
+    require(pages.granted() && pool.snapshot().pagesAllocated == 4 * extents,
             "release setup did not acquire every page");
     release(pool, pages.pages);
     require(pool.snapshot().reclaimableExtents == extents,
-            "every empty resident extent was not reclaimable");
+            "every empty extent was not reclaimable");
     const auto before = pool.snapshot().extentReleases;
     require(pool.reclaimEmptyExtents(true) == extents - 1 &&
-                backing.releasedExtents == extents - 1 &&
+                storage.releasedExtents == extents - 1 &&
                 pool.snapshot().extentReleases == before + extents - 1 &&
                 pool.snapshot().reclaimableExtents == 1,
             "a pass did not release every empty extent but the runway");
     require(pool.reclaimEmptyExtents(false) == 1 &&
-                pool.snapshot().pagesResident == 0 &&
+                pool.snapshot().pagesAllocated == 0 &&
                 pool.snapshot().extentReleases == extents,
             "a pass without the runway did not release it");
 }
 
 void testFullestExtentFillsFirstSoColdExtentsDrain() {
-    TestBacking backing(12, 4, 3);
-    KvPool pool(backing);
+    TestStorage storage(12, 4, 3);
+    KvPool pool(storage);
     auto all = pool.acquirePages(12, false);
     require(all.granted() && all.pages.size() == 12,
             "fill setup did not acquire every page");
     // Leave extent 0 with three holes, extent 1 with one and extent 2 with two.
     release(pool, {0, 1, 2, 5, 8, 9});
-    require(pool.snapshot().pagesFreeResident == 6 &&
+    require(pool.snapshot().pagesFree == 6 &&
                 pool.snapshot().reclaimableExtents == 0,
             "partial release accounting is incorrect");
 
@@ -263,16 +263,16 @@ void testFullestExtentFillsFirstSoColdExtentsDrain() {
     release(pool, {3});
     require(pool.snapshot().reclaimableExtents == 1 &&
                 pool.reclaimEmptyExtents(false) == 1 &&
-                pool.snapshot().pagesResident == 8 &&
-                backing.releasedExtents == 1,
+                pool.snapshot().pagesAllocated == 8 &&
+                storage.releasedExtents == 1,
             "drained extent was not released");
 }
 
 void testShorterTrailingExtentIsNotPreferredForBeingSmall() {
     // Having fewer free pages only because an extent is small must not rank
     // it as the fullest.
-    TestBacking backing({4, 4, 2}, 3);
-    KvPool pool(backing);
+    TestStorage storage({4, 4, 2}, 3);
+    KvPool pool(storage);
     auto all = pool.acquirePages(10, false);
     require(all.granted() && all.pages.size() == 10,
             "trailing extent setup did not acquire every page");
@@ -292,13 +292,13 @@ void testShorterTrailingExtentIsNotPreferredForBeingSmall() {
     require(next.granted() && next.pages.front() < 4,
             "empty trailing extent was refilled ahead of a partial extent");
     require(pool.reclaimEmptyExtents(false) == 1 &&
-                pool.snapshot().pagesResident == 8,
+                pool.snapshot().pagesAllocated == 8,
             "empty trailing extent was not released");
 }
 
-void testPrefixAndActiveReferencesShareResidency() {
-    TestBacking backing(8, 4, 1);
-    KvPool pool(backing);
+void testPrefixAndActiveReferencesHoldTheExtent() {
+    TestStorage storage(8, 4, 1);
+    KvPool pool(storage);
     auto active = pool.acquirePages(1, false);
     require(active.granted(), "shared reference setup failed");
     pool.retainPage(active.pages.front(), true);
@@ -315,15 +315,15 @@ void testPrefixAndActiveReferencesShareResidency() {
 
 int main() {
     try {
-        testGrowthPacksResidentExtents();
+        testGrowthPacksAllocatedExtents();
         testFailedGrowthRollsBackAtomically();
         testFailedGrowthKeepsItsExtentsForTheRetry();
-        testThrowingBackingKeepsAccounting();
-        testPressureReusesResidentPagesAndDeniesGrowth();
+        testThrowingStorageKeepsAccounting();
+        testPressureReusesFreePagesAndDeniesGrowth();
         testPassReleasesEveryEmptyExtent();
         testFullestExtentFillsFirstSoColdExtentsDrain();
         testShorterTrailingExtentIsNotPreferredForBeingSmall();
-        testPrefixAndActiveReferencesShareResidency();
+        testPrefixAndActiveReferencesHoldTheExtent();
         std::cout << "elastic KV pool tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception &error) {

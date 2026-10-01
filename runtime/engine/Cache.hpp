@@ -113,7 +113,7 @@ struct CacheReclaimResult final {
   bool pending = false;
 };
 
-enum class CacheReclaimMode { ReuseBacking, ReleaseBacking };
+enum class CacheReclaimMode { KeepExtents, ReleaseExtents };
 
 // KV restores a request waits for before it can run.
 enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
@@ -195,7 +195,7 @@ public:
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
 
   // One cache reclaimer for memory growth and pressure warnings. After empty
-  // backing, disposable checkpoints are reclaimed first. Ordinary states and
+  // extents, disposable checkpoints are reclaimed first. Ordinary states and
   // resident KV leaves share one oldest-first access order. A chosen state
   // keeps its disk copy when it has one, is written when the tier admits it
   // and dropped otherwise; its RAM is free when the call returns. A chosen
@@ -210,8 +210,8 @@ public:
   // publication. A shrink that no request is waiting for gains the one cell
   // that publication holds and costs the next request a replay of its whole
   // prompt, because a hybrid model cannot resume from cached KV without the
-  // recurrent state. Empty backing, older publications and state-free KV are
-  // still reclaimed. keepRunway leaves one empty extent resident, for the
+  // recurrent state. Empty extents, older publications and state-free KV are
+  // still reclaimed. keepRunway leaves one empty extent allocated, for the
   // next request.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
                                       bool keepResumePoint = false,
@@ -225,11 +225,10 @@ public:
   [[nodiscard]] bool transfersInFlight() const noexcept;
   // One bounded reclaim step for an allocation retry: one empty extent, one
   // state or one KV leaf, so a denied allocation frees only what it needs.
-  // Progress is distinct from physical bytes because evicting a KV reference
-  // can make a resident page reusable without immediately emptying its
-  // extent.
+  // Progress is distinct from released bytes because evicting a KV reference
+  // can make a page reusable without emptying its extent.
   [[nodiscard]] CacheReclaimResult reclaimOne(
-      CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
+      CacheReclaimMode mode = CacheReclaimMode::ReleaseExtents,
       bool keepResumePoint = false, bool keepRunway = false);
   // Recycles exactly one unpinned state, preferring checkpoints, for a
   // required state publication; the disk tier keeps it when it admits it.
