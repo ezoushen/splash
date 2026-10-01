@@ -9,7 +9,7 @@
 
 namespace splash::kv {
 
-// Physical storage for paged KV in extents: ordinary private Metal buffers of
+// Physical storage for paged KV in extents: ordinary shared Metal buffers of
 // extentPages pages each, allocated when the pool needs one of their pages and
 // released when the last of them is free. Inside an extent every attention
 // layer has a region that holds the keys of all its pages, then their key

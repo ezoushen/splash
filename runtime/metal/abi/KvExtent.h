@@ -1,7 +1,7 @@
 #pragma once
 
 // Where KV pages live, shared by the host and the kernels. A pool's pages sit
-// in extents: ordinary private Metal buffers that all hold the same number of
+// in extents: ordinary shared Metal buffers that all hold the same number of
 // pages, allocated when the pool grows and released when their last page is
 // free. Kernels reach them only through the page entries of a request's
 // table, never through a bound buffer.

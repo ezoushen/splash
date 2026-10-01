@@ -239,11 +239,12 @@ public:
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage = BufferStorage::Shared,
                  std::string_view label = {});
-  // A private, hazard-untracked buffer that kernels reach only through GPU
+  // A shared, hazard-untracked buffer that kernels reach only through GPU
   // addresses held in other buffers, as they reach KV pages: the residency
   // set makes it resident for every command, so nothing names it per command
-  // or dispatch. Fails with MetalAllocationError unless Metal allocates
-  // exactly `bytes`, the amount admission charged.
+  // or dispatch. The CPU reaches it too, through contents(). Fails with
+  // MetalAllocationError unless Metal allocates exactly `bytes`, the amount
+  // admission charged.
   [[nodiscard]] MetalBuffer allocateAddressed(uint64_t bytes,
                                               std::string_view label = {});
 

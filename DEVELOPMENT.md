@@ -513,7 +513,7 @@ them again. Memory returns to macOS when the engine releases it, never because
 macOS compressed or dropped an idle buffer. macOS page cache, driver
 allocations and other applications still affect memory pressure and swap.
 
-KV pages live in extents: ordinary private Metal buffers of one size per pool,
+KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, with a 64 KiB-aligned region per
 attention layer, sized to leave the fewest of the budget's pages unused
 (`Layout::extentPagesFor`). The pool allocates an extent when it needs one of

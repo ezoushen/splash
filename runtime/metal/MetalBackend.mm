@@ -755,7 +755,7 @@ MetalBuffer MetalBackend::allocateAddressed(uint64_t bytes,
     }
     id<MTLBuffer> buffer = [impl_->device
         newBufferWithLength:checkedNSUInteger(bytes, "buffer size")
-        options:MTLResourceStorageModePrivate |
+        options:MTLResourceStorageModeShared |
                 MTLResourceHazardTrackingModeUntracked];
     if (!buffer) throw MetalAllocationError("Metal buffer allocation failed");
     if (buffer.allocatedSize != bytes) {
@@ -764,7 +764,7 @@ MetalBuffer MetalBackend::allocateAddressed(uint64_t bytes,
             " bytes for an addressed buffer of " + std::to_string(bytes));
     }
     if (!label.empty()) buffer.label = checkedNSString(label, "buffer label");
-    return impl_->registerBuffer(buffer, BufferStorage::Private);
+    return impl_->registerBuffer(buffer, BufferStorage::Shared);
 }
 
 MetalBuffer MetalBackend::wrapSharedMemory(

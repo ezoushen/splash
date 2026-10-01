@@ -539,11 +539,13 @@ NSUInteger paddedAllocatedSize(id buffer, SEL selector) {
                originalBufferAllocatedSize)(buffer, selector) + 16384;
 }
 
-// Addressed buffers are private and untracked, allocated at exactly their
-// size and reached only through GPU addresses in a table. The residency set
-// makes them resident for every command, also once its keep-alive has
-// lapsed; one dispatch reads what the previous one wrote through them; and
-// buffers released and allocated again between commands work at once.
+// Addressed buffers are shared and untracked, allocated at exactly their
+// size, and kernels reach them only through GPU addresses in a table. The
+// residency set makes them resident for every command, also once its
+// keep-alive has lapsed; one dispatch reads what the previous one wrote
+// through them; the CPU reads what kernels wrote and kernels read what the
+// CPU wrote between commands; and buffers released and allocated again
+// between commands work at once.
 void addressedBuffersThroughTables(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.2;
     constexpr uint32_t kBuffers = 6, kWords = 16384, kRounds = 60;
@@ -560,12 +562,12 @@ void addressedBuffersThroughTables(const std::string &metallibPath) {
         originalNewBuffer = options.original;
         buffers[0] = backend.allocateAddressed(kBytes, "addressed-test");
     }
-    require(lastBufferOptions == (MTLResourceStorageModePrivate |
+    require(lastBufferOptions == (MTLResourceStorageModeShared |
                                   MTLResourceHazardTrackingModeUntracked),
-            "an addressed buffer is not private and hazard-untracked");
+            "an addressed buffer is not shared and hazard-untracked");
     {
         id<MTLBuffer> sample = [device newBufferWithLength:kBytes
-            options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked];
+            options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
         MethodReplacement padded(sample, @selector(allocatedSize),
                                  reinterpret_cast<IMP>(paddedAllocatedSize));
         originalBufferAllocatedSize = padded.original;
@@ -577,7 +579,7 @@ void addressedBuffersThroughTables(const std::string &metallibPath) {
     }
     for (uint32_t index = 1; index < kBuffers; ++index)
         buffers[index] = backend.allocateAddressed(kBytes);
-    require(buffers[0].storage() == BufferStorage::Private && !buffers[0].contents() &&
+    require(buffers[0].storage() == BufferStorage::Shared && buffers[0].contents() &&
                 buffers[0].sizeBytes() == kBytes &&
                 backend.memoryStats().allocatedBytes == before + kBuffers * kBytes,
             "addressed buffers were not allocated or counted at their size");
@@ -601,6 +603,10 @@ void addressedBuffersThroughTables(const std::string &metallibPath) {
         ComputeDispatch{"addressed_check_u32", {{0, table}, {3, mismatches}},
             {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
             {kWords / 256, kBuffers, 1}, {256, 1, 1}}};
+    const std::array<ComputeDispatch, 1> check{command[1]};
+    const auto expected = [&](uint32_t index, uint32_t word) {
+        return seed ^ (index * 131071u + word);
+    };
     uint32_t regrown = 0;
     bool lapsedRound = false;
     for (uint32_t round = 0; round < kRounds; ++round) {
@@ -625,13 +631,32 @@ void addressedBuffersThroughTables(const std::string &metallibPath) {
         }
         seed = 0x9e3779b9u * (round + 1);
         *static_cast<uint32_t *>(mismatches.contents()) = 0;
-        auto ticket = backend.submitCommandAsync(command);
+        // Every third round the CPU writes what the check expects, and the
+        // command only checks it.
+        const bool hostWrites = round % 3 == 2;
+        if (hostWrites) {
+            for (uint32_t index = 0; index < kBuffers; ++index) {
+                auto *contents = static_cast<uint32_t *>(buffers[index].contents());
+                for (uint32_t word = 0; word < kWords; ++word)
+                    contents[word] = expected(index, word);
+            }
+        }
+        auto ticket = hostWrites ? backend.submitCommandAsync(check)
+                                 : backend.submitCommandAsync(command);
         require(backend.commandInFlight(), "a submitted command is not in flight");
         (void)ticket.wait();
         require(!backend.commandInFlight(), "a consumed command is still in flight");
         require(*static_cast<uint32_t *>(mismatches.contents()) == 0,
                 "round " + std::to_string(round) +
                     " read wrong data through the addresses of its buffers");
+        for (uint32_t index = 0; index < kBuffers; ++index) {
+            const auto *contents = static_cast<const uint32_t *>(buffers[index].contents());
+            for (uint32_t word = 0; word < kWords; ++word) {
+                if (contents[word] != expected(index, word))
+                    fail("round " + std::to_string(round) +
+                         ": the CPU read other data than the kernels wrote");
+            }
+        }
     }
     buffers.clear();
     require(backend.memoryStats().allocatedBytes == before &&
