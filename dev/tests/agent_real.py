@@ -293,7 +293,7 @@ def status(*, wait_for_fresh=True, tolerate_critical=False):
 
 def idle_status():
     # Up to 60 s: a phase boundary may fall inside the engine's critical
-    # window, which clears once shed memory is released at the paced rate.
+    # window, which clears once macOS has registered the memory it shed.
     for _ in range(240):
         value = status(tolerate_critical=True)
         if not value.get("ready"):

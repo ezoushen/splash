@@ -52,11 +52,11 @@ public:
     }
     splash::metal::AllocationResult ensureResident(uint32_t page) override {
         uint32_t extent = extentOf_.at(page);
-        ++mappingAttempts;
+        ++allocationAttempts;
         if (!admission) return false;
         if (failExtent && extent == *failExtent) return false;
         if (throwExtent && extent == *throwExtent)
-            throw std::runtime_error("test mapping failure");
+            throw std::runtime_error("test allocation failure");
         resident_.at(extent) = true;
         return true;
     }
@@ -76,7 +76,7 @@ public:
     bool admission = true;
     std::optional<uint32_t> failExtent;
     std::optional<uint32_t> throwExtent;
-    uint32_t mappingAttempts = 0;
+    uint32_t allocationAttempts = 0;
     uint32_t releasedExtents = 0;
 
 private:
@@ -130,7 +130,7 @@ void testFailedGrowthRollsBackAtomically() {
             "failed physical growth was not reported as physical capacity");
     auto status = pool.snapshot();
     require(status.pagesFree == 12 && status.pagesActive == 0 &&
-                status.pagesPrefix == 0 && backing.mappingAttempts == 2,
+                status.pagesPrefix == 0 && backing.allocationAttempts == 2,
             "failed physical growth leaked references");
 }
 
@@ -161,7 +161,7 @@ void testFailedGrowthKeepsItsExtentsForTheRetry() {
             "a reclaim pass did not return the extents the retry left");
 }
 
-// A backing that throws while mapping leaves every page free and the
+// A backing that throws while allocating leaves every page free and the
 // accounting whole; the extent mapped before it stays resident and
 // reclaimable, and the pool keeps serving.
 void testThrowingBackingKeepsAccounting() {
