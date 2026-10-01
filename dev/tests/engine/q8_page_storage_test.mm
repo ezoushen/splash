@@ -3,11 +3,14 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace splash;
 using namespace splash::engine;
@@ -61,6 +64,44 @@ static_assert(bf16Layout.extentPagesFor(31) == 0 && bf16Layout.extentPagesFor(44
 static_assert(compactBf16Layout.extentAlignmentPages() == 2 &&
               compactBf16Layout.minimumExtentPages() == 104 &&
               compactBf16Layout.maximumExtentPages() == 306);
+
+// The host reaches a page through spans of its tensors, layer by layer as
+// keys, key scales, values and value scales, BF16 without scales. Kernels
+// find a page's keys at the page's slab in the layer's region, so that is
+// where each layer's spans start, and the spans of an extent's pages cover
+// the extent once, without gaps or overlaps.
+void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) {
+    const kv::Layout layout = storage.layout();
+    const bool scaled = layout.format == kv::Format::Int8;
+    const uint32_t tensors = scaled ? 4 : 2;
+    std::byte *const extent = storage.spans(firstPage).front().data();
+    std::vector<std::span<std::byte>> all;
+    for (uint32_t index = 0; index < storage.extentPages(); ++index) {
+        const auto spans = storage.spans(firstPage + index);
+        require(spans.size() == layout.attentionLayers * tensors,
+                "a page does not have one span per tensor of every layer");
+        for (uint32_t span = 0; span < spans.size(); ++span) {
+            const uint64_t bytes = scaled && span % 2 ? layout.scaleBytesPerLayerPage()
+                                                      : layout.dataBytesPerLayerPage();
+            require(spans[span].size() == bytes, "a page's span holds another tensor's bytes");
+        }
+        for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer) {
+            require(spans[layer * tensors].data() ==
+                        extent + storage.layer(layer).kv.offset +
+                            uint64_t{index} * layout.dataBytesPerLayerPage(),
+                    "a layer's spans do not start at the page's keys in its region");
+        }
+        all.insert(all.end(), spans.begin(), spans.end());
+    }
+    std::sort(all.begin(), all.end(),
+              [](auto left, auto right) { return left.data() < right.data(); });
+    std::byte *next = extent;
+    for (const auto span : all) {
+        require(span.data() == next, "the spans of an extent's pages leave a gap or overlap");
+        next += span.size();
+    }
+    require(next == extent + storage.extentBytes(), "the spans of an extent's pages do not cover it");
+}
 
 void run(const std::string &metallib) {
     metal::MetalBackend backend(metallib);
@@ -306,6 +347,9 @@ void run(const std::string &metallib) {
             "a page entry does not carry the page's index in its extent");
     requireThrows<std::logic_error>([&] { (void)storage.entry(200); },
                                     "an unbacked page received an entry");
+    requireThrows<std::logic_error>([&] { (void)storage.spans(200); },
+                                    "an unbacked page received host memory");
+    requireSpansTileExtent(storage, 0);
     requireThrows<std::logic_error>(
         [&] { storage.writeEntries(std::array<uint32_t, 1>{200}, table); },
         "a table was written with an unbacked page");
@@ -372,6 +416,7 @@ void run(const std::string &metallib) {
         require(bf16.residentPages() == extent && !bf16.isResident(extent) &&
                     bf16.actualAllocatedBytes() == extent * layout.bytesPerModelPage(),
                 "BF16 initial residency escaped its admitted extent");
+        requireSpansTileExtent(bf16, 0);
         require(bf16.ensureResident(extent) && bf16.residentPages() == 2 * extent &&
                     bf16.actualAllocatedBytes() == uint64_t{bf16.pageCount()} * bf16.bytesPerPage(),
                 "BF16 growth did not account for both extents");

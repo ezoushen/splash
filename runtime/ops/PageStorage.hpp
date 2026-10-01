@@ -3,6 +3,7 @@
 #include "metal/MetalBackend.hpp"
 #include "ops/PagedKv.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -15,10 +16,10 @@ namespace splash::kv {
 // layer has a region that holds the keys of all its pages, then their key
 // scales, values and value scales (abi/KvExtent.h). Kernels reach a page
 // through its entry in a request's GPU page table, and the backend's
-// residency set keeps every extent resident for every command. Active
-// requests may overwrite slots at or beyond their logical commit index.
-// Cached KV blocks reference only fully committed pages, which are immutable
-// while shared.
+// residency set keeps every extent resident for every command; the host
+// reaches the same bytes through the page's spans(). Active requests may
+// overwrite slots at or beyond their logical commit index. Cached KV blocks
+// reference only fully committed pages, which are immutable while shared.
 class PageStorage final : public Backing {
 public:
   // pageCount must be a whole number of extents of extentPages pages, a
@@ -63,6 +64,12 @@ public:
   // table, which must hold all of them; throws std::logic_error otherwise.
   void writeEntries(std::span<const uint32_t> pages,
                     const metal::MetalBuffer &table) const;
+  // The page's memory as the host reaches it, and the only code that names
+  // it: the page's bytes of each tensor in every layer's region, layer by
+  // layer as keys, key scales, values and value scales, where
+  // splash_kv_offset places them for the kernels. BF16 pages have no scale
+  // bytes. Throws std::logic_error for a page whose extent has no backing.
+  [[nodiscard]] std::vector<std::span<std::byte>> spans(uint32_t page) const;
   // Advances whenever an extent is allocated or released. A GPU table
   // written at an earlier generation may hold an entry of a released extent.
   [[nodiscard]] uint64_t generation() const noexcept { return generation_; }

@@ -137,4 +137,30 @@ void PageStorage::writeEntries(std::span<const uint32_t> pages,
         entries[index] = entry(pages[index]);
 }
 
+std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
+    auto *extent =
+        static_cast<std::byte *>(extents_[extentIndex(page)].contents());
+    if (!extent) {
+        throw std::logic_error("KV page " + std::to_string(page) +
+                               " has no backing");
+    }
+    const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
+    const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
+    const uint32_t index = page % extentPages_;
+    std::vector<std::span<std::byte>> result;
+    result.reserve(size_t{layout_.attentionLayers} * (scale ? 4 : 2));
+    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
+        for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES;
+             ++tensor) {
+            if (const uint32_t bytes = splash_kv_page_bytes(data, scale, tensor)) {
+                result.emplace_back(extent + splash_kv_offset(extentPages_, data,
+                                                              scale, layer,
+                                                              tensor, index),
+                                    bytes);
+            }
+        }
+    }
+    return result;
+}
+
 }  // namespace splash::kv
