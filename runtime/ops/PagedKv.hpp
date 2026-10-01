@@ -72,8 +72,11 @@ inline constexpr int32_t kQuantizedMaximum = 127;
 // kernels were tuned on it, and regions aligned to less cost Apple10's 35B
 // verify kernel a fixed ~25 µs per dispatch.
 inline constexpr uint64_t kExtentRegionAlignmentBytes = 64 * 1024;
-inline constexpr uint64_t kAllocationExtentTargetBytes =
-    SPLASH_ALLOCATION_EXTENT_TARGET_BYTES;
+// The size a pool aims its extents at (Layout::extentPagesFor stays within
+// half and one and a half times it): each extent costs the serving loop an
+// allocation and a release, and an extent returns memory only once all of
+// its pages are free.
+inline constexpr uint64_t kAllocationExtentTargetBytes = 128ull * 1024 * 1024;
 
 namespace detail {
 

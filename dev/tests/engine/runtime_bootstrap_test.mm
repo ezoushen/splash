@@ -99,7 +99,6 @@ std::string executionManifest(uint32_t draftRows = 8,
                               std::string_view extraGeometry = {}) {
   std::ostringstream out;
   out << R"({"schema_version":3,"model":"Qwen3.8-27B-DFlash2","format":{"name":"splash-packed-q4","q4_bits":4,"q4_group_size":64,"q4_storage_n":256,"section_alignment_bytes":16384,"target_layer_magic":"MDFL0006","draft_layer_magic":"MDFD0004","vision_magic":"MDFV0001"},"execution_geometry":{)"
-      << R"("allocation_extent_target_bytes":134217728,)"
       << R"("draft_proposal_tokens":7,)"
       << "\"draft_query_rows\":" << draftRows << ','
       << R"("draft_sliding_window":2048,)"

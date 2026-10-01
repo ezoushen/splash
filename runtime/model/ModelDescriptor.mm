@@ -18,8 +18,7 @@ struct GeometryField final {
 };
 
 constexpr auto kExecutionGeometry = std::to_array<GeometryField>(
-    {{"allocation_extent_target_bytes", kv::kAllocationExtentTargetBytes},
-     {"draft_proposal_tokens", ExecutionLimits::draftProposalTokens},
+    {{"draft_proposal_tokens", ExecutionLimits::draftProposalTokens},
      {"draft_query_rows", ExecutionLimits::draftQueryRows},
      {"draft_sliding_window", ExecutionLimits::draftContextTokens},
      {"maximum_batch_width", ExecutionLimits::maximumBatchWidth},
