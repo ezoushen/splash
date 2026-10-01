@@ -34,6 +34,7 @@ public:
     allocated_.at(page) = false;
     return true;
   }
+  void copyPages(std::span<const kv::PageCopy>) override {}
   uint32_t extentFirstPage(uint32_t page) const override {
     return page - page % 4;
   }

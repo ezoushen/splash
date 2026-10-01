@@ -299,15 +299,26 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages) {
   return {};
 }
 
-// Reclaim: one victim at a time in the shared recency order, states and
+// Reclaim: memory returns as whole extents. Free pages go first, an empty
+// extent as it is and the pages scattered over the others once they fill
+// one; then one victim at a time in the shared recency order, states and
 // resident KV leaves alike.
 
 uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
                              bool keepResumePoint, bool keepRunway) {
-  // Pages whose copies are being written count toward the target.
   uint64_t released = reclaimEmptyExtents(keepRunway);
-  auto needsMore = [&] { return !reclaimMet(released, targetBytes, evictAll); };
-  while (needsMore()) {
+  if (evictAll) {
+    // Everything unpinned goes before anything moves.
+    for (CacheReclaimResult evicted = evictOne(keepResumePoint);
+         evicted.madeProgress; evicted = evictOne(keepResumePoint))
+      released += evicted.reclaimedBytes;
+    do {
+      released += reclaimEmptyExtents(keepRunway);
+    } while (compactExtent());
+    return released;
+  }
+  // Pages whose copies are being written count toward the target.
+  while (!reclaimMet(released, targetBytes, false)) {
     const CacheReclaimResult result = reclaimOne(
         CacheReclaimMode::ReleaseExtents, keepResumePoint, keepRunway);
     if (!result.madeProgress)
@@ -319,11 +330,20 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
 
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
                                      bool keepResumePoint, bool keepRunway) {
-  if (mode == CacheReclaimMode::ReleaseExtents) {
+  const bool release = mode == CacheReclaimMode::ReleaseExtents;
+  if (release) {
     if (const uint64_t bytes = reclaimEmptyExtents(keepRunway, 1))
       return {true, bytes};
+    if (compactExtent())
+      return {true, reclaimEmptyExtents(keepRunway, 1)};
   }
+  CacheReclaimResult evicted = evictOne(keepResumePoint);
+  if (evicted.madeProgress && release)
+    evicted.reclaimedBytes += reclaimEmptyExtents(keepRunway, 1);
+  return evicted;
+}
 
+CacheReclaimResult Cache::evictOne(bool keepResumePoint) {
   const auto reclaimState = [&](uint64_t block) {
     const StateEviction eviction =
         states_.reclaim(block, completionNotifier_, makeRoom_, true);
@@ -355,9 +375,7 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
     }
     switch (reclaimKvLeaf(kv->id)) {
     case LeafReclaim::Started:
-      return {true, mode == CacheReclaimMode::ReleaseExtents
-                        ? reclaimEmptyExtents(keepRunway, 1)
-                        : 0};
+      return {true, 0};
     case LeafReclaim::Pending:
       kvOpen = false;
       break;
@@ -456,6 +474,30 @@ uint64_t Cache::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
   static_cast<void>(pool_.reclaimEmptyExtents(keepRunway, limit));
   const uint64_t after = pool_.allocatedBytes();
   return before >= after ? before - after : 0;
+}
+
+bool Cache::compactExtent() {
+  std::vector<uint32_t> inTransfer;
+  inTransfer.reserve(demotions_.size() + restores_.size());
+  for (const Demotion &demotion : demotions_)
+    inTransfer.push_back(kv_.page(demotion.block));
+  for (const auto &[block, _] : restores_)
+    inTransfer.push_back(kv_.page(block));
+  const KvPageMoves moves = pool_.compactExtent(inTransfer);
+  if (moves.empty())
+    return false;
+  kv_.followPages(moves);
+  for (auto &[_, active] : requests_) {
+    bool moved = false;
+    for (uint32_t &page : active.pages) {
+      const uint32_t destination = moves.follow(page);
+      moved = moved || destination != page;
+      page = destination;
+    }
+    if (moved)
+      ++active.pageTableRevision;
+  }
+  return true;
 }
 
 bool Cache::transfersInFlight() const noexcept {

@@ -298,6 +298,11 @@ void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<model::KvDiskSlot> slot
   entry.slot = std::move(slot);
 }
 
+void KvCache::followPages(const KvPageMoves &moves) noexcept {
+  for (auto &[_, entry] : blocks_)
+    entry.page = moves.follow(entry.page);
+}
+
 bool KvCache::abandonRestore(uint64_t blockId) {
   Block &entry = block(blockId);
   if (!entry.transferring || entry.residentChildren || entry.activeUsers)

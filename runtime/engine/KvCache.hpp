@@ -134,6 +134,9 @@ public:
   // Gives a disk-only block a page whose content follows, by restore or from
   // the request that recomputed it. The parent must be resident.
   void adoptPage(uint64_t blockId, uint32_t page);
+  // The pool moved pages: every block on one of them names the page it
+  // moved to.
+  void followPages(const KvPageMoves &moves) noexcept;
   // Abandons an unsubmitted restore at an unused leaf, keeping its disk copy.
   [[nodiscard]] bool abandonRestore(uint64_t blockId);
   // A restore that failed: the block matches nothing any more and leaves

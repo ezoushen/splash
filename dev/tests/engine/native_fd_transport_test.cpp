@@ -38,6 +38,7 @@ public:
     allocated_.at(page) = false;
     return true;
   }
+  void copyPages(std::span<const kv::PageCopy>) override {}
   uint32_t extentFirstPage(uint32_t page) const override { return page; }
   uint32_t extentPageCount(uint32_t) const override { return 1; }
 private:

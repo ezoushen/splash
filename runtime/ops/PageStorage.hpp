@@ -56,6 +56,10 @@ public:
   // through its tables without retaining them, so releasing one while a
   // command is in flight throws std::logic_error and leaves it intact.
   [[nodiscard]] bool releaseExtentOf(uint32_t page) override;
+  // A command reaches both pages through its tables and may still write the
+  // source, so, like a release, copying while one is in flight throws
+  // std::logic_error.
+  void copyPages(std::span<const PageCopy> copies) override;
   [[nodiscard]] uint32_t extentFirstPage(uint32_t page) const override;
   [[nodiscard]] uint32_t extentPageCount(uint32_t page) const override;
   [[nodiscard]] LayerStorage layer(uint32_t index) const;

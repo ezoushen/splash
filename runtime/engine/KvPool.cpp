@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
+#include <utility>
 
 namespace splash::engine {
 namespace {
@@ -187,6 +189,76 @@ bool KvPool::releaseExtent(uint32_t extent) {
   return true;
 }
 
+KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed) {
+  // Pages move only into extents that hold pages already: an empty extent is
+  // released as it is, never filled to release another.
+  uint32_t freeInUse = 0;
+  for (const ExtentRecord &extent : extents_) {
+    if (extent.allocated && extent.usedPages)
+      freeInUse += extent.freePages.count;
+  }
+  uint32_t emptied = noIndex;
+  for (uint32_t index = 0; index < extents_.size(); ++index) {
+    const ExtentRecord &extent = extents_[index];
+    if (!extent.allocated || !extent.usedPages ||
+        extent.usedPages > freeInUse - extent.freePages.count ||
+        (emptied != noIndex && extent.usedPages >= extents_[emptied].usedPages))
+      continue;
+    if (std::none_of(fixed.begin(), fixed.end(), [&](uint32_t page) {
+          return pages_.at(page).extent == index;
+        }))
+      emptied = index;
+  }
+  if (emptied == noIndex)
+    return {};
+
+  std::vector<uint32_t> receivers;
+  for (uint32_t index = 0; index < extents_.size(); ++index) {
+    const ExtentRecord &extent = extents_[index];
+    if (index != emptied && extent.allocated && extent.usedPages &&
+        extent.freePages.count)
+      receivers.push_back(index);
+  }
+  std::stable_sort(receivers.begin(), receivers.end(),
+                   [&](uint32_t left, uint32_t right) {
+                     return extents_[left].usedPages > extents_[right].usedPages;
+                   });
+  const ExtentRecord &source = extents_[emptied];
+  std::vector<kv::PageCopy> copies;
+  copies.reserve(source.usedPages);
+  auto receiver = receivers.begin();
+  uint32_t to = extents_[*receiver].freePages.head;
+  for (uint32_t page = source.firstPage;
+       page < source.firstPage + source.pageCount; ++page) {
+    if (pageFree(page))
+      continue;
+    // The receivers' free pages cover the extent, so one always follows.
+    while (to == noIndex)
+      to = extents_[*++receiver].freePages.head;
+    copies.push_back({page, to});
+    to = pages_[to].nextFree;
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  storage_.copyPages(copies);
+  KvPageMoves moves{source.firstPage, std::vector<uint32_t>(source.pageCount)};
+  std::iota(moves.destinations.begin(), moves.destinations.end(), source.firstPage);
+  for (const kv::PageCopy &copy : copies) {
+    markUsed(copy.to);
+    pages_[copy.to].activeReferences =
+        std::exchange(pages_[copy.from].activeReferences, 0);
+    pages_[copy.to].prefixReferences =
+        std::exchange(pages_[copy.from].prefixReferences, 0);
+    markFree(copy.from);
+    moves.destinations[copy.from - moves.firstPage] = copy.to;
+  }
+  ++extentCompactions_;
+  pagesMoved_ += copies.size();
+  extentCompactMaxMilliseconds_ =
+      std::max(extentCompactMaxMilliseconds_, millisecondsSince(start));
+  return moves;
+}
+
 KvPoolSnapshot KvPool::snapshot() const {
   KvPoolSnapshot result;
   result.pagesAllocated = allocatedPages_;
@@ -200,6 +272,9 @@ KvPoolSnapshot KvPool::snapshot() const {
   result.extentReleases = extentReleases_;
   result.extentAllocateMaxMilliseconds = extentAllocateMaxMilliseconds_;
   result.extentReleaseMaxMilliseconds = extentReleaseMaxMilliseconds_;
+  result.extentCompactions = extentCompactions_;
+  result.pagesMoved = pagesMoved_;
+  result.extentCompactMaxMilliseconds = extentCompactMaxMilliseconds_;
   return result;
 }
 

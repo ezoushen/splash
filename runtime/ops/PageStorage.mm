@@ -1,5 +1,6 @@
 #include "ops/PageStorage.hpp"
 
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -91,6 +92,27 @@ bool PageStorage::releaseExtentOf(uint32_t page) {
     --allocatedExtents_;
     ++generation_;
     return true;
+}
+
+void PageStorage::copyPages(std::span<const PageCopy> copies) {
+    if (backend_.commandInFlight()) {
+        throw std::logic_error(
+            "cannot copy KV pages while a command is in flight");
+    }
+    for (const PageCopy &copy : copies) {
+        if (!isAllocated(copy.from) || !isAllocated(copy.to)) {
+            throw std::logic_error(
+                "cannot copy a KV page of an extent that is not allocated");
+        }
+    }
+    for (const PageCopy &copy : copies) {
+        const auto source = spans(copy.from);
+        const auto destination = spans(copy.to);
+        for (size_t tensor = 0; tensor < source.size(); ++tensor) {
+            std::memcpy(destination[tensor].data(), source[tensor].data(),
+                        source[tensor].size());
+        }
+    }
 }
 
 LayerStorage PageStorage::layer(uint32_t index) const {

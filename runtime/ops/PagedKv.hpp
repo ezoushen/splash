@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string_view>
 #include <type_traits>
 
@@ -39,6 +40,12 @@ enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
   return "invalid";
 }
 
+// A page whose content goes to another page.
+struct PageCopy final {
+  uint32_t from = 0;
+  uint32_t to = 0;
+};
+
 // The memory of the engine's page pool: extents of whole pages, each
 // allocated or not. Implementations provide Metal storage or deterministic
 // test storage.
@@ -50,6 +57,10 @@ public:
   [[nodiscard]] virtual bool isAllocated(uint32_t page) const = 0;
   [[nodiscard]] virtual metal::AllocationResult ensureAllocated(uint32_t page) = 0;
   [[nodiscard]] virtual bool releaseExtentOf(uint32_t page) = 0;
+  // Copies each page's content onto its destination, both in allocated
+  // extents: how the pool moves the pages of an extent it empties. Either
+  // every copy is made or the call throws before the first.
+  virtual void copyPages(std::span<const PageCopy> copies) = 0;
   [[nodiscard]] virtual uint32_t extentFirstPage(uint32_t page) const = 0;
   [[nodiscard]] virtual uint32_t extentPageCount(uint32_t page) const = 0;
 };

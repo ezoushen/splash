@@ -147,6 +147,9 @@ std::string runtimeStatusJson(
       << ",\"extent_releases\":" << pool.extentReleases
       << ",\"extent_allocate_max_ms\":" << pool.extentAllocateMaxMilliseconds
       << ",\"extent_release_max_ms\":" << pool.extentReleaseMaxMilliseconds
+      << ",\"extent_compactions\":" << pool.extentCompactions
+      << ",\"pages_moved\":" << pool.pagesMoved
+      << ",\"extent_compact_max_ms\":" << pool.extentCompactMaxMilliseconds
       << "}"
       << ",\"state\":{\"entries\":" << state.entries
       << ",\"pinned\":" << state.pinned << ",\"bytes\":" << state.bytes

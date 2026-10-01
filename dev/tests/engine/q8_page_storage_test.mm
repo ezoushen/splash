@@ -394,6 +394,46 @@ void run(const std::string &metallib) {
                 (storage.entry(255) & SPLASH_KV_PAGE_INDEX_MASK) == 127,
             "a released extent could not be allocated again");
 
+    // The pool moves a page by copying it: every tensor of every layer goes
+    // to the other page, in another extent too, and the pages beside both
+    // stay as they were. A command may still write the source, so nothing is
+    // copied while one is in flight, nor when a page has no memory.
+    const auto fill = [&](uint32_t page, uint8_t first) {
+        uint8_t value = first;
+        for (const auto span : storage.spans(page))
+            std::memset(span.data(), value++, span.size());
+    };
+    const auto holds = [&](uint32_t page, uint8_t first) {
+        uint8_t value = first;
+        for (const auto span : storage.spans(page)) {
+            const auto expected = static_cast<std::byte>(value++);
+            if (!std::all_of(span.begin(), span.end(),
+                             [&](std::byte byte) { return byte == expected; }))
+                return false;
+        }
+        return true;
+    };
+    fill(5, 10);
+    fill(6, 60);
+    fill(200, 110);
+    fill(201, 160);
+    fill(255, 210);
+    {
+        const metal::ComputeDispatch kick{"residency_kick", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
+        auto ticket = backend.submitAsync(kick);
+        requireThrows<std::logic_error>(
+            [&] { storage.copyPages(std::array<kv::PageCopy, 1>{{{5, 200}}}); },
+            "a page was copied while a command was in flight");
+        (void)ticket.wait();
+    }
+    requireThrows<std::logic_error>(
+        [&] { storage.copyPages(std::array<kv::PageCopy, 2>{{{5, 200}, {6, 300}}}); },
+        "a page was copied to an extent that is not allocated");
+    require(holds(200, 110), "a refused copy changed a page");
+    storage.copyPages(std::array<kv::PageCopy, 2>{{{5, 200}, {6, 255}}});
+    require(holds(200, 10) && holds(255, 60) && holds(5, 10) && holds(6, 60) && holds(201, 160),
+            "a copied page does not hold its source's tensors, or its neighbour changed");
+
     kv::PageStorage compactStorage(
         backend, governor.allocationAdmission(), compactLayout, 1024, 512);
     require(compactStorage.layer(9).kv.extent_pages == 512 &&

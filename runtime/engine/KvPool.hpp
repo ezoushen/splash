@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <vector>
 
 namespace splash::engine {
@@ -27,6 +28,28 @@ struct KvPoolSnapshot {
   uint64_t extentReleases = 0;
   double extentAllocateMaxMilliseconds = 0.0;
   double extentReleaseMaxMilliseconds = 0.0;
+  // Extents emptied by moving their pages, the pages moved, and the longest
+  // emptying of one.
+  uint64_t extentCompactions = 0;
+  uint64_t pagesMoved = 0;
+  double extentCompactMaxMilliseconds = 0.0;
+};
+
+// Where the pages of an emptied extent went. Whoever names one of its pages
+// follows it.
+struct KvPageMoves final {
+  uint32_t firstPage = 0;
+  // By offset in the extent: the page that took the page's content, or the
+  // page itself where it was free.
+  std::vector<uint32_t> destinations;
+
+  [[nodiscard]] bool empty() const noexcept { return destinations.empty(); }
+  // The page that holds what `page` held.
+  [[nodiscard]] uint32_t follow(uint32_t page) const noexcept {
+    return page >= firstPage && page - firstPage < destinations.size()
+               ? destinations[page - firstPage]
+               : page;
+  }
 };
 
 enum class KvPageAcquireFailure : uint8_t {
@@ -53,7 +76,9 @@ struct KvPageAcquisition {
 // directly allocate or release Metal memory. Free pages are handed out from
 // the allocated extent with the most live pages first, so partially used
 // extents fill up, empty extents are touched last, and cold extents drain to
-// empty, the only state in which an extent can be released.
+// empty, the only state in which an extent can be released. Held pages are
+// scattered over the extents all the same; compactExtent() empties one more
+// extent whenever the free pages of the others cover it.
 class KvPool final {
 public:
   explicit KvPool(kv::ExtentStorage &storage);
@@ -77,6 +102,14 @@ public:
   [[nodiscard]] uint32_t
   reclaimEmptyExtents(bool keepRunway,
                       uint32_t limit = std::numeric_limits<uint32_t>::max());
+  // Empties the allocated extent that holds the fewest pages, by moving each
+  // of them to a free page of the other extents that hold pages, fullest
+  // first: free pages scattered over the pool become an empty extent, which
+  // a reclaim releases. References move with their pages, and the result
+  // says where each went, for the caller to re-point whoever names them.
+  // Nothing moves, and the result is empty, unless those free pages cover
+  // the extent. An extent that holds a page of `fixed` is not emptied.
+  [[nodiscard]] KvPageMoves compactExtent(std::span<const uint32_t> fixed);
   [[nodiscard]] KvPoolSnapshot snapshot() const;
 
 private:
@@ -125,6 +158,9 @@ private:
   uint64_t extentReleases_ = 0;
   double extentAllocateMaxMilliseconds_ = 0.0;
   double extentReleaseMaxMilliseconds_ = 0.0;
+  uint64_t extentCompactions_ = 0;
+  uint64_t pagesMoved_ = 0;
+  double extentCompactMaxMilliseconds_ = 0.0;
   std::vector<PageRecord> pages_;
   std::vector<ExtentRecord> extents_;
   uint32_t freePages_ = 0;
