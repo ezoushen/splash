@@ -185,7 +185,10 @@ struct CacheFixture {
   std::vector<uint32_t> prompt;
   std::vector<uint64_t> blocks;
 
-  explicit CacheFixture(model::KvTier *tier = nullptr) : cache(pool, cacheNamespace(), tier) {
+  // With running, the request that cached the chain stays unfinished, so
+  // none of its KV is a victim, as for a request publishing its states.
+  explicit CacheFixture(model::KvTier *tier = nullptr, bool running = false)
+      : cache(pool, cacheNamespace(), tier) {
     for (uint32_t block = 0; block < 4; ++block) {
       for (uint32_t row = 0; row < KvCache::pageTokens; ++row)
         prompt.push_back(1000 + block * 100 + row);
@@ -197,7 +200,8 @@ struct CacheFixture {
     static_cast<void>(cache.publishCommittedBlocks(1, prompt, 128));
     for (uint32_t boundary = 32; boundary <= 128; boundary += 32)
       blocks.push_back(cache.blockAt(1, boundary));
-    cache.endRequest(1);
+    if (!running)
+      cache.endRequest(1);
   }
 
   void publish(uint32_t block, uint64_t bytes = 100) {
@@ -1025,12 +1029,12 @@ void testDemotionFreesTheBufferAtOnce() {
   auto control = std::make_shared<TransferControl>();
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control));
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOneState(), "required publication could not recycle a buffer");
+  require(fixture.cache.reclaimOneState().made, "required publication could not recycle a buffer");
   auto snapshot = fixture.cache.snapshot().stateCache;
   require(snapshot.entries == 2 && snapshot.bytes == 100 && snapshot.diskBytes == 100,
           "demotion took a second state or kept the victim's RAM");
   // One write in flight: a second victim inside the window is dropped.
-  require(fixture.cache.reclaimOneState(), "second recycle failed");
+  require(fixture.cache.reclaimOneState().made, "second recycle failed");
   snapshot = fixture.cache.snapshot().stateCache;
   require(snapshot.entries == 1 && snapshot.bytes == 0 && snapshot.offloads == 1,
           "second victim was written while a write was in flight");
@@ -1114,7 +1118,7 @@ void testRepublicationKeepsTheDiskCopy() {
 void testLostStatesAreCounted() {
   CacheFixture fixture;
   fixture.publish(3);
-  require(fixture.cache.reclaimOneState(), "state was not dropped");
+  require(fixture.cache.reclaimOneState().made, "state was not dropped");
   {
     auto lookup = fixture.lookup(129);
     require(lookup.kvBoundary == 128 && !lookup.state && lookup.lostState,
@@ -1130,7 +1134,7 @@ void testLostStatesAreCounted() {
     require(hit.state && !hit.lostState, "a disk hit was counted as a lost state");
   }
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TestState>(100), true);
-  require(fixture.cache.reclaimOneState(true), "checkpoint was not dropped");
+  require(fixture.cache.reclaimOneState(true).made, "checkpoint was not dropped");
   {
     auto shallow = fixture.lookup(65);
     require(!shallow.state && !shallow.lostState, "a dropped checkpoint counted as a lost state");
@@ -1290,7 +1294,7 @@ void testFailedWriteUnderALookup() {
     auto control = std::make_shared<TransferControl>();
     const auto block = fixture.blocks[3];
     publishReusable(fixture, block, std::make_shared<TieredState>(control));
-    require(fixture.cache.reclaimOneState(), "state was not demoted");
+    require(fixture.cache.reclaimOneState().made, "state was not demoted");
     auto reader = fixture.lookup(129);
     require(reader.state && !reader.state->state()->residentBytes(),
             "the state in flight was not served from disk");
@@ -1330,7 +1334,7 @@ void testFailedWriteIsCountedAfterItsEntryLeft() {
     const auto block = fixture.blocks[3];
     if (replaced) {
       publishReusable(fixture, block, std::make_shared<TieredState>(control));
-      require(fixture.cache.reclaimOneState(), "state was not demoted");
+      require(fixture.cache.reclaimOneState().made, "state was not demoted");
       {
         auto reader = fixture.lookup(129);
         fixture.cache.discardState(block, reader.state->state().get());
@@ -1518,7 +1522,7 @@ void testDemotionCostsNoSecondState() {
   auto control = std::make_shared<TransferControl>();
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control)); // A, A
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control)); // B
-  require(fixture.cache.reclaimOneState(), "no buffer was recycled for C");            // C needs a buffer
+  require(fixture.cache.reclaimOneState().made, "no buffer was recycled for C");            // C needs a buffer
   {
     auto b = fixture.lookup(129);
     require(b.state && b.state->kvBlock() == fixture.blocks[3] && b.state->state()->residentBytes() == 100,
@@ -1903,7 +1907,7 @@ void testWaitingCheckpointHoldsBackNothingElse() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
   fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOneState(), "first state was not written");
+  require(fixture.cache.reclaimOneState().made, "first state was not written");
   fixture.publish(2);
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control),
                                       true);
@@ -2825,9 +2829,10 @@ void testKvAStateInUseNeedsGoesLast() {
 // before the publication applies to it, and so does one on a block whose
 // state left and was published again. Only a publication that is itself in
 // use displaces a state in use, after every other state; ordinary and
-// optional publications never do.
+// optional publications never do. The chain's request runs, so no KV
+// competes with the states.
 void testStateUsesAreCountedPerBlock() {
-  CacheFixture fixture;
+  CacheFixture fixture(nullptr, true);
   const auto resident = [&](uint32_t block) {
     return fixture.cache.stateResident(fixture.blocks[block]);
   };
@@ -2942,7 +2947,7 @@ void testInUseWaitsForTransfersInFlight() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
   fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOneState(), "the first state was not written");
+  require(fixture.cache.reclaimOneState().made, "the first state was not written");
   // Only the transfer holds this state back: nothing needs to write it.
   StateUse use = fixture.cache.useState(fixture.blocks[1]);
   fixture.publish(1);
@@ -2993,12 +2998,13 @@ void testLaneTakesStatesInUseLast() {
 // A publication in use never drops a state in use for a busy write slot:
 // while the write in flight holds it nothing is recycled, and that
 // publication goes without. Once the slot is free, a publication in use
-// takes the state by writing it.
+// takes the state by writing it. The chain's request runs, so no KV is
+// left to make room with either.
 void testRecycleNeverDropsAStateInUseForTheWriteSlot() {
-  CacheFixture fixture;
+  CacheFixture fixture(nullptr, true);
   auto control = std::make_shared<TransferControl>();
   fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOneState(), "the first state was not written");
+  require(fixture.cache.reclaimOneState().made, "the first state was not written");
   StateUse held = fixture.cache.useState(fixture.blocks[1]);
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control));
   StateUse publishing = fixture.cache.useState(fixture.blocks[2]);
@@ -3017,9 +3023,10 @@ void testRecycleNeverDropsAStateInUseForTheWriteSlot() {
 // Disk replacement follows the class of the copy it makes room for: the
 // write of a state in use gives up ordinary copies first and the oldest copy
 // in use last, while an ordinary state's write never replaces a copy in use;
-// that state is dropped, as when the quota holds nothing to give.
+// that state is dropped, as when the quota holds nothing to give. The
+// chain's request runs, so only states compete.
 void testDiskReplacementTakesStatesInUseLast() {
-  CacheFixture fixture;
+  CacheFixture fixture(nullptr, true);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   // Probes find the copies without refreshing them.
@@ -3180,6 +3187,126 @@ void testInUseEvictionsCountChoices() {
           "a failed copy counted as an eviction of a state in use");
 }
 
+// Starts a request whose chain of whole pages stays active, as a running
+// request's does; its prompt and blocks, root first.
+std::pair<std::vector<uint32_t>, std::vector<uint64_t>>
+runChain(engine::Cache &cache, uint64_t id, uint32_t pages) {
+  std::vector<uint32_t> prompt(pages * KvCache::pageTokens + 1);
+  for (uint32_t row = 0; row < prompt.size(); ++row)
+    prompt[row] = static_cast<uint32_t>(1000 * id + row);
+  cache.beginRequest(id);
+  require(admitTokens(cache, id, pages * KvCache::pageTokens).granted(),
+          "the running request got no pages");
+  static_cast<void>(cache.publishCommittedBlocks(id, prompt, pages * KvCache::pageTokens));
+  std::vector<uint64_t> blocks;
+  for (uint32_t page = 1; page <= pages; ++page)
+    blocks.push_back(cache.blockAt(id, page * KvCache::pageTokens));
+  return {std::move(prompt), std::move(blocks)};
+}
+
+// A publication in use makes room as running work does: another
+// conversation's KV older than every ordinary state goes first, then that
+// state, then newer KV. Optional and ordinary publications take no KV, and
+// the running chain the publication belongs to is never a victim.
+void testPublicationInUseTakesOrdinaryKv() {
+  test::TestKvStorage storage{8, 100};
+  KvPool pool{storage};
+  engine::Cache cache(pool, cacheNamespace());
+  const auto older = cacheChain(cache, 1, 2).first;
+  const std::vector<uint64_t> stated = cacheChain(cache, 2, 2).second;
+  cache.publishCompositeState(stated[1], std::make_shared<TestState>(100));
+  const auto newer = cacheChain(cache, 3, 2);
+  const uint64_t point = runChain(cache, 4, 2).second[1];
+  StateUse use = cache.useState(point);
+  const auto blocks = [&] { return cache.snapshot().kvCache.blocks; };
+  require(!cache.reclaimOneState(true, point) && blocks() == 8,
+          "an optional publication took KV");
+  for (uint32_t leaf = 0; leaf < 2; ++leaf)
+    require(cache.reclaimOneState(false, point) && cache.stateResident(stated[1]),
+            "the older KV did not go before the newer ordinary state");
+  require(blocks() == 6 && cache.lookup(older).kvBoundary == 0 &&
+              pool.snapshot().pagesAllocated == 6,
+          "the older KV did not go with its extents");
+  require(cache.reclaimOneState(false, point) && !cache.stateResident(stated[1]) &&
+              blocks() == 6,
+          "the ordinary state did not go before newer KV");
+  require(!cache.reclaimOneState(false, newer.second[0]) && blocks() == 6,
+          "an ordinary publication took KV");
+  for (uint32_t leaf = 0; leaf < 2; ++leaf)
+    require(cache.reclaimOneState(false, point).made, "the KV of the old state did not go");
+  require(blocks() == 4 && cache.lookup(newer.first).kvBoundary == 64,
+          "newer KV went before older KV");
+  for (uint32_t leaf = 0; leaf < 2; ++leaf)
+    require(cache.reclaimOneState(false, point).made, "the newest KV did not go");
+  require(!cache.reclaimOneState(false, point) && blocks() == 2 &&
+              cache.snapshot().stateCache.inUseEvictions == 0,
+          "a publication took its own running chain");
+  cache.endRequest(4);
+}
+
+// While the engine may not grow, an extent's bytes give a snapshot nothing:
+// a publication in use leaves KV and extents where they are and recycles
+// states like any other publication, the oldest in use after the ordinary
+// ones. With growth each step says what it gave, buffers or an extent.
+void testPublicationInUseWithoutGrowthTakesStatesAlone() {
+  test::TestKvStorage storage{8, 100};
+  KvPool pool{storage};
+  engine::Cache cache(pool, cacheNamespace());
+  const auto older = cacheChain(cache, 1, 2).first;
+  const std::vector<uint64_t> stated = cacheChain(cache, 2, 2).second;
+  cache.publishCompositeState(stated[1], std::make_shared<TestState>(100));
+  const uint64_t other = runChain(cache, 3, 2).second[1];
+  StateUse held = cache.useState(other);
+  cache.publishCompositeState(other, std::make_shared<TestState>(100));
+  const uint64_t point = runChain(cache, 4, 2).second[1];
+  StateUse use = cache.useState(point);
+  const auto blocks = [&] { return cache.snapshot().kvCache.blocks; };
+  const auto allocated = [&] { return pool.snapshot().pagesAllocated; };
+  require(blocks() == 8 && allocated() == 8, "fixture geometry changed");
+
+  StateRoom room = cache.reclaimOneState(false, point, false);
+  require(room && !room.extent && !cache.stateResident(stated[1]) && blocks() == 8 &&
+              allocated() == 8 && cache.lookup(older).kvBoundary == 64,
+          "without growth the publication took KV ahead of the ordinary state");
+  room = cache.reclaimOneState(false, point, false);
+  require(room && !room.extent && !cache.stateResident(other) && blocks() == 8 &&
+              allocated() == 8 && cache.snapshot().stateCache.inUseEvictions == 1,
+          "without growth the publication took KV ahead of the state in use");
+  require(!cache.reclaimOneState(false, point, false) && blocks() == 8 && allocated() == 8,
+          "without growth the publication took KV once no state was left");
+  room = cache.reclaimOneState(false, point);
+  require(room && room.extent && blocks() == 7 && allocated() == 7,
+          "with growth the oldest KV did not go with its extent");
+  cache.endRequest(3);
+  cache.endRequest(4);
+}
+
+// A publication in use takes ordinary KV only: the KV another state in use
+// restores through stays, and running work takes it, last.
+void testPublicationInUseLeavesKvInUse() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage{4, 100};
+  KvPool pool{storage};
+  test::TestKvTier tier;
+  engine::Cache cache(pool, cacheNamespace(), &tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const std::vector<uint64_t> used = cacheChain(cache, 1, 2).second;
+  StateUse held = cache.useState(used[1]);
+  cache.publishCompositeState(used[1], std::make_shared<TieredState>(control));
+  require(cache.reclaimOne(reuse).madeProgress && cache.pollTransfers() &&
+              !cache.stateResident(used[1]),
+          "the state in use was not written");
+  const uint64_t point = runChain(cache, 2, 2).second[1];
+  StateUse use = cache.useState(point);
+  require(!cache.reclaimOneState(false, point) && cache.snapshot().kvCache.blocks == 4 &&
+              tier.demotions == 0,
+          "a publication in use took the KV a state in use restores through");
+  require(cache.reclaimOne(reuse).madeProgress && tier.demotions == 1,
+          "running work did not take the KV in use last");
+  cache.endRequest(2);
+}
+
 int main() {
   try {
     testStateInUseGoesLast();
@@ -3197,6 +3324,9 @@ int main() {
     testOrdinaryDemotionKeepsCopiesInUse();
     testPromotionSkipsForAStateInUse();
     testInUseEvictionsCountChoices();
+    testPublicationInUseTakesOrdinaryKv();
+    testPublicationInUseWithoutGrowthTakesStatesAlone();
+    testPublicationInUseLeavesKvInUse();
     testLargeSharedDiskRestore();
     testRestoreKeepsTheBlockItExtends();
     testDemotionKeepsThePageUnderANewState();

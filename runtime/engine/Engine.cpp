@@ -965,10 +965,21 @@ void Engine::publishReachedStateBoundaries(Request &active,
         }
         if (!state)
           state = model_.snapshot(active.request.id);
-        // A state in use is recycled only for a block in use, and never
-        // dropped for a busy write slot: this publication gives way instead.
-        if (!state && cache_.reclaimOneState(checkpoint, block)) {
-          state = model_.snapshot(active.request.id);
+        // Room comes from what this publication's class may take: cached KV
+        // and states in use only for a block in use. A state in use is never
+        // dropped for a busy write slot; this publication gives way instead.
+        // The command that reached this boundary is consumed and the next one
+        // not yet submitted, so KV that empties an extent releases it now. A
+        // recycled state hands over its buffers; an extent may hold less
+        // than a state, so room is made until the snapshot fits or nothing
+        // more of the class goes.
+        if (!state) {
+          StateRoom room;
+          do {
+            room = cache_.reclaimOneState(checkpoint, block, !growthPaused());
+            if (room)
+              state = model_.snapshot(active.request.id);
+          } while (!state && room.extent);
           if (state)
             ++counters_.recycledStatePublications;
         }

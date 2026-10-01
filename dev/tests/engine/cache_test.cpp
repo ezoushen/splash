@@ -325,6 +325,49 @@ void testReleaseTimeCoversOneExtent() {
           "the release time is not one extent's");
 }
 
+// KV gives a publication in use memory only through the extent it leaves
+// empty. An empty extent goes first. Then leaves go, oldest first, until one
+// leaves an extent empty, which is released before the call returns: the
+// snapshot that follows needs the memory at once.
+void testPublicationReleasesTheExtentItEmpties() {
+  Storage storage(16);
+  KvPool pool(storage);
+  engine::Cache resources(pool, cacheNamespace());
+  // The publishing request runs on the first extent.
+  const auto running = tokens(129);
+  resources.beginRequest(1);
+  require(resources.ensureTokens(1, 128).granted(), "the running request got no pages");
+  static_cast<void>(resources.publishCommittedBlocks(1, running, 128));
+  const uint64_t point = resources.blockAt(1, 128);
+  StateUse use = resources.useState(point);
+  // Another conversation's chain fills the second extent and half the third.
+  const auto other = tokens(193, 1000);
+  resources.beginRequest(2);
+  require(resources.ensureTokens(2, 192).granted(), "the other chain got no pages");
+  static_cast<void>(resources.publishCommittedBlocks(2, other, 192));
+  resources.endRequest(2);
+  // A request that cached nothing leaves the fourth extent empty.
+  resources.beginRequest(3);
+  require(resources.ensureTokens(3, 96).granted(), "the empty extent was not allocated");
+  resources.endRequest(3);
+  require(resources.snapshot().pool.reclaimableExtents == 1 && storage.allocatedPages() == 16,
+          "fixture geometry changed");
+
+  // An extent is room only for a snapshot that can allocate its bytes.
+  require(!resources.reclaimOneState(false, point, false) && storage.releasedExtents == 0 &&
+              resources.snapshot().kvCache.blocks == 10,
+          "a publication that cannot allocate released an extent or took KV");
+  StateRoom room = resources.reclaimOneState(false, point);
+  require(room && room.extent && storage.releasedExtents == 1 &&
+              resources.snapshot().kvCache.blocks == 10,
+          "the publication did not release the empty extent first");
+  room = resources.reclaimOneState(false, point);
+  require(room && room.extent && storage.releasedExtents == 2 &&
+              storage.allocatedPages() == 8 && resources.snapshot().kvCache.blocks == 8,
+          "the publication took more KV than its extent or kept the extent it emptied");
+  resources.endRequest(1);
+}
+
 } // namespace
 
 int main() {
@@ -337,6 +380,7 @@ int main() {
     testGrowthReclaimsOneWholeCachedExtent();
     testFragmentedColdKvPrecedesNewerState();
     testReplacementKeepsTheExtentItEmpties();
+    testPublicationReleasesTheExtentItEmpties();
     std::cout << "engine cache tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

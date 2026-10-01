@@ -519,17 +519,17 @@ attention layer, sized to leave the fewest of the budget's pages unused
 (`Layout::extentPagesFor`). The pool allocates an extent when it needs one of
 its pages. An extent whose last page is free stays allocated until a reclaim
 releases it, at once and only between commands: memory pressure, an admission
-the budget denies, or startup cleanup. Kernels reach a page through the GPU
-address in its request's page table, so no command binds KV; the residency
-set makes extents resident for every command. The host reaches the same
-memory (`PageStorage::spans`), which is how the disk tier moves pages. A
-reclaim returns free pages before it evicts anything: an empty extent as it
-is, and the free pages scattered over the others as soon as they cover the
-extent that holds the fewest pages, whose pages the pool copies to them
-(`KvPool::compactExtent`). The blocks and requests on those pages follow them,
-a page a disk transfer reads or writes stays where it is, and a pass that
-evicts everything copies only what is left afterwards. Every extent a pass
-empties is released.
+the budget denies, the publication of a replay point in use, or startup
+cleanup. Kernels reach a page through the GPU address in its request's page
+table, so no command binds KV; the residency set makes extents resident for
+every command. The host reaches the same memory (`PageStorage::spans`), which
+is how the disk tier moves pages. A reclaim returns free pages before it evicts
+anything: an empty extent as it is, and the free pages scattered over the
+others as soon as they cover the extent that holds the fewest pages, whose
+pages the pool copies to them (`KvPool::compactExtent`). The blocks and
+requests on those pages follow them, a page a disk transfer reads or writes
+stays where it is, and a pass that evicts everything copies only what is left
+afterwards. Every extent a pass empties is released.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
@@ -890,8 +890,11 @@ Until the request ends, suspended or not, that replay point is in use, and so
 is the KV it restores through. Cache victims come in three classes:
 checkpoints, then ordinary states and KV, then what is in use. No work
 displaces anything of a class above its own. Memory for running requests takes
-what is in use after everything else, a publication or disk copy in use may
-displace the oldest state in use, and ordinary or optional work never does.
+what is in use after everything else. A publication in use takes cached KV and
+states in the same order, then the oldest state in use: KV leaves go until one
+empties an extent, which is released at once, and the snapshot follows. Other
+publications recycle only states, a disk copy in use may displace the oldest
+copy in use, and ordinary or optional work never displaces anything in use.
 Nothing in use is pinned, so running work that needs the memory still takes it
 once nothing else is left. A resumed lane that lost its prompt's replay point
 rebuilds it on the way. `/status` reports under `state` the replay points
@@ -957,8 +960,9 @@ must leave the other its share. When the tier takes no more, admission waits
 for a transfer instead of evicting additional victims.
 
 A state with no available RAM cache slot can be written directly from its lane.
-When every state in RAM is in use, a replay point takes the slot of the oldest
-by writing that one out, and goes unpublished while the staging buffer is busy.
+When every state in RAM is in use and no cached KV is left to take, a replay
+point takes the slot of the oldest by writing that one out, and goes
+unpublished while the staging buffer is busy.
 Rolling checkpoints replace the least recently used copies like any state, so
 a suspended request keeps its progress when the quota is full; they retire when
 replaced or no longer needed. With the disk tier enabled, a checkpoint less than one full
