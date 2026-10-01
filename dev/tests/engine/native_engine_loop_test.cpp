@@ -67,7 +67,6 @@ public:
   std::shared_ptr<bool> ticketReady;
   std::function<void()> onSubmit;
   std::function<void()> onHealthCheck;
-  bool pendingHealth = false;
   // Score requests whose final prompt chunk reports a per-lane model failure.
   std::unordered_set<uint64_t> invalidScores;
   // The request flags each request began with.
@@ -80,7 +79,6 @@ public:
     if (onHealthCheck)
       onHealthCheck();
   }
-  bool needsHealthCheck() const noexcept override { return pendingHealth; }
   StateAdmission begin(const ModelRequest &request) override {
     beganFlags[request.id] = request.flags;
     for (uint32_t slot = 0; slot < model::ExecutionLimits::maximumBatchWidth;
@@ -689,15 +687,10 @@ void testCommandWatchdogAndPendingHealthWake() {
   KvPool pool(backing);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
-  executor.pendingHealth = true; // A command can outlive all requests.
   engine::NativeRuntime loop({}, resources, executor,
       [](std::span<const uint8_t>) {}, [] { return std::string("{}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 0.0; }});
-  require(!loop.tick() && loop.idle() &&
-              loop.millisecondsUntilNextWakeup() == 1000.0,
-          "an idle outstanding backend operation lost its health wake");
-  executor.pendingHealth = false;
-  require(!loop.millisecondsUntilNextWakeup(),
+  require(!loop.tick() && loop.idle() && !loop.millisecondsUntilNextWakeup(),
           "fully idle engine retained a polling wake");
 }
 

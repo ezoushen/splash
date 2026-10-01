@@ -471,7 +471,6 @@ class Model {
 public:
   virtual ~Model() = default;
   virtual void checkHealth() {}
-  [[nodiscard]] virtual bool needsHealthCheck() const noexcept { return false; }
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
   // Safe-point preemption releases execution backing, retaining only the
   // request's host-side sampling/constraint continuation. Resume replays the

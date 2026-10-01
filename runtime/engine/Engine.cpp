@@ -284,7 +284,7 @@ bool Engine::drainingForRecovery() const {
 
 std::optional<double> Engine::nextWakeupMilliseconds() const {
   std::optional<double> result;
-  if (pending_ || model_.needsHealthCheck())
+  if (pending_)
     result = nextHealthCheckMilliseconds_;
   const bool draining = drainingForRecovery();
   if (draining && (!result || drainEndMilliseconds_ < *result))

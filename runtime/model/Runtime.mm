@@ -1779,10 +1779,6 @@ Runtime::~Runtime() = default;
 
 void Runtime::checkHealth() { impl_->backend.checkHealth(); }
 
-bool Runtime::needsHealthCheck() const noexcept {
-  return impl_->backend.needsHealthCheck();
-}
-
 void Runtime::beginColdRequest(const ModelRequest &request,
                                uint32_t stateSlot) {
   if (auto admission = beginAt(request, stateSlot); !admission) {

@@ -302,7 +302,6 @@ public:
   // completion here if the driver callback is delayed.
   // Timeout marks the backend unhealthy without releasing in-flight resources.
   void checkHealth();
-  [[nodiscard]] bool needsHealthCheck() const noexcept;
   [[nodiscard]] std::string unhealthyReason() const;
 
 private:
