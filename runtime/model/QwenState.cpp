@@ -257,9 +257,8 @@ QwenStateStorage::tryActivateSlot(uint32_t index, uint64_t requestId, uint64_t e
     throw std::logic_error("idle Qwen state slot still owns buffers");
   }
   Buffers buffers;
-  if (auto admission = acquire(static_cast<uint32_t>(current.gdn.size()),
-                               "qwen-state-cell-" + std::to_string(index), buffers,
-                               extraBytes, allocateExtra);
+  if (auto admission = acquire(kLaneCells, "qwen-state-cell-" + std::to_string(index),
+                               buffers, extraBytes, allocateExtra);
       !admission)
     return admission;
   current.gdn = std::move(buffers.gdn);
@@ -294,8 +293,22 @@ void QwenStateStorage::releaseSlot(uint32_t index, uint64_t requestId) {
   current.metadata = {};
 }
 
-uint64_t QwenStateStorage::releaseIdle(uint32_t keepCells,
-                                       uint32_t keepRings) noexcept {
+uint64_t QwenStateStorage::releaseIdle(bool keepLane) noexcept {
+  return releaseIdleBeyond(keepLane ? kLaneCells : 0, keepLane ? 1 : 0);
+}
+
+uint64_t QwenStateStorage::releaseOneIdle(bool keepLane) noexcept {
+  const uint32_t cells = idleCells();
+  const uint32_t rings = idleRings();
+  if (cells > (keepLane ? kLaneCells : 0))
+    return releaseIdleBeyond(cells - 1, rings);
+  if (rings > (keepLane ? 1U : 0U))
+    return releaseIdleBeyond(cells, rings - 1);
+  return 0;
+}
+
+uint64_t QwenStateStorage::releaseIdleBeyond(uint32_t keepCells,
+                                             uint32_t keepRings) noexcept {
   const uint64_t before = backend_.memoryStats().allocatedBytes;
   while (pool_->cells.size() > keepCells)
     pool_->cells.pop_back();

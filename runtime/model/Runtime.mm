@@ -1811,7 +1811,6 @@ void Runtime::suspend(uint64_t requestId) {
     throw std::logic_error("Qwen request cannot be suspended");
   }
   impl_->states.releaseSlot(entry.slot, requestId);
-  static_cast<void>(impl_->states.releaseIdle(0, 0));
   impl_->pageTableBindings[entry.slot] = {};
   entry.images.clear();
   entry.draftContextPlan.reset();
@@ -2367,14 +2366,8 @@ Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
 uint64_t Runtime::reclaimIdleState(bool keepLane) noexcept {
   // One idle buffer per call, so a denied allocation frees only what it
   // needs; rebuildable caches go once the pool has nothing more to give.
-  const uint32_t keptCells = keepLane ? QwenStateStorage::kLaneCells : 0;
-  const uint32_t keptRings = keepLane ? 1 : 0;
-  const uint32_t cells = impl_->states.idleCells();
-  const uint32_t rings = impl_->states.idleRings();
-  if (cells > keptCells)
-    return impl_->states.releaseIdle(cells - 1, rings);
-  if (rings > keptRings)
-    return impl_->states.releaseIdle(cells, rings - 1);
+  if (const uint64_t buffer = impl_->states.releaseOneIdle(keepLane))
+    return buffer;
   uint64_t released = 0;
   released += impl_->dropEmbeddingCache();
   if (impl_->vision && impl_->visionIdle()) {

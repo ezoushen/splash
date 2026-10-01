@@ -218,9 +218,11 @@ private:
   [[nodiscard]] Prepared prepare(BatchPlan &plan,
                                  std::vector<ModelBatchItem> &items,
                                  double nowMilliseconds);
-  [[nodiscard]] CacheReclaimResult reclaimForGrowth(
-      CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
-  [[nodiscard]] bool reclaimIdleState() noexcept;
+  // What a denied allocation was for. Idle memory of that kind stays for it
+  // to reuse; idle memory of the other kind is released first.
+  enum class Growth : uint8_t { State, Kv };
+  [[nodiscard]] CacheReclaimResult reclaimForGrowth(Growth growth);
+  [[nodiscard]] bool reclaimIdleState(bool keepLane) noexcept;
   [[nodiscard]] CacheReclaimResult reuseIdleBackingWhilePaused(
       const TokenAdmission &admission);
   [[nodiscard]] bool growthPaused() const;

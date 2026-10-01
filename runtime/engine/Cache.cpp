@@ -463,10 +463,6 @@ bool Cache::reclaimMet(uint64_t releasedBytes, uint64_t targetBytes,
 }
 
 
-void Cache::releaseUnusedKvBacking() {
-  static_cast<void>(pool_.reclaimEmptyExtents(true));
-}
-
 // Disk tier: restores and demotions in flight, the quota they draw on, and
 // states promoted back into RAM.
 

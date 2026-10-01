@@ -504,7 +504,8 @@ bool Engine::admit(Request &active, double now) {
       const bool hostPressure =
           admission.allocationFailure == metal::AllocationFailure::HostPressure;
       const CacheReclaimResult reclaimed =
-          hostPressure ? CacheReclaimResult{reclaimIdleState()} : reclaimForGrowth();
+          hostPressure ? CacheReclaimResult{reclaimIdleState(true)}
+                       : reclaimForGrowth(Growth::State);
       if (reclaimed.madeProgress) {
         admission = activate();
         continue;
@@ -1112,7 +1113,7 @@ Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attem
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
     const CacheReclaimResult progress = paused
         ? reuseIdleBackingWhilePaused(admission)
-        : reclaimForGrowth(CacheReclaimMode::ReuseBacking);
+        : reclaimForGrowth(Growth::Kv);
     if (!progress.madeProgress) {
       pendingReclaim = progress.pending;
       break;
@@ -1135,22 +1136,28 @@ bool Engine::growthPaused() const {
   return config_.growthPaused && config_.growthPaused();
 }
 
-CacheReclaimResult Engine::reclaimForGrowth(CacheReclaimMode mode) {
-  if (reclaimIdleState())
+// One reclaim step for an allocation the governor denied. Idle memory of the
+// kind it takes stays for it to reuse: the pooled buffers a lane starts from
+// for a lane's state, which its activation takes, and resident extents for
+// KV. Idle memory of the other kind goes first, then one victim of the cache.
+CacheReclaimResult Engine::reclaimForGrowth(Growth growth) {
+  const bool state = growth == Growth::State;
+  if (reclaimIdleState(state))
     return {true, 0};
   // The background pressure controller owns physical shrink. Retrying a
   // paused allocator here would drain the cache before macOS can acknowledge
   // any reclaimed bytes.
   if (growthPaused())
     return {};
-  const CacheReclaimResult reclaimed = cache_.reclaimOne(mode);
+  const CacheReclaimResult reclaimed = cache_.reclaimOne(
+      state ? CacheReclaimMode::ReleaseBacking : CacheReclaimMode::ReuseBacking);
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed;
 }
 
-bool Engine::reclaimIdleState() noexcept {
-  if (!model_.reclaimIdleState(false))
+bool Engine::reclaimIdleState(bool keepLane) noexcept {
+  if (!model_.reclaimIdleState(keepLane))
     return false;
   signalResourceProgress();
   return true;
@@ -1165,7 +1172,7 @@ bool Engine::reclaimIdleState() noexcept {
 // that must wait for the transfer in flight makes the request wait with it,
 // as it does without the pause.
 CacheReclaimResult Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
-  if (reclaimIdleState())
+  if (reclaimIdleState(false))
     return {true, 0};
   const KvPoolSnapshot pool = cache_.snapshot().pool;
   // Cached prefixes can also have active owners; those pages cannot be reused.

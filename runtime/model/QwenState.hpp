@@ -94,7 +94,7 @@ struct QwenCacheSlot final {
 
 // Free buffers available for reuse: a lane takes two cells and a ring, a
 // cached state one of each. Both return them here; idle buffers are released
-// only by explicit reclaim.
+// only by reclaim.
 struct QwenBufferPool final {
   std::vector<std::shared_ptr<QwenGdnCell>> cells;
   std::vector<std::shared_ptr<DFlashDraftRing>> rings;
@@ -193,10 +193,12 @@ public:
                   const std::function<void()> &allocateExtra = {});
   void releaseSlot(uint32_t slot, uint64_t requestId);
 
-  // Returns pooled buffers beyond the kept counts to macOS. Active lanes and
-  // cached states are never moved or reclaimed.
-  [[nodiscard]] uint64_t releaseIdle(uint32_t keepCells,
-                                     uint32_t keepRings) noexcept override;
+  // Returns pooled buffers to macOS, all but one lane's cells and ring when
+  // keepLane. Active lanes and cached states are never moved or reclaimed.
+  [[nodiscard]] uint64_t releaseIdle(bool keepLane) noexcept override;
+  // The same for one pooled buffer, a cell before a ring: what a reclaim
+  // step for a denied allocation releases. Zero when none is left to give.
+  [[nodiscard]] uint64_t releaseOneIdle(bool keepLane) noexcept;
   [[nodiscard]] uint32_t idleCells() const noexcept;
   [[nodiscard]] uint32_t idleRings() const noexcept;
 
@@ -248,7 +250,7 @@ private:
   // admission for everything the pool lacks and for the caller's extra. A
   // refusal allocates nothing and takes nothing from the pool.
   struct Buffers final {
-    std::array<std::shared_ptr<QwenGdnCell>, 2> gdn;
+    std::array<std::shared_ptr<QwenGdnCell>, kLaneCells> gdn;
     std::shared_ptr<DFlashDraftRing> draft;
   };
   [[nodiscard]] metal::AllocationResult
@@ -257,6 +259,7 @@ private:
   // The bytes of the cells and the ring the pool lacks of that.
   [[nodiscard]] uint64_t missingBytes(uint32_t cells) const noexcept;
   static void refreshViews(Slot &slot);
+  [[nodiscard]] uint64_t releaseIdleBeyond(uint32_t cells, uint32_t rings) noexcept;
   void restoreLengths(uint32_t slot, QwenLogicalLengths lengths, bool restoreDraft);
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t slot, QwenLogicalLengths lengths);

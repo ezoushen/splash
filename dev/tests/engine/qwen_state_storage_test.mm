@@ -12,6 +12,7 @@
 #include <iostream>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -193,7 +194,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
   source.reset();
   require(storage.idleCells() == 1 && storage.idleRings() == 1,
           "demotion did not return the source buffers at once");
-  static_cast<void>(storage.releaseIdle(0, 0));
+  static_cast<void>(storage.releaseIdle(false));
   require(finishWhenReady(*write), "disk write failed");
   write.reset();
   const auto beforeRestore = storage.actualAllocatedBytes();
@@ -545,7 +546,7 @@ void run(const std::string &metallib) {
     const uint64_t beforeSuspend = storage.actualAllocatedBytes();
     const uint64_t releasedSlotBytes = storage.actualSlotBytes(0);
     storage.releaseSlot(0, 303);
-    require(storage.releaseIdle(0, 0) == releasedSlotBytes,
+    require(storage.releaseIdle(false) == releasedSlotBytes,
             "recomputation preemption retained active backing");
     require(!storage.metadata(0).assigned && storage.actualSlotBytes(0) == 0 &&
                 storage.actualAllocatedBytes() == beforeSuspend - releasedSlotBytes,
@@ -595,7 +596,7 @@ void run(const std::string &metallib) {
     pooled.reset();
     require(storage.actualAllocatedBytes() == beforeDrop,
             "second dropped cached state was freed instead of pooled");
-    require(storage.releaseIdle(0, 0) == observedPrefixActual &&
+    require(storage.releaseIdle(false) == observedPrefixActual &&
                 storage.actualAllocatedBytes() ==
                     beforeDrop - observedPrefixActual,
             "releaseIdle did not free the pooled cache slot");
@@ -619,11 +620,11 @@ void run(const std::string &metallib) {
     require(storage.idleCells() == 5 && storage.idleRings() == 3,
             "dropped cached state did not return its buffers to the pool");
     // Releasing down to one lane's worth keeps two cells and one ring warm.
-    require(storage.releaseIdle(2, 1) ==
+    require(storage.releaseIdle(true) ==
                 observedSlotActual + observedPrefixActual &&
                 storage.idleCells() == 2 && storage.idleRings() == 1,
             "partial idle release did not keep the requested buffers");
-    require(storage.releaseIdle(0, 0) == observedSlotActual,
+    require(storage.releaseIdle(false) == observedSlotActual,
             "idle lane buffers were not reclaimed");
     require(storage.idleCells() == 0 && storage.idleRings() == 0,
             "reclaimed buffers remain pooled");
@@ -645,7 +646,7 @@ void run(const std::string &metallib) {
     // With one cell and the ring in the pool the lane lacks a cell: a refusal
     // leaves both pooled, and the retry is admitted that cell alone.
     storage.releaseSlot(0, 505);
-    require(storage.releaseIdle(1, 1) != 0 && storage.idleCells() == 1 &&
+    require(storage.releaseOneIdle(false) != 0 && storage.idleCells() == 1 &&
                 storage.idleRings() == 1,
             "fixture pool does not hold one cell and the ring");
     const uint64_t pooledBytes = storage.actualAllocatedBytes();
@@ -662,7 +663,7 @@ void run(const std::string &metallib) {
                 storage.actualSlotBytes(0) == observedSlotActual,
             "the retry did not take the pooled buffers and one admission for the rest");
     storage.releaseSlot(0, 506);
-    require(storage.releaseIdle(0, 0) == observedSlotActual &&
+    require(storage.releaseIdle(false) == observedSlotActual &&
                 storage.actualAllocatedBytes() == 0,
             "the lane's buffers were not reclaimed");
     // What else a request's start allocates joins the lane's admission: one
@@ -680,7 +681,7 @@ void run(const std::string &metallib) {
                 storage.actualSlotBytes(0) == observedSlotActual,
             "a start was not admitted in one piece");
     storage.releaseSlot(0, 507);
-    require(storage.releaseIdle(0, 0) == observedSlotActual &&
+    require(storage.releaseIdle(false) == observedSlotActual &&
                 storage.actualAllocatedBytes() == 0,
             "the started lane's buffers were not reclaimed");
   }

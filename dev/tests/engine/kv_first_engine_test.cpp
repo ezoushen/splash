@@ -385,6 +385,8 @@ public:
   }
   uint64_t reclaimIdleState(bool keepLane) noexcept override {
     keptLane = keepLane;
+    if (!keepLane && pooledLaneBytes)
+      return std::exchange(pooledLaneBytes, 0);
     const uint64_t released = reclaimableIdleStateBytes;
     reclaimableIdleStateBytes = 0;
     reclaimedIdleStateBytes += released;
@@ -449,6 +451,9 @@ public:
   bool restoredDraft = false;
   metal::AllocationFailure beginAllocationFailure = metal::AllocationFailure::None;
   uint64_t reclaimableIdleStateBytes = 0;
+  // The pooled buffers a lane starts from; only a reclaim that does not keep
+  // the lane releases them.
+  uint64_t pooledLaneBytes = 0;
   uint64_t reclaimedIdleStateBytes = 0;
   bool keptLane = false;
   bool *physicalGrowthBlocked = nullptr;
@@ -2932,6 +2937,35 @@ void testBudgetDenialRetriesAfterRelease() {
 // takes that room once: its retries, each after one cached prefix is
 // evicted, reuse the extents the denied attempts allocated rather than
 // releasing and allocating them again.
+// A lane's admission keeps the pooled buffers a lane starts from: its
+// activation takes them, so releasing them would only make the retry allocate
+// them again. KV growth has no use for them and releases them.
+void testStateAdmissionKeepsThePooledLaneBuffers() {
+  for (bool state : {true, false}) {
+    Backing backing(8);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor executor(1);
+    executor.pooledLaneBytes = 4096;
+    Events events;
+    engine::Engine engine({}, cache, executor, events);
+    if (state) {
+      executor.beginGrowthBlocked = [] { return true; };
+      executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
+    } else {
+      backing.growthBlocked = true;
+      backing.allocationFailure = metal::AllocationFailure::EngineBudget;
+    }
+    engine.submit(request(286, {286}));
+    static_cast<void>(engine.tick(1));
+    require(engine.idle() &&
+                events.failures == std::vector<std::string>{"capacity_exhausted"} &&
+                (executor.pooledLaneBytes != 0) == state,
+            state ? "a lane's admission released the pooled buffers it starts from"
+                  : "KV growth kept idle state buffers it cannot use");
+  }
+}
+
 void testDeniedGrowthAllocatesEachExtentOnce() {
   constexpr uint32_t cachedExtents = 24;
   constexpr uint32_t budgetExtents = 32;
@@ -5338,6 +5372,7 @@ int main() {
     testRecoveryAdmitsFailedKvTargetBeforeReplaying();
     testFailedResumeRestoreKeepsTheKvTarget();
     testBudgetDenialRetriesAfterRelease();
+    testStateAdmissionKeepsThePooledLaneBuffers();
     testDeniedGrowthAllocatesEachExtentOnce();
     testGrowthBeyondTheBudgetFailsAtOnce();
     testReclaimPassReleasesEveryEmptyExtent();

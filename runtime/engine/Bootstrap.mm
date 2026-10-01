@@ -373,9 +373,10 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         // Wider batches and cache backing grow on demand after Ready.
         ActualMemoryReport report = resourcesPointer->actualMemoryReport(
             modelPointer->actualRuntimeMemory(), estimatedPeakBytes);
-        // Keep one lane's worth of warm buffers for the first request.
-        static_cast<void>(resourcesPointer->stateStorage().releaseIdle(2, 1));
-        resourcesPointer->cache().releaseUnusedKvBacking();
+        // Keep what the first request starts from: one lane's state buffers
+        // and one empty KV extent. No cache data is evicted.
+        static_cast<void>(resourcesPointer->stateStorage().releaseIdle(true));
+        static_cast<void>(resourcesPointer->cache().reclaimCache(0, false, false, true));
         resourcesPointer->memoryGovernor().markServingFootprint();
         return report;
       },

@@ -483,6 +483,10 @@ void requireAtomicImageAdmission(model::Runtime &executor,
       require(executor.begin(text.modelView()).granted(),
               "image resume setup failed");
       executor.suspend(text.id);
+      // The suspended lane's buffers go back: what a reclaim finds after a
+      // failed start below is then that start's own.
+      while (executor.reclaimIdleState(false)) {
+      }
     }
     for (bool sharedVision : {false, true}) {
       EngineRequest keeper = image;
@@ -586,7 +590,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
 
   // Free only pooled state, keeping the image cache. A cache-only request
   // must fit a fresh state cell without recreating the reclaimed encoder.
-  static_cast<void>(states.releaseIdle(0, 0));
+  static_cast<void>(states.releaseIdle(false));
   const uint64_t stateBytes = model.stateLayout().activeCellBytes();
   require(stateBytes < encoderBytes, "image budget fixture cannot deny the encoder");
   const uint64_t beforeReuse = backend.memoryStats().allocatedBytes;
@@ -968,7 +972,7 @@ int main(int argc, char **argv) {
     kvAdmissionFailure = metal::AllocationFailure::None;
     require(static_cast<bool>(pages.ensureResident(0)),
             "warmup refusal fixture failed to recover KV admission");
-    static_cast<void>(states.releaseIdle(0, 0));
+    static_cast<void>(states.releaseIdle(false));
     // The engine refuses image requests to a model without vision before they
     // reach the runtime, which treats one as a broken invariant.
     if (model.descriptor.hasVision()) {
@@ -2151,8 +2155,8 @@ int main(int argc, char **argv) {
                                         ? sampleCommittedState(states, slot)
                                         : StateSamples{};
         executor.suspend(sequence.id);
-        require(states.actualAllocatedBytes() == 0,
-                "preempted request retained GDN/draft backing");
+        require(states.actualSlotBytes(slot) == 0,
+                "preempted request retained its GDN/draft buffers");
         if (deliverInitialMask) {
           const std::array<uint32_t, 1> anchor{100};
           executor.provideMask(sequence.id, singletonMasks(anchor));
@@ -2169,8 +2173,8 @@ int main(int argc, char **argv) {
                                    pageTable, cohort),
                       "interrupted state replay");
           executor.suspend(sequence.id);
-          require(states.actualAllocatedBytes() == 0,
-                  "repeated preemption retained state backing");
+          require(states.actualSlotBytes(slot) == 0,
+                  "repeated preemption retained its state buffers");
           admission = executor.resume(sequence.modelView());
           require(admission.granted(), "repeated recompute admission failed");
           slot = *admission.cell;

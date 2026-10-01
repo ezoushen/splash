@@ -311,10 +311,10 @@ class StateStorage {
 public:
   virtual ~StateStorage() = default;
   [[nodiscard]] virtual uint64_t actualAllocatedBytes() const noexcept = 0;
-  // Frees pooled idle buffers beyond the counts kept warm and returns the
-  // bytes released. Active lanes and cached states are never touched.
-  [[nodiscard]] virtual uint64_t releaseIdle(uint32_t keepCells,
-                                             uint32_t keepRings) noexcept = 0;
+  // Frees pooled idle buffers, all but what one lane starts from when
+  // keepLane, and returns the bytes released. Active lanes and cached states
+  // are never touched.
+  [[nodiscard]] virtual uint64_t releaseIdle(bool keepLane) noexcept = 0;
 };
 
 // One slot of the disk tier holding a KV page; releasing the last handle
