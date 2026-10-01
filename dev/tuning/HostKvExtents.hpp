@@ -62,8 +62,8 @@ public:
     return {extentPages, (pages + extentPages - 1) / extentPages};
   }
 
-  // Shared buffers of the backend, zero-filled, which its residency set keeps
-  // resident for every command.
+  // Shared buffers of the backend, zero-filled, resident for every command
+  // like every backend buffer.
   HostKvExtents(metal::MetalBackend &backend, kv::Layout layout,
                 uint32_t extentPages, uint32_t extents)
       : layout_(layout), extentPages_(extentPages) {
@@ -71,7 +71,6 @@ public:
       metal::MetalBuffer buffer = backend.allocateBuffer(
           extentBytes(layout, extentPages), metal::BufferStorage::Shared,
           "host-kv-extent");
-      backend.keepResident(buffer);
       auto *contents = static_cast<std::byte *>(buffer.contents());
       std::fill_n(contents, buffer.sizeBytes(), std::byte{0});
       extents_.push_back({contents, buffer.gpuAddress()});

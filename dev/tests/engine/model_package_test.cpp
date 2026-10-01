@@ -389,15 +389,6 @@ void testWeightFileValidationAndLifetime(MetalBackend &backend,
                 "GPU read of retained mapped weights was incorrect");
         requireCleanFileMapping(mappedAddress);
     }
-    // The file object is gone but its weights are not: the base is still
-    // kept resident, so keeping it again throws.
-    bool kept = false;
-    try {
-        backend.keepResident(retained);
-    } catch (const splash::metal::MetalBackendError &) {
-        kept = true;
-    }
-    require(kept, "mapped weights were not kept resident");
     retained = MetalBuffer{};
     require(backend.memoryStats().allocatedBytes == baseline,
             "released mapped buffer remains in backend accounting");

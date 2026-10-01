@@ -504,11 +504,14 @@ Runtime admission counts prepared weights, draft and vision exactly once
 too). Before loading, startup refuses a model whose prepared weights, with the
 pipeline and runtime reserves, one state cell, one KV extent and any disk tier
 KV staging, exceed the hard budget, so a model that can never fit is not
-prepared. File backing does not make Metal-resident pages reclaimable, and
-`WeightFile` keeps its buffer resident (`MetalBackend::keepResident`): the
-weights stay wired between requests until 10 minutes pass without a command,
-and the next command wires them again. macOS page cache, driver allocations and
-other applications still affect memory pressure and swap.
+prepared. File backing does not make Metal-resident pages reclaimable.
+Every buffer the backend allocates or wraps belongs to one residency set
+attached to its command queue (`MetalBackend::allocateBuffer`): weights, KV
+extents, state cells and draft rings, and scratch alike stay wired between
+requests until 10 minutes pass without a command, and the next command wires
+them again. Memory returns to macOS when the engine releases it, never because
+macOS compressed or dropped an idle buffer. macOS page cache, driver
+allocations and other applications still affect memory pressure and swap.
 
 KV pages live in extents: ordinary private Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, with a 64 KiB-aligned region per
@@ -517,8 +520,8 @@ attention layer, sized to leave the fewest of the budget's pages unused
 its pages. An extent whose last page is free stays allocated until a reclaim
 releases it, at once and only between commands: memory pressure, an admission
 the budget denies, or startup cleanup. Kernels reach a page through the GPU
-address in its request's page table, so no command binds KV; extents join the
-weights' residency set and stay wired as they do. A reclaim pass releases every
+address in its request's page table, so no command binds KV; the residency
+set makes extents resident for every command. A reclaim pass releases every
 extent that is empty or that its evictions empty. `/status` reports under `kv`
 the extents allocated and released, the longest growth and the longest release
 pass, evictions within it included.

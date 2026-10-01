@@ -198,9 +198,9 @@ struct MetalAllocation {
     std::shared_ptr<AllocationAccounting> accounting;
     uint64_t bytes = 0;
     BufferStorage storage = BufferStorage::Shared;
-    // Non-empty while a member of the residency set: kept resident or
-    // addressed. The set retains the buffer, and with it the backing, so the
-    // last view takes it out.
+    // The residency set the buffer belongs to, held weakly as allocations
+    // may outlive the backend. The set retains the buffer, and with it its
+    // memory, so the last view takes it out.
     std::weak_ptr<Residency> residency;
 
     ~MetalAllocation() {
@@ -475,6 +475,8 @@ struct MetalBackend::Impl {
         allocation->accounting = accounting;
         allocation->bytes = buffer.allocatedSize;
         allocation->storage = storage;
+        residency->add(buffer);
+        allocation->residency = residency;
         raisePeak(accounting->peakAllocatedBytes,
                   accounting->allocatedBytes.fetch_add(
                       allocation->bytes, std::memory_order_relaxed) +
@@ -762,10 +764,7 @@ MetalBuffer MetalBackend::allocateAddressed(uint64_t bytes,
             " bytes for an addressed buffer of " + std::to_string(bytes));
     }
     if (!label.empty()) buffer.label = checkedNSString(label, "buffer label");
-    MetalBuffer result = impl_->registerBuffer(buffer, BufferStorage::Private);
-    impl_->residency->join(buffer);
-    result.impl_->allocation->residency = impl_->residency;
-    return result;
+    return impl_->registerBuffer(buffer, BufferStorage::Private);
 }
 
 MetalBuffer MetalBackend::wrapSharedMemory(
@@ -832,15 +831,6 @@ MetalBuffer MetalBackend::view(const MetalBuffer &base,
     result->offsetBytes = base.impl_->offsetBytes + offsetBytes;
     result->lengthBytes = lengthBytes;
     return MetalBuffer(std::move(result));
-}
-
-void MetalBackend::keepResident(const MetalBuffer &buffer) {
-    MetalAllocation &allocation = impl_->allocationOf(buffer);
-    if (!allocation.residency.expired()) {
-        throw MetalBackendError("Metal buffer is already kept resident");
-    }
-    impl_->residency->add(allocation.buffer);
-    allocation.residency = impl_->residency;
 }
 
 uint64_t MetalBackend::lapsedResidentBytes() const noexcept {

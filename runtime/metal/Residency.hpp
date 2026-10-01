@@ -12,10 +12,10 @@
 
 namespace splash::metal {
 
-// Holds the buffers of one residency set wired between the commands of a
-// command queue. Metal wires them while a command runs and lets them go a few
-// seconds later, and one request holds them only about two seconds, so a
-// heartbeat requests residency every 500 ms. After keepAlive without a command
+// Holds every buffer of a backend in one residency set, wired between the
+// commands of its command queue. Metal wires them while a command runs and
+// lets them go a few seconds later, and one request holds them only about two
+// seconds, so a heartbeat requests residency every 500 ms. After keepAlive without a command
 // it ends residency, which Metal applies at its next GPU operation on any
 // queue: one dispatch of the kick kernel, whose pipeline the backend builds
 // with its library, on a queue of its own, as the runtime keeps exactly one
@@ -77,18 +77,6 @@ public:
       bytes_ += buffer.allocatedSize;
     }
     use();
-  }
-
-  // Makes the buffer a member without requesting residency. While the set is
-  // held, Metal wires it before the commit returns; after a lapse, the next
-  // command wires it with the rest of the set.
-  void join(id<MTLBuffer> buffer) {
-    dispatch_sync(queue_, ^{
-      [set_ addAllocation:buffer];
-      [set_ commit];
-    });
-    std::lock_guard lock(mutex_);
-    bytes_ += buffer.allocatedSize;
   }
 
   void remove(id<MTLBuffer> buffer) {

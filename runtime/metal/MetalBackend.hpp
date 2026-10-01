@@ -208,8 +208,8 @@ private:
 // Permits exactly one submitted-but-not-applied command on its command queue.
 class MetalBackend final {
 public:
-  // Buffers kept resident stay wired until residencyKeepAliveSeconds pass
-  // without a command.
+  // Every buffer stays wired until residencyKeepAliveSeconds pass without a
+  // command (see allocateBuffer).
   explicit MetalBackend(std::string metallibPath,
                         double commandTimeoutSeconds = 120.0,
                         double residencyKeepAliveSeconds = 600.0);
@@ -228,17 +228,22 @@ public:
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
 
+  // Every buffer the backend allocates or wraps belongs to one residency set,
+  // attached to the command queue, until its last view is gone. Metal by
+  // itself wires a buffer only while a command uses it and a few seconds
+  // after, so memory pressure could compress idle state or drop idle weights
+  // and the next request would wait to get them back. A member is wired from
+  // its allocation on until the keep-alive passes without a command, and
+  // again from the next command: memory goes back to macOS when the engine
+  // releases it, not when macOS chooses.
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage = BufferStorage::Shared,
                  std::string_view label = {});
   // A private, hazard-untracked buffer that kernels reach only through GPU
-  // addresses held in other buffers, as they reach KV pages. It belongs to
-  // the residency set of kept buffers until its last view is gone; the set
-  // is attached to the command queue, so every command has it resident and
-  // nothing names it per command or dispatch. While the set is held, Metal
-  // wires the buffer before this returns; after a lapse, the next command
-  // wires it with the rest of the set. Fails with MetalAllocationError unless
-  // Metal allocates exactly `bytes`, the amount admission charged.
+  // addresses held in other buffers, as they reach KV pages: the residency
+  // set makes it resident for every command, so nothing names it per command
+  // or dispatch. Fails with MetalAllocationError unless Metal allocates
+  // exactly `bytes`, the amount admission charged.
   [[nodiscard]] MetalBuffer allocateAddressed(uint64_t bytes,
                                               std::string_view label = {});
 
@@ -251,14 +256,7 @@ public:
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
 
-  // Metal wires a buffer only while a command uses it and a few seconds
-  // after, so memory pressure can drop idle weights and the next request
-  // reads them from disk again. A kept buffer (the base allocation of a view)
-  // is wired from here on until the keep-alive passes without a command, and
-  // again from the next command, until the allocation's last view is gone.
-  // Keeping a buffer twice throws.
-  void keepResident(const MetalBuffer &buffer);
-  // The kept bytes whose residency the keep-alive has ended, until the next
+  // The bytes whose residency the keep-alive has ended, until the next
   // command holds them again; Metal unwires them shortly after the end.
   [[nodiscard]] uint64_t lapsedResidentBytes() const noexcept;
 

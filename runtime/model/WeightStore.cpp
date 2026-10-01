@@ -200,9 +200,6 @@ WeightFile::WeightFile(metal::MetalBackend &backend,
     impl_->base = backend.wrapSharedMemory(
         impl_->mapping->address(), impl_->bytes, impl_->mapping,
         impl_->record.relativePath);
-    // The weights outlive this loader: the base stays resident until its last
-    // view is gone.
-    backend.keepResident(impl_->base);
 }
 
 WeightFile::WeightFile(WeightFile &&) noexcept = default;

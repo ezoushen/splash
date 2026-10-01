@@ -147,15 +147,15 @@ Plan makePlan(AttentionShape shape, bool prefill, uint32_t lanes, uint32_t histo
   return plan;
 }
 
-// The fixture's extents are views of its one buffer, which its residency
-// keeps resident: the kernels reach them only through page entries.
+// The fixture's extents are views of its one buffer, resident for every
+// command like every backend buffer: the kernels reach them only through
+// page entries.
 class Fixture final {
 public:
   Fixture(metal::MetalBackend &backend, Plan plan)
       : plan_(std::move(plan)),
         base_(backend.allocateBuffer(plan_.bytes, metal::BufferStorage::Shared,
                                      "attention-sweep-fixture")) {
-    backend.keepResident(base_);
     uint64_t offset = 0;
     for (size_t i = 0; i < plan_.sizes.size(); ++i) {
       if (plan_.sizes[i]) buffers_[i] = backend.view(base_, offset, plan_.sizes[i]);
