@@ -993,15 +993,17 @@ CommandTicket MetalBackend::submitCommandAsync(
     };
 
     auto wallStart = std::chrono::steady_clock::now();
-    id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
-    if (!command) {
-        failBeforeCommit("unable to create Metal command buffer");
-    }
-    ticketState->wallStart = wallStart;
-    // Encoders can remain autoreleased after their command has completed.
-    // The serving loop is long-lived, so bound their temporary ownership to
-    // encoding; the command retains everything needed for GPU execution.
+    // Metal may autorelease the command and its encoder, and the serving
+    // loop's pool never drains, so their temporary ownership ends with this
+    // submission (under the validation layer an autoreleased command holds
+    // every member of the residency set). The command retains everything the
+    // GPU still needs.
     @autoreleasepool {
+        id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
+        if (!command) {
+            failBeforeCommit("unable to create Metal command buffer");
+        }
+        ticketState->wallStart = wallStart;
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
         if (!encoder) {
             failBeforeCommit("unable to create Metal compute encoder");
@@ -1031,23 +1033,24 @@ CommandTicket MetalBackend::submitCommandAsync(
             impl_->asyncState->releaseSubmission(ticketState->sequence);
             throw;
         }
-    }
 
-    // Driver callbacks only complete the ticket. Device-wide memory telemetry
-    // is sampled on the host before submission and when consuming the result.
-    [command addCompletedHandler:^(id<MTLCommandBuffer> completedCommand) {
-        ticketState->finishCommand(completedCommand);
-    }];
-    impl_->sampleDeviceMemory();
-    impl_->residency->use();
-    std::shared_ptr<BackendAsyncState> backend = impl_->asyncState;
-    if (!backend->healthy.load(std::memory_order_acquire)) {
-        ticketState->finish({}, "Metal backend became unhealthy before command submission");
-    } else if (!backend->commitSubmission(ticketState->sequence, command,
-                   [weakTicket = std::weak_ptr(ticketState)](id<MTLCommandBuffer> completed) {
-                       if (auto ticket = weakTicket.lock()) ticket->finishCommand(completed);
-                   })) {
-        ticketState->finish({}, "Metal backend stopped before command submission");
+        // Driver callbacks only complete the ticket. Device-wide memory
+        // telemetry is sampled on the host before submission and when
+        // consuming the result.
+        [command addCompletedHandler:^(id<MTLCommandBuffer> completedCommand) {
+            ticketState->finishCommand(completedCommand);
+        }];
+        impl_->sampleDeviceMemory();
+        impl_->residency->use();
+        std::shared_ptr<BackendAsyncState> backend = impl_->asyncState;
+        if (!backend->healthy.load(std::memory_order_acquire)) {
+            ticketState->finish({}, "Metal backend became unhealthy before command submission");
+        } else if (!backend->commitSubmission(ticketState->sequence, command,
+                       [weakTicket = std::weak_ptr(ticketState)](id<MTLCommandBuffer> completed) {
+                           if (auto ticket = weakTicket.lock()) ticket->finishCommand(completed);
+                       })) {
+            ticketState->finish({}, "Metal backend stopped before command submission");
+        }
     }
     return CommandTicket(std::move(ticketState));
 }
