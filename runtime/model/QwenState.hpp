@@ -102,15 +102,17 @@ struct QwenBufferPool final {
   bool open = true;
 };
 
-// One host copy of a state on its way to disk. The write reads this copy,
-// so the state's own buffers return to the pool as soon as it is taken.
+// One copy of a state on its way to disk, in a buffer of the backend's like
+// every other: resident, and set aside by the memory plan. The write reads
+// this copy, so the state's own buffers return to the pool as soon as it is
+// taken.
 struct StateStaging final {
-  struct Free {
-    void operator()(void *memory) const noexcept { std::free(memory); }
-  };
-  std::unique_ptr<std::byte, Free> bytes;
-  uint64_t size = 0;
+  metal::MetalBuffer buffer;
   bool busy = false;
+
+  [[nodiscard]] std::span<std::byte> bytes() const {
+    return {static_cast<std::byte *>(buffer.contents()), buffer.sizeBytes()};
+  }
 };
 
 // An immutable composite snapshot owns a private copy of the state that
@@ -232,6 +234,9 @@ public:
 
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept override {
     return allocations_->bytes.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] uint64_t stagingBytes() const noexcept override {
+    return staging_ ? staging_->buffer.sizeBytes() : 0;
   }
   [[nodiscard]] uint64_t actualSlotBytes(uint32_t slot) const;
   [[nodiscard]] CompositeStateLayout layout() const noexcept { return layout_; }

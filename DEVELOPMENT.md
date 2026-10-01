@@ -502,9 +502,9 @@ replaced or changed after `prepare` checked it is refused.
 Runtime admission counts prepared weights, draft and vision exactly once
 (`preparedModelWeightBytes`, which `tune-kernels` and the runtime oracle use
 too). Before loading, startup refuses a model whose prepared weights, with the
-pipeline and runtime reserves, one state cell and one KV extent, exceed the
-hard budget, so a model that can never fit is not prepared. File backing does
-not make Metal-resident pages reclaimable.
+pipeline and runtime reserves, one state cell, one KV extent and any disk tier
+state staging, exceed the hard budget, so a model that can never fit is not
+prepared. File backing does not make Metal-resident pages reclaimable.
 Every buffer the backend allocates or wraps belongs to one residency set
 attached to its command queue (`MetalBackend::allocateBuffer`): weights, KV
 extents, state cells and draft rings, and scratch alike stay wired between
@@ -915,7 +915,7 @@ The estimate is conservative, since macOS compresses other applications further
 once the engine loads. The tier does not raise the context limit.
 
 Writes happen when RAM reclamation selects a victim. States copy through one
-host staging buffer, freeing their RAM immediately. KV leaves needed by a state
+staging buffer, freeing their RAM immediately. KV leaves needed by a state
 on them or below them are written straight from their extents and released
 after the write succeeds. Unneeded tails are dropped without writing, together
 with any disk copies below them. A restored page is read straight into its
@@ -948,8 +948,9 @@ quota. Closing the server releases both files.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range
 moved through the file's own 1 MiB buffer. The KV tier takes no Metal memory.
-The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is host
-memory outside `--max-memory`.
+The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is a
+buffer of the backend's like every other: resident, and set aside by the memory
+plan within `--max-memory` whenever the tier is configured.
 A quota too small for one state leaves the tier disabled.
 A failed write disables further writes to that file. Failed KV writes retain
 RAM pages; failed state writes invalidate the disk copy. A failed read

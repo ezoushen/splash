@@ -176,14 +176,15 @@ std::unique_ptr<StateOffload> QwenCompositeState::write(
   if (!disk) return {};
   auto result = std::shared_ptr<const QwenCompositeState>(
       new QwenCompositeState(layout, lengths, file, disk));
-  std::byte *staged = staging->bytes.get();
+  const std::span<std::byte> staged = staging->bytes();
+  std::byte *cursor = staged.data();
   for (auto span : spans)
-    staged = std::copy(span.begin(), span.end(), staged);
+    cursor = std::copy(span.begin(), span.end(), cursor);
   staging->busy = true;
   std::shared_ptr<SlotFile::Operation> operation;
   try {
     operation = file->write(
-        std::move(disk), {std::span<const std::byte>(staging->bytes.get(), staging->size)},
+        std::move(disk), {std::span<const std::byte>(staged)},
         std::move(completion));
     return std::make_unique<FileOffload>(operation, std::move(result), staging);
   } catch (...) {
@@ -220,13 +221,8 @@ QwenStateStorage::QwenStateStorage(metal::MetalBackend &backend,
   if (file) {
     file_ = std::move(file);
     staging_ = std::make_shared<StateStaging>();
-    void *memory = nullptr;
-    if (::posix_memalign(&memory, SlotFile::kAlignmentBytes, layout_.cachedBytes()) != 0)
-      throw std::bad_alloc();
-    staging_->bytes.reset(static_cast<std::byte *>(memory));
-    staging_->size = layout_.cachedBytes();
-    // Touch the pages now rather than on the engine thread at the first write.
-    std::memset(memory, 0, layout_.cachedBytes());
+    staging_->buffer = backend_.allocateBuffer(
+        layout_.cachedBytes(), metal::BufferStorage::Shared, "qwen-state-staging");
   }
 }
 

@@ -17,7 +17,7 @@ void require(bool value, const char *message) {
 }
 
 EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
-                      uint64_t kvStagingBytes = 0) {
+                      uint64_t stateStagingBytes = 0) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -31,7 +31,7 @@ EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
   device.hasUnifiedMemory = true;
   ModelMemoryProfile model =
       test::modelMemoryProfile(2 * kGiB, 1 * kGiB, visionBytes);
-  model.footprint.kvStagingBytes = kvStagingBytes;
+  model.footprint.stateStagingBytes = stateStagingBytes;
   return requireEngineMemoryPlan(device, model);
 }
 
@@ -109,10 +109,10 @@ void testUnreportedAllocationsCountAgainstReserves() {
           "unreported allocations beyond the reserves were accepted");
 }
 
-// The plan sets the disk tier's KV staging aside beside the reserves, so the
+// The plan sets the disk tier's state staging aside beside the reserves, so the
 // audit bounds it by that plan: it is neither charged to the reserves nor
 // counted a second time beside the warmup estimate that includes it.
-void testKvStagingHasItsOwnBound() {
+void testStateStagingHasItsOwnBound() {
   const uint64_t ring = 130 * kMiB;
   const auto memoryPlan = plan(kGiB, ring);
   const auto &budget = memoryPlan.breakdown();
@@ -120,7 +120,7 @@ void testKvStagingHasItsOwnBound() {
       budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes;
   const auto audit = [&](uint64_t stagingBytes, uint64_t unclassifiedBytes) {
     ActualMemoryReport actual = report(memoryPlan, unclassifiedBytes);
-    actual.kvStagingBytes = stagingBytes;
+    actual.stateStagingBytes = stagingBytes;
     actual.backendAllocatedBytes += stagingBytes;
     actual.deviceCurrentAllocatedBytes += stagingBytes;
     actual.devicePeakAllocatedBytes += stagingBytes;
@@ -130,11 +130,11 @@ void testKvStagingHasItsOwnBound() {
   const auto staged = audit(ring, reserves);
   require(staged.valid && staged.backendUnclassifiedBytes == reserves &&
               staged.warmupPeakDeviationBasisPoints == 0,
-          "KV staging was charged to the reserves or counted twice");
+          "state staging was charged to the reserves or counted twice");
   require(audit(ring + 1, 0).error == MemoryAuditError::CategoryExceedsPlan,
-          "KV staging beyond its plan was accepted");
+          "state staging beyond its plan was accepted");
   require(audit(0, 0).valid,
-          "a plan with KV staging failed without a started disk tier");
+          "a plan with state staging failed without a started disk tier");
 }
 
 void testFixedCategoryAndPeakFailures() {
@@ -218,7 +218,7 @@ int main() {
     testUnifiedDynamicAudit();
     testOptionalVisionAudit();
     testUnreportedAllocationsCountAgainstReserves();
-    testKvStagingHasItsOwnBound();
+    testStateStagingHasItsOwnBound();
     testFixedCategoryAndPeakFailures();
     testWarmupDeviationExcludesReserves();
     std::cout << "elastic memory audit tests passed\n";

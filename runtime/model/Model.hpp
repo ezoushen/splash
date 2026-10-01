@@ -311,6 +311,9 @@ class StateStorage {
 public:
   virtual ~StateStorage() = default;
   [[nodiscard]] virtual uint64_t actualAllocatedBytes() const noexcept = 0;
+  // The buffer a state's write to the disk tier stages through; zero without
+  // a tier.
+  [[nodiscard]] virtual uint64_t stagingBytes() const noexcept = 0;
   // Frees pooled idle buffers, all but what one lane starts from when
   // keepLane, and returns the bytes released. Active lanes and cached states
   // are never touched.

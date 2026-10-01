@@ -30,10 +30,10 @@ struct ModelMemoryFootprint final {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
-  // Metal staging of the disk tier's KV transfers, set aside whenever
-  // --max-cache-disk is set, even if the tier then fails to start; zero
-  // without the flag.
-  uint64_t kvStagingBytes = 0;
+  // The buffer a state's write to the disk tier stages through, set aside
+  // whenever --max-cache-disk is set, even if the tier then fails to start;
+  // zero without the flag.
+  uint64_t stateStagingBytes = 0;
 };
 
 struct ModelMemoryProfile final {
@@ -113,7 +113,7 @@ struct EngineMemoryBreakdown {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
-  uint64_t kvStagingBytes = 0;
+  uint64_t stateStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
   // All active state cells, cached composite states, and KV extents grow

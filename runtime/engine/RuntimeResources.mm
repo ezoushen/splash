@@ -294,12 +294,18 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     requireStartupHeadroom(hostAvailableMemory, preparationReserveBytes, level);
   };
   backend->setOperationGuard(admitMetalOperation);
+  // A state's write to the disk tier stages through one buffer of a state's
+  // size. It is the backend's like every other, so the governor charges it
+  // beside the weights and the plan sets it aside before it sizes KV.
+  const uint64_t stateStagingBytes =
+      config.maximumCacheDiskBytes ? config.model.stateLayout.cachedBytes() : 0;
   try {
     const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
     // Reject a model that cannot fit before preparing or registering its
     // weights. Beside them the plan needs at least the runtime reserves, one
-    // state cell and one KV extent; the full plan below adds the arenas.
+    // state cell, one KV extent and any disk tier state staging; the full plan
+    // below adds the arenas.
     kv::Layout kvLayout = config.model.targetKvLayout;
     kvLayout.format = config.kvFormat;
     uint64_t requiredBytes = 0;
@@ -308,15 +314,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
           model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
           config.model.stateLayout.activeCellBytes(),
           uint64_t{kvLayout.minimumExtentPages()} *
-              kvLayout.bytesPerModelPage()}) {
+              kvLayout.bytesPerModelPage(),
+          stateStagingBytes}) {
       if (!checkedAdd(requiredBytes, bytes, requiredBytes))
         requiredBytes = std::numeric_limits<uint64_t>::max();
     }
     if (requiredBytes > hardBudgetBytes) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
-          "model weights with the runtime reserves, one state cell and one "
-          "KV extent require " + std::to_string(requiredBytes) +
+          "model weights with the runtime reserves, one state cell, one KV "
+          "extent and any disk tier state staging require " +
+              std::to_string(requiredBytes) +
               " bytes but the Metal memory budget is " +
               std::to_string(hardBudgetBytes) + " bytes",
           deviceStatusJson(device), {}, RuntimeResourceFailure::EngineCapacity);
@@ -375,6 +383,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         modelMemoryPlan.sharedDecodePlannedAllocatedBytes,
         modelMemoryPlan.pipelineReserveBytes,
         modelMemoryPlan.runtimeOverheadReserveBytes,
+        stateStagingBytes,
     };
 
     ModelMemoryProfile modelProfile{
@@ -489,7 +498,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
             *kvPages, std::make_shared<model::SlotFile>(slotBytes, diskBudget));
         logKernelStartup("Cache disk tier: ", config.maximumCacheDiskBytes / kMiB,
                          " MiB for KV pages of ", slotBytes / 1024, " KiB and states of ",
-                         stateBytes / kMiB, " MiB.");
+                         stateBytes / kMiB, " MiB; a state's write stages through ",
+                         stateStagingBytes / kMiB, " MiB of the memory plan.");
       } catch (const std::exception &error) {
         logKernelStartup("Cache disk KV storage disabled; state storage remains enabled (",
                          error.what(), ").");
@@ -559,6 +569,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   report.sharedPrefillBytes = modelMemory.sharedPrefillActualAllocatedBytes;
   report.sharedDecodeBytes = modelMemory.sharedDecodeActualAllocatedBytes;
   report.kvResidentBytes = kvPages_->actualAllocatedBytes();
+  report.stateStagingBytes = stateStorage_->stagingBytes();
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh current residency after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();

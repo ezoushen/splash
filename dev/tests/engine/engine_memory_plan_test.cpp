@@ -128,37 +128,37 @@ void testDiskTierKvStagingIsBudgeted() {
   // 128 16 KiB-aligned page slots plus the copy table rounded up to 16 KiB.
   const uint64_t ring =
       128 * tiered.targetKvLayout.bytesPerModelPage() + 16 * 1024;
-  tiered.footprint.kvStagingBytes = ring;
+  tiered.footprint.stateStagingBytes = ring;
   const EngineMemoryPlan with = requireEngineMemoryPlan(device(), tiered);
   const auto &budget = with.breakdown();
   require(without.breakdown().fixedRuntimeBytes + ring +
                   budget.activeStateCellBytes + budget.kvCapacityBytes <=
               budget.hardBudgetBytes,
-          "the advertised context cannot be mapped beside the KV staging ring");
+          "the advertised context cannot be mapped beside the state staging buffer");
   require(with.maximumContextTokens() < without.maximumContextTokens(),
-          "a budget-limited context did not shrink by the KV staging ring");
-  require(budget.kvStagingBytes == ring &&
+          "a budget-limited context did not shrink by the state staging buffer");
+  require(budget.stateStagingBytes == ring &&
               budget.fixedRuntimeBytes ==
                   without.breakdown().fixedRuntimeBytes + ring,
-          "KV staging was not planned as fixed runtime memory");
+          "state staging was not planned as fixed runtime memory");
   // A budget that fits everything but the ring is refused by the plan, not
   // by a warmup allocation.
   const auto tight = evaluateEngineMemoryPlan(
       device(), tiered, without.breakdown().minimumRequiredBytes);
   require(!tight.plan &&
               tight.status.code == BudgetErrorCode::KvPoolDoesNotFit,
-          "a budget without room for the KV staging ring was accepted");
-  const std::string staging = "\"kv_staging_bytes\":" + std::to_string(ring);
+          "a budget without room for the state staging buffer was accepted");
+  const std::string staging = "\"state_staging_bytes\":" + std::to_string(ring);
   require(with.toStatusJson().find(staging + ",\"fixed_runtime_bytes\"") !=
                   std::string::npos &&
               with.toStatusJson().find(staging + "}}") != std::string::npos &&
-              budget.describe().find("disk tier KV staging: " +
+              budget.describe().find("disk tier state staging: " +
                                      std::to_string(ring)) != std::string::npos,
-          "KV staging is missing from the memory plan status");
-  require(without.breakdown().kvStagingBytes == 0 &&
-              without.toStatusJson().find("\"kv_staging_bytes\":0,") !=
+          "state staging is missing from the memory plan status");
+  require(without.breakdown().stateStagingBytes == 0 &&
+              without.toStatusJson().find("\"state_staging_bytes\":0,") !=
                   std::string::npos,
-          "a plan without the disk tier reported KV staging");
+          "a plan without the disk tier reported state staging");
 }
 
 void testHardBudgetBoundaries() {
