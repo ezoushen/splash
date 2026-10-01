@@ -2888,9 +2888,10 @@ void testBudgetDenialRetriesAfterRelease() {
     engine::Engine engine(config, cache, executor, events);
     engine.submit(request(284, {284}));
     static_cast<void>(engine.tick(1));
-    // The denial released every empty extent at once, then retried.
-    require(executor.beginAttempts == 2,
-            "a denied admission did not retry after releasing the empty extents");
+    // The denial released one empty extent per step, retrying after each:
+    // the backing's two extents take two steps.
+    require(executor.beginAttempts == 3,
+            "a denied admission did not retry after each extent it released");
     if (recovers) {
       require(executor.requests.size() == 1 && events.failedCount == 0,
               "the retry after the release did not admit the request");

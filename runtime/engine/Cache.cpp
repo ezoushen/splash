@@ -375,7 +375,7 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
                                      bool keepResumePoint, bool keepRunway) {
   if (mode == CacheReclaimMode::ReleaseBacking) {
-    if (const uint64_t bytes = reclaimEmptyExtents(keepRunway))
+    if (const uint64_t bytes = reclaimEmptyExtents(keepRunway, 1))
       return {true, bytes};
   }
 
@@ -411,7 +411,7 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
     switch (reclaimKvLeaf(kv->id)) {
     case LeafReclaim::Started:
       return {true, mode == CacheReclaimMode::ReleaseBacking
-                        ? reclaimEmptyExtents(keepRunway)
+                        ? reclaimEmptyExtents(keepRunway, 1)
                         : 0};
     case LeafReclaim::Pending:
       kvOpen = false;
@@ -506,9 +506,9 @@ void Cache::dropPoisoned() {
   });
 }
 
-uint64_t Cache::reclaimEmptyExtents(bool keepRunway) {
+uint64_t Cache::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
   const uint64_t before = pool_.residentBackingBytes();
-  static_cast<void>(pool_.reclaimEmptyExtents(keepRunway));
+  static_cast<void>(pool_.reclaimEmptyExtents(keepRunway, limit));
   const uint64_t after = pool_.residentBackingBytes();
   return before >= after ? before - after : 0;
 }

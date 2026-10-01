@@ -71,9 +71,12 @@ public:
   [[nodiscard]] bool pageFree(uint32_t page) const;
   [[nodiscard]] uint64_t residentBackingBytes() const noexcept;
 
-  // Releases every completely unreferenced extent. keepRunway retains one
-  // resident extent to avoid adding allocation latency to the next request.
-  [[nodiscard]] uint32_t reclaimEmptyExtents(bool keepRunway);
+  // Releases completely unreferenced extents, at most `limit` of them.
+  // keepRunway retains one resident extent to avoid adding allocation
+  // latency to the next request.
+  [[nodiscard]] uint32_t
+  reclaimEmptyExtents(bool keepRunway,
+                      uint32_t limit = std::numeric_limits<uint32_t>::max());
   // A reclaim pass that released extents between its evictions held the
   // serving thread this long; the snapshot keeps the longest pass.
   void recordReleasePass(double milliseconds) noexcept;

@@ -162,12 +162,12 @@ uint64_t KvPool::residentBackingBytes() const noexcept {
   return uint64_t{residentPages_} * bytesPerPage();
 }
 
-uint32_t KvPool::reclaimEmptyExtents(bool keepRunway) {
+uint32_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
   const auto start = std::chrono::steady_clock::now();
   uint32_t reclaimed = 0;
   bool kept = false;
   uint32_t extent = reclaimableExtents_.head;
-  while (extent != noIndex) {
+  while (extent != noIndex && reclaimed < limit) {
     const uint32_t next = extents_[extent].nextReclaimable;
     if (keepRunway && !kept) {
       kept = true;

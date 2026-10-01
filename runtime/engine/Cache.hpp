@@ -222,9 +222,11 @@ public:
   // A KV demotion, a KV restore or the one state write is in flight, so
   // memory or quota returns by itself and its completion wakes the engine.
   [[nodiscard]] bool transfersInFlight() const noexcept;
-  // One bounded reclaim step for an allocation retry. Progress is distinct
-  // from physical bytes because evicting a KV reference can make a resident
-  // page reusable without immediately emptying its extent.
+  // One bounded reclaim step for an allocation retry: one empty extent, one
+  // state or one KV leaf, so a denied allocation frees only what it needs.
+  // Progress is distinct from physical bytes because evicting a KV reference
+  // can make a resident page reusable without immediately emptying its
+  // extent.
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
       bool keepResumePoint = false, bool keepRunway = false);
@@ -328,7 +330,9 @@ private:
   [[nodiscard]] bool freeDiskSpace();
   void startRestore(uint64_t block);
   [[nodiscard]] uint64_t pendingBytes() const noexcept;
-  [[nodiscard]] uint64_t reclaimEmptyExtents(bool keepRunway);
+  [[nodiscard]] uint64_t
+  reclaimEmptyExtents(bool keepRunway,
+                      uint32_t limit = std::numeric_limits<uint32_t>::max());
 
   KvPool &pool_;
   model::KvTier *tier_;
