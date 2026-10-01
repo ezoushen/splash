@@ -242,8 +242,13 @@ engine::NativeProcessExit run(std::span<const uint8_t> input) {
 }
 
 // A shutdown request ends run() with a clean exit while the input is still
-// open, and a control handler that reports pending work is run again without
-// another notification until it reports none.
+// open, and a control handler that reports pending work is run again at the
+// loop's next wake, without another control notification, until it reports
+// none. Here input wakes the loop, as a landing transfer's completion does.
+void wakeWithStatusRequest(Harness &harness, uint64_t id) {
+  writeAll(harness.pipes.input[1], wire(protocol::Message{protocol::StatusRequestFrame{id}}));
+}
+
 void testShutdownRequestAndControlContinuation() {
   {
     Harness harness;
@@ -255,7 +260,10 @@ void testShutdownRequestAndControlContinuation() {
     Harness harness;
     int invocations = 0;
     harness.transport.setControlHandler([&] {
-      if (++invocations < 3) return true;
+      if (++invocations < 3) {
+        wakeWithStatusRequest(harness, invocations);
+        return true;
+      }
       harness.transport.requestShutdown();
       return false;
     });
@@ -278,6 +286,7 @@ void testLoopRecordsItsLongestTick() {
   harness.transport.setControlHandler([&] {
     if (++invocations == 1) {
       std::this_thread::sleep_for(std::chrono::milliseconds(40));
+      wakeWithStatusRequest(harness, 1);
       return true;
     }
     recorded = harness.transport.maxTickMilliseconds();

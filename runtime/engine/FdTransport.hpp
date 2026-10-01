@@ -42,9 +42,9 @@ public:
 
   [[nodiscard]] NativeRuntime::ByteSink outputSink();
   // Runs between commands after a control notification. Returning true asks
-  // for another run at the next command-free point, bounded by a short poll
-  // timeout, so a reclaim that transfers in flight held back continues
-  // without a new notification.
+  // for another run at the next command-free point after the loop wakes, so
+  // a reclaim that transfers in flight held back continues when one of them
+  // lands: its completion wakes the loop.
   using ControlHandler = std::function<bool()>;
   [[nodiscard]] std::function<void()> controlNotifier();
   void setControlHandler(ControlHandler handler);
