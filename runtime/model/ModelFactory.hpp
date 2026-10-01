@@ -59,13 +59,12 @@ struct ModelPackage final {
   }
 };
 
-// Model execution resources; physical memory admission remains governed by
-// the engine through admitAllocation.
 class KvPageTier;
 
+// Model execution resources. What a request's start allocates is admitted
+// by the engine through the state storage.
 struct RuntimeContext final {
   metal::MetalBackend &backend;
-  metal::AllocationAdmission admitAllocation;
   const ModelPackage &package;
   kv::PageStorage &kvPages;
   StateStorage &stateStorage;

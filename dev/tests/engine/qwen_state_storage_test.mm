@@ -320,9 +320,11 @@ void run(const std::string &metallib) {
   testDirectDiskSnapshot(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
-  // Switched off to prove that a pooled cache slot needs no new admission.
+  // Switched off to prove that a pooled cache slot needs no new admission;
+  // the count is of the admissions granted.
   bool admitNewAllocations = true;
-  auto admitState = [&governor, &admitNewAllocations](
+  uint32_t admissions = 0;
+  auto admitState = [&governor, &admitNewAllocations, &admissions](
                         uint64_t bytes,
                         const std::function<void()> &allocate) {
     if (!admitNewAllocations)
@@ -332,6 +334,7 @@ void run(const std::string &metallib) {
       return false;
     allocate();
     reservation->commit();
+    ++admissions;
     return true;
   };
   constexpr kv::Layout kvLayout{16, 4, 256};
@@ -626,6 +629,60 @@ void run(const std::string &metallib) {
             "reclaimed buffers remain pooled");
     require(storage.actualAllocatedBytes() == 0,
             "reclaimed state cells remain accounted");
+
+    // An activation asks the governor once for everything the pool lacks:
+    // a refusal allocates nothing and leaves the pool as it was.
+    admitNewAllocations = false;
+    require(!storage.tryActivateSlot(0, 505) && !storage.metadata(0).assigned &&
+                storage.actualAllocatedBytes() == 0,
+            "a denied activation allocated part of its lane");
+    admitNewAllocations = true;
+    uint32_t admitted = admissions;
+    require(static_cast<bool>(storage.tryActivateSlot(0, 505)) &&
+                admissions == admitted + 1 &&
+                storage.actualSlotBytes(0) == observedSlotActual,
+            "an activation asked the governor for its buffers one by one");
+    // With one cell and the ring in the pool the lane lacks a cell: a refusal
+    // leaves both pooled, and the retry is admitted that cell alone.
+    storage.releaseSlot(0, 505);
+    require(storage.releaseIdle(1, 1) != 0 && storage.idleCells() == 1 &&
+                storage.idleRings() == 1,
+            "fixture pool does not hold one cell and the ring");
+    const uint64_t pooledBytes = storage.actualAllocatedBytes();
+    admitNewAllocations = false;
+    require(!storage.tryActivateSlot(0, 506) && storage.idleCells() == 1 &&
+                storage.idleRings() == 1 &&
+                storage.actualAllocatedBytes() == pooledBytes,
+            "a denied activation took or dropped the pooled buffers");
+    admitNewAllocations = true;
+    admitted = admissions;
+    require(static_cast<bool>(storage.tryActivateSlot(0, 506)) &&
+                admissions == admitted + 1 && storage.idleCells() == 0 &&
+                storage.idleRings() == 0 &&
+                storage.actualSlotBytes(0) == observedSlotActual,
+            "the retry did not take the pooled buffers and one admission for the rest");
+    storage.releaseSlot(0, 506);
+    require(storage.releaseIdle(0, 0) == observedSlotActual &&
+                storage.actualAllocatedBytes() == 0,
+            "the lane's buffers were not reclaimed");
+    // What else a request's start allocates joins the lane's admission: one
+    // call for both, and a refusal builds neither.
+    bool extraBuilt = false;
+    const auto buildExtra = [&] { extraBuilt = true; };
+    admitNewAllocations = false;
+    require(!storage.tryActivateSlot(0, 507, 4096, buildExtra) && !extraBuilt &&
+                storage.actualAllocatedBytes() == 0,
+            "a refused start built what came with its lane");
+    admitNewAllocations = true;
+    admitted = admissions;
+    require(static_cast<bool>(storage.tryActivateSlot(0, 507, 4096, buildExtra)) &&
+                extraBuilt && admissions == admitted + 1 &&
+                storage.actualSlotBytes(0) == observedSlotActual,
+            "a start was not admitted in one piece");
+    storage.releaseSlot(0, 507);
+    require(storage.releaseIdle(0, 0) == observedSlotActual &&
+                storage.actualAllocatedBytes() == 0,
+            "the started lane's buffers were not reclaimed");
   }
   require(backend.memoryStats().allocatedBytes == beforeStorage,
           "destroyed state slots remained in actual allocation count");

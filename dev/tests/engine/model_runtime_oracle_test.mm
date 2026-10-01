@@ -415,9 +415,9 @@ void requireAtomicImageAdmission(model::Runtime &executor,
   EngineRequest image = makeRequest(93, {1, 2}, 1);
   image.images = {{0, 1, 2, 2, 139, 431}};
   image.imagePixels.resize(image.images.front().pixelBytes());
-  // At the budget the engine retries a denied admission after each reclaim
-  // step. With no encoder and an empty state pool, a request whose lane does
-  // not fit is refused before its encoder arena or image buffers are built.
+  // At the budget the engine retries a denied start after each reclaim
+  // step. A start is one admission, so a request whose lane does not fit is
+  // refused before its encoder arena or image buffers are built.
   {
     const ImageSpan &span = image.images.front();
     const uint64_t attemptBytes =
@@ -491,32 +491,30 @@ void requireAtomicImageAdmission(model::Runtime &executor,
         require(executor.begin(keeper.modelView()).granted(),
                 "shared vision setup failed");
       const uint64_t before = backend.memoryStats().allocatedBytes;
-      // The check of the whole attempt, fresh vision, image pixels/embeddings,
-      // two GDN cells, draft ring. With an existing encoder, the check and
-      // the last four allocations remain.
-      for (int boundary = 0; boundary < (sharedVision ? 5 : 6); ++boundary) {
-        for (bool throwing : {false, true}) {
-          fault = {boundary, throwing};
-          bool threw = false;
-          try {
-            const StateAdmission admission = resume
-                ? executor.resume(image.modelView())
-                : executor.begin(image.modelView());
-            require(!admission.granted() &&
-                        admission.failure == StateFailure::MemoryPressure,
-                    "image allocation denial was not retryable");
-          } catch (const std::runtime_error &error) {
-            require(std::string(error.what()) == "injected image allocation",
-                    "unexpected image admission exception");
-            threw = true;
-          }
-          fault = {};
-          require(threw == throwing, "image admission exception was lost");
-          require(backend.memoryStats().allocatedBytes == before,
-                  "failed image admission retained or removed shared buffers");
-          require(executor.reclaimIdleState(false) == 0,
-                  "failed image admission created false reclamation progress");
+      // The start is one admission, of the encoder when none exists, the
+      // image pixels and embeddings and the lane's cells and ring: it is
+      // refused, or fails after it allocated them all.
+      for (bool throwing : {false, true}) {
+        fault = {0, throwing};
+        bool threw = false;
+        try {
+          const StateAdmission admission = resume
+              ? executor.resume(image.modelView())
+              : executor.begin(image.modelView());
+          require(!admission.granted() &&
+                      admission.failure == StateFailure::MemoryPressure,
+                  "image allocation denial was not retryable");
+        } catch (const std::runtime_error &error) {
+          require(std::string(error.what()) == "injected image allocation",
+                  "unexpected image admission exception");
+          threw = true;
         }
+        fault = {};
+        require(threw == throwing, "image admission exception was lost");
+        require(backend.memoryStats().allocatedBytes == before,
+                "failed image admission retained or removed shared buffers");
+        require(executor.reclaimIdleState(false) == 0,
+                "failed image admission created false reclamation progress");
       }
       if (sharedVision) {
         executor.end(keeper.id);
@@ -603,34 +601,31 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
           "cached image required more than its fresh request state");
 
   // A mixed hit/miss must keep the cached rows while admitting new resources.
-  // Fail at the check of the whole attempt, the encoder, image buffers and
-  // first state cell, including an exception after allocation, and leave both
-  // the cache and live request intact. Only the admitted attempt counts its
-  // cache hit as a reuse.
+  // Fail the start's admission, by refusal and by an exception after it
+  // allocated, and leave both the cache and live request intact. Only the
+  // admitted attempt counts its cache hit as a reuse.
   EngineRequest mixed = request;
   mixed.id = 97;
   mixed.images.push_back({80, 16, 8, 8, 157, 439});
   mixed.imagePixels.resize(2 * request.imagePixels.size());
   const uint64_t beforeMixed = backend.memoryStats().allocatedBytes;
   const uint64_t reusedBeforeMixed = executor.telemetry().imageEmbeddingReuses;
-  for (int boundary : {0, 1, 2, 3}) {
-    for (bool throwing : {false, true}) {
-      fault = {boundary, throwing};
-      bool threw = false;
-      try {
-        const StateAdmission denied = executor.begin(mixed.modelView());
-        require(!denied.granted() && denied.failure == StateFailure::MemoryPressure,
-                "mixed image allocation denial was not retryable");
-      } catch (const std::runtime_error &error) {
-        require(std::string(error.what()) == "injected image allocation",
-                "unexpected mixed image admission exception");
-        threw = true;
-      }
-      fault = {};
-      require(threw == throwing &&
-                  backend.memoryStats().allocatedBytes == beforeMixed,
-              "mixed image admission changed preexisting buffers on failure");
+  for (bool throwing : {false, true}) {
+    fault = {0, throwing};
+    bool threw = false;
+    try {
+      const StateAdmission denied = executor.begin(mixed.modelView());
+      require(!denied.granted() && denied.failure == StateFailure::MemoryPressure,
+              "mixed image allocation denial was not retryable");
+    } catch (const std::runtime_error &error) {
+      require(std::string(error.what()) == "injected image allocation",
+              "unexpected mixed image admission exception");
+      threw = true;
     }
+    fault = {};
+    require(threw == throwing &&
+                backend.memoryStats().allocatedBytes == beforeMixed,
+            "mixed image admission changed preexisting buffers on failure");
   }
   const ImageSpan &miss = mixed.images.back();
   const uint64_t missingImageBytes = miss.pixelBytes() +
@@ -904,8 +899,7 @@ int main(int argc, char **argv) {
           }
           if (allocationFault.remaining > 0)
             --allocationFault.remaining;
-          // Only allocations spend the budget: the runtime's check of a
-          // whole image attempt allocates nothing.
+          // An admission spends what it allocates.
           const uint64_t before = backend.memoryStats().allocatedBytes;
           if (!admit(bytes, allocate))
             return false;
@@ -928,7 +922,7 @@ int main(int argc, char **argv) {
                                     admission,
                                     model.stateLayout());
     model::RuntimeContext context{
-        backend, admission, model, pages, states, operators,
+        backend, model, pages, states, operators,
         ops::kMaximumImagePatches, budget.pipelineReserveBytes,
         budget.runtimeOverheadReserveBytes};
     require(executorPlan.sharedDecodePlannedAllocatedBytes <=

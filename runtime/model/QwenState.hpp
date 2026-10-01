@@ -181,11 +181,16 @@ public:
   [[nodiscard]] const QwenSlotBuffers &buffers(uint32_t slot) const;
   [[nodiscard]] const QwenSlotMetadata &metadata(uint32_t slot) const;
 
-  // Activation reuses pooled buffers and admits any missing allocations.
-  // It clears parity-zero GDN state and resets draft logical lengths; later
-  // transitions overwrite the remaining data. Refusals retain their cause.
-  // Release returns the lane's buffers to the pool.
-  [[nodiscard]] metal::AllocationResult tryActivateSlot(uint32_t slot, uint64_t requestId);
+  // Activation takes pooled buffers and asks the governor once for all the
+  // pool lacks, together with `extraBytes` for what else the request's start
+  // allocates (`allocateExtra`, run first in the same admission). A start is
+  // only useful whole, so a refusal allocates nothing, leaves the pool as it
+  // was and retains its cause. Activation clears parity-zero GDN state and
+  // resets draft logical lengths; later transitions overwrite the remaining
+  // data. Release returns the lane's buffers to the pool.
+  [[nodiscard]] metal::AllocationResult
+  tryActivateSlot(uint32_t slot, uint64_t requestId, uint64_t extraBytes = 0,
+                  const std::function<void()> &allocateExtra = {});
   void releaseSlot(uint32_t slot, uint64_t requestId);
 
   // Returns pooled buffers beyond the kept counts to macOS. Active lanes and
@@ -194,17 +199,15 @@ public:
                                      uint32_t keepRings) noexcept override;
   [[nodiscard]] uint32_t idleCells() const noexcept;
   [[nodiscard]] uint32_t idleRings() const noexcept;
-  // What activating a slot allocates: the GDN cells and the draft ring the
-  // idle pool lacks, since a slot takes pooled buffers first.
-  [[nodiscard]] uint64_t activationBytes() const noexcept;
 
   // Hot-path metadata operations; neither performs a buffer copy.
   void updateLengths(uint32_t slot, QwenLogicalLengths lengths);
   void swapParity(uint32_t slot);
 
   // Copies committed state into a pooled or newly admitted cache slot while
-  // the lane retains its own cells. Returns nullptr on capacity pressure;
-  // dropping a cached state makes its slot available for retry.
+  // the lane retains its own cells. Returns nullptr on capacity pressure,
+  // with nothing allocated; dropping a cached state makes its slot available
+  // for retry.
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t slot);
   [[nodiscard]] bool canSnapshotToDisk() const noexcept {
@@ -241,16 +244,18 @@ private:
   void validateLengths(const QwenLogicalLengths &lengths,
                        bool cacheSnapshot) const;
   static void requireAssigned(const Slot &slot);
-  [[nodiscard]] metal::AllocationResult allocateSlot(uint32_t index);
-  [[nodiscard]] std::shared_ptr<QwenGdnCell> acquireCell(std::string_view label);
-  [[nodiscard]] std::shared_ptr<DFlashDraftRing>
-  acquireRing(std::string_view label);
-  [[nodiscard]] std::shared_ptr<QwenGdnCell>
-  allocateGdnCell(std::string_view label,
-                    metal::AllocationFailure *failure = nullptr);
-  [[nodiscard]] std::shared_ptr<DFlashDraftRing>
-  allocateDraftRing(std::string_view label,
-                    metal::AllocationFailure *failure = nullptr);
+  // `cells` GDN cells and a draft ring: the pool's buffers, and one
+  // admission for everything the pool lacks and for the caller's extra. A
+  // refusal allocates nothing and takes nothing from the pool.
+  struct Buffers final {
+    std::array<std::shared_ptr<QwenGdnCell>, 2> gdn;
+    std::shared_ptr<DFlashDraftRing> draft;
+  };
+  [[nodiscard]] metal::AllocationResult
+  acquire(uint32_t cells, std::string_view label, Buffers &buffers,
+          uint64_t extraBytes = 0, const std::function<void()> &allocateExtra = {});
+  // The bytes of the cells and the ring the pool lacks of that.
+  [[nodiscard]] uint64_t missingBytes(uint32_t cells) const noexcept;
   static void refreshViews(Slot &slot);
   void restoreLengths(uint32_t slot, QwenLogicalLengths lengths, bool restoreDraft);
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>

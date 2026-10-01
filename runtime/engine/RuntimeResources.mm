@@ -551,7 +551,6 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
   const EngineMemoryBreakdown &budget = memoryPlan_.breakdown();
   return {
       *backend_,
-      memoryGovernor_->allocationAdmission(),
       model_,
       *kvPages_,
       *stateStorage_,

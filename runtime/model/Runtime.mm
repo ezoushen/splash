@@ -247,7 +247,6 @@ struct Runtime::Impl {
   };
 
   MetalBackend &backend;
-  metal::AllocationAdmission admitAllocation;
   const ModelPackage &package;
   const RuntimeGeometry geometry;
   const ops::ExecutionPlans &operators;
@@ -283,7 +282,6 @@ struct Runtime::Impl {
   DFlashDraft draftModel;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
-        admitAllocation(std::move(value.admitAllocation)),
         package(value.package),
         geometry(RuntimeGeometry::from(value.package, value.kvPages.layout().format)),
         operators(value.operators),
@@ -301,9 +299,6 @@ struct Runtime::Impl {
                         },
                         value.package.target)),
         draftModel(value.package.draft, value.backend, operators) {
-    if (!admitAllocation)
-      throw std::invalid_argument(
-          "model runtime requires allocation admission");
     if (states.layout() != package.stateLayout() ||
         kvPages.layout() != package.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
@@ -440,12 +435,15 @@ struct Runtime::Impl {
     }
   };
 
-  // Admits the memory an image request needs before its state cell: the
-  // shared vision scratch and per-image pixel and embedding buffers, all
-  // through the governor, preserving the allocation refusal reason.
-  metal::AllocationResult stageImages(const ModelRequest &request) {
+  // A request's lane with everything else its start allocates, in one
+  // admission: the shared vision scratch when no encoder exists and the
+  // pixel and embedding buffers of the images not yet encoded. At the budget
+  // the engine retries a denied start after each reclaim step, and a denial
+  // builds nothing, so no encoder arena, image buffer or state cell is built
+  // and dropped every time. The refusal keeps its cause.
+  metal::AllocationResult activate(const ModelRequest &request, uint32_t slot) {
     if (request.images.empty() || stagedImages.contains(request.id))
-      return true;
+      return states.tryActivateSlot(slot, request.id);
     // The engine rejects image requests at submission when there is no vision.
     if (!package.descriptor.hasVision())
       throw std::logic_error("image request reached a model without vision");
@@ -476,28 +474,13 @@ struct Runtime::Impl {
                                package.vision.tensors.layout,
                                maximumImagePatches)
                          : 0;
-    // At the budget the engine retries a denied admission after each reclaim
-    // step. Checking the whole attempt first, with the GDN cells and draft
-    // ring the lane needs beyond the idle pool, keeps a denial from building
-    // and dropping the encoder arena and image buffers every time.
-    if (bytes) {
-      if (auto admission = admitAllocation(
-              encoderBytes + bytes + states.activationBytes(), [] {});
-          !admission)
-        return admission;
-    }
-    if (encoderBytes) {
-      std::unique_ptr<ops::Vision> candidate;
-      const auto admission = admitAllocation(encoderBytes, [&] {
-        candidate = std::make_unique<ops::Vision>(
-            backend, package.vision.tensors, maximumImagePatches);
-      });
-      if (!admission)
-        return admission;
-      vision = std::move(candidate);
-    }
+    std::unique_ptr<ops::Vision> encoder;
     const uint8_t *pixels = request.imagePixels.data();
-    const auto allocateImages = [&] {
+    const auto allocate = [&] {
+      if (encoderBytes) {
+        encoder = std::make_unique<ops::Vision>(
+            backend, package.vision.tensors, maximumImagePatches);
+      }
       for (ImageState &image : staged) {
         const ImageSpan &span = image.span;
         if (!image.data->embeddings) {
@@ -511,10 +494,12 @@ struct Runtime::Impl {
         pixels += span.pixelBytes();
       }
     };
-    if (bytes) {
-      if (auto admission = admitAllocation(bytes, allocateImages); !admission)
-        return admission;
-    }
+    if (auto admission = states.tryActivateSlot(slot, request.id,
+                                                encoderBytes + bytes, allocate);
+        !admission)
+      return admission;
+    if (encoder)
+      vision = std::move(encoder);
     stagedImages.emplace(request.id, std::move(staged));
     return true;
   }
@@ -1818,11 +1803,8 @@ void Runtime::beginColdRequest(const ModelRequest &request,
 
 StateAdmission Runtime::begin(const ModelRequest &request) {
   Impl::ImageAdmission images(*impl_, request.id);
-  StateAdmission admission = admitIdleSlot(impl_->states, [&](uint32_t slot) {
-    if (auto imageAdmission = impl_->stageImages(request); !imageAdmission)
-      return imageAdmission;
-    return beginAt(request, slot);
-  });
+  StateAdmission admission = admitIdleSlot(
+      impl_->states, [&](uint32_t slot) { return beginAt(request, slot); });
   images.committed = admission.granted();
   return admission;
 }
@@ -1853,12 +1835,8 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     throw std::invalid_argument("recomputed history cannot shorten the prompt");
   }
   Impl::ImageAdmission images(*impl_, request.id);
-  StateAdmission admission =
-      admitIdleSlot(impl_->states, [&](uint32_t slot) {
-        if (auto imageAdmission = impl_->stageImages(request); !imageAdmission)
-          return imageAdmission;
-        return impl_->states.tryActivateSlot(slot, request.id);
-      });
+  StateAdmission admission = admitIdleSlot(
+      impl_->states, [&](uint32_t slot) { return impl_->activate(request, slot); });
   if (admission.granted()) {
     entry.slot = *admission.cell;
     entry.resident = true;
@@ -1922,8 +1900,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   entry.decodeStage = entry.cohort == BatchCohort::Constrained
                           ? DecodeStage::RequestInitialMask
                           : DecodeStage::Regular;
-  if (auto admission = impl_->states.tryActivateSlot(stateSlot, request.id);
-      !admission)
+  if (auto admission = impl_->activate(request, stateSlot); !admission)
     return admission;
   entry.slot = stateSlot;
   entry.resident = true;
