@@ -138,10 +138,10 @@ void sampling() {
     const uint64_t count = rows;
     require(workspace.argmaxValuesBytes == count * 16 * 4 &&
                 workspace.argmaxIndicesBytes == count * 16 * 4 &&
-                workspace.partialIdsBytes == count * 16 * 32 * 4 &&
-                workspace.partialValuesBytes == count * 16 * 32 * 4 &&
-                workspace.topIdsBytes == count * 32 * 4 &&
-                workspace.topProbabilitiesBytes == count * 32 * 4,
+                workspace.partialMassesBytes == count * 16 * 12 &&
+                workspace.vocabularyRowsBytes == count * 28 &&
+                workspace.vocabularyRangesBytes == count * 256 * 8 &&
+                workspace.vocabularyArrivalsBytes == count * 4,
             "target sampling workspace changed from the shipped 16-shard ABI");
   }
   for (uint32_t positions : {1U, 7U, 14U, 21U, 28U,

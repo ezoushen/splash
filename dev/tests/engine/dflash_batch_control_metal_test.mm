@@ -51,12 +51,10 @@ void runWidth(MetalBackend &backend, uint32_t width,
   MetalBuffer draftProbabilities =
       shared(backend, kLanes * kProposals * 16 * sizeof(float),
              "accept-draft-probabilities");
-  MetalBuffer targetIds =
-      shared(backend, kLanes * kRows * 32 * sizeof(uint32_t),
-             "accept-target-ids");
-  MetalBuffer targetProbabilities =
-      shared(backend, kLanes * kRows * 32 * sizeof(float),
-             "accept-target-probabilities");
+  // Every lane is greedy here; sampled lanes read their target rows.
+  MetalBuffer targetRows =
+      shared(backend, kLanes * kRows * sizeof(TargetVocabularyRow),
+             "accept-target-rows");
   MetalBuffer uniforms =
       shared(backend, kLanes * 2 * kRows * sizeof(float), "accept-uniforms");
   MetalBuffer output = shared(backend, kLanes * kRows * sizeof(uint32_t),
@@ -73,9 +71,7 @@ void runWidth(MetalBackend &backend, uint32_t width,
   std::memset(draftIds.contents(), 0, draftIds.sizeBytes());
   std::memset(draftProbabilities.contents(), 0,
               draftProbabilities.sizeBytes());
-  std::memset(targetIds.contents(), 0, targetIds.sizeBytes());
-  std::memset(targetProbabilities.contents(), 0,
-              targetProbabilities.sizeBytes());
+  std::memset(targetRows.contents(), 0, targetRows.sizeBytes());
   std::memset(uniforms.contents(), 0, uniforms.sizeBytes());
   std::memset(retained.contents(), 0, retained.sizeBytes());
   std::memset(next.contents(), 0, next.sizeBytes());
@@ -109,14 +105,13 @@ void runWidth(MetalBackend &backend, uint32_t width,
   dispatch.buffers = {{0, draft},
                       {1, draftIds},
                       {2, draftProbabilities},
-                      {3, targetIds},
-                      {4, targetProbabilities},
-                      {5, uniforms},
-                      {6, output},
-                      {7, retained},
-                      {8, next},
-                      {9, accepted}};
-  dispatch.bytes = {{10, &params, sizeof(params)}};
+                      {3, targetRows},
+                      {4, uniforms},
+                      {5, output},
+                      {6, retained},
+                      {7, next},
+                      {8, accepted}};
+  dispatch.bytes = {{9, &params, sizeof(params)}};
   dispatch.threadgroups = {width, 1, 1};
   dispatch.threadsPerThreadgroup = {1, 1, 1};
   static_cast<void>(backend.submit(dispatch));

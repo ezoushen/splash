@@ -291,7 +291,7 @@ struct Runtime::Impl {
         maximumImagePatches(value.maximumImagePatches),
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
-        sampling(value.backend, geometry.target.vocabularySize, kDecodeRows),
+        sampling(geometry.target.vocabularySize, kDecodeRows),
         targetModel(std::visit(
                         [&](const auto &weights) {
                           return QwenTarget(weights, value.backend, operators,
@@ -730,16 +730,18 @@ struct Runtime::Impl {
   template <class Get>
   static ops::SamplingBuffers samplingBuffersWith(Get d) {
     return {d(DecodeTensor::Logits),
-            d(DecodeTensor::TargetTopPartialIds),
-            d(DecodeTensor::TargetTopPartialValues),
-            d(DecodeTensor::TargetTopIds),
-            d(DecodeTensor::TargetTopProbs),
+            d(DecodeTensor::TargetPartialMasses),
+            d(DecodeTensor::TargetVocabularyRows),
             d(DecodeTensor::SamplingUniforms),
             d(DecodeTensor::ConstraintMasks),
             d(DecodeTensor::OutputTokens),
             d(DecodeTensor::ArgmaxValues),
             d(DecodeTensor::ArgmaxIndices),
-            d(DecodeTensor::InputTokens)};
+            d(DecodeTensor::InputTokens),
+            d(DecodeTensor::Candidates),
+            d(DecodeTensor::ProposalProbs),
+            d(DecodeTensor::TargetVocabularyRanges),
+            d(DecodeTensor::TargetVocabularyArrivals)};
   }
 
   ops::SamplingBuffers samplingBuffers(uint32_t lanes) const {
@@ -1445,8 +1447,7 @@ struct Runtime::Impl {
         {decodeArena->packed(DecodeTensor::ProposedTokens, width),
          decodeArena->packed(DecodeTensor::Candidates, width),
          decodeArena->packed(DecodeTensor::ProposalProbs, width),
-         decodeArena->packed(DecodeTensor::TargetTopIds, width),
-         decodeArena->packed(DecodeTensor::TargetTopProbs, width),
+         decodeArena->packed(DecodeTensor::TargetVocabularyRows, width),
          decodeArena->packed(DecodeTensor::SamplingUniforms, width),
          decodeArena->packed(DecodeTensor::OutputTokens, width),
          decodeArena->packed(DecodeTensor::RetainedCount, width),
@@ -1898,9 +1899,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   if (entry.cohort != expected || !std::isfinite(entry.sampling.temperature) ||
       entry.sampling.temperature < 0.0F ||
       !std::isfinite(entry.sampling.topP) || entry.sampling.topP <= 0.0F ||
-      entry.sampling.topP > 1.0F ||
-      entry.sampling.topK > ops::kTargetSamplingCandidates ||
-      (Impl::samplingEnabled(entry) && !entry.sampling.topK)) {
+      entry.sampling.topP > 1.0F) {
     throw std::invalid_argument("request sampling/cohort contract is invalid");
   }
   // The penalties' ranges, as the API takes them.

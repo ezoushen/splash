@@ -251,10 +251,10 @@ enum class DecodeTensor : uint32_t {
   Logits,
   ArgmaxValues,
   ArgmaxIndices,
-  TargetTopPartialIds,
-  TargetTopPartialValues,
-  TargetTopIds,
-  TargetTopProbs,
+  TargetPartialMasses,
+  TargetVocabularyRows,
+  TargetVocabularyRanges,
+  TargetVocabularyArrivals,
   SamplingUniforms,
   ConstraintMasks,
   OutputTokens,
@@ -351,6 +351,11 @@ public:
     }
     if (cursor != baseBytes)
       throw std::logic_error("decode arena mismatch");
+    // Sampled rows' draws return their arrival counts to zero; they start
+    // there.
+    const metal::MetalBuffer arrivals =
+        packed(DecodeTensor::TargetVocabularyArrivals, kLaneCount);
+    std::memset(arrivals.contents(), 0, arrivals.sizeBytes());
 
     const uint64_t denseScratchBytes = gateScratchBytes(geometry_, operators);
     if (denseScratchBytes) {

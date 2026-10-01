@@ -35,6 +35,8 @@ struct TargetSamplingBatchParams {
   uint32_t top_k[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   float top_p[SPLASH_MAXIMUM_BATCH_WIDTH];
+  // Lanes that sample; the others take the argmax.
+  uint32_t sampling_mask;
   uint32_t constrained_mask;
   // Lanes that ignore end-of-sequence: they never select a stop token.
   uint32_t exclude_stop_mask;
@@ -42,8 +44,53 @@ struct TargetSamplingBatchParams {
   uint32_t stop_token_1;
 };
 
-static_assert(sizeof(TargetSamplingBatchParams) == 80,
-              "Batched target sampling parameters are 80 bytes on both sides");
+static_assert(sizeof(TargetSamplingBatchParams) == 84,
+              "Batched target sampling parameters are 84 bytes on both sides");
+
+// One shard's share of a sampled row's softmax denominator: the largest
+// logit it admits, the sum of exp((logit - maximum) / temperature) over its
+// admitted tokens, and how many it admits.
+struct TargetShardMass {
+  float maximum;
+  float sum;
+  uint32_t admitted;
+};
+
+static_assert(sizeof(TargetShardMass) == 12,
+              "Target shard masses are 12 bytes on both sides");
+
+// A sampled row's selection over the whole vocabulary. The search merges
+// its shards' masses into the row's largest admitted logit, softmax
+// denominator and admitted count, and records where its top-k/top-p
+// distribution ends in the order of the logits (the key and id of its last
+// token, metal/kernels/decode/sampling.metal). The draw writes the target
+// probability of the row's draft token and the token it draws: for a verify
+// row with a draft token, the correction acceptance takes if it rejects that
+// token (a draw from the residual distribution); otherwise a draw from the
+// row's distribution.
+struct TargetVocabularyRow {
+  float maximum;
+  float mass;
+  uint32_t admitted;
+  uint32_t end_key;
+  uint32_t end_last;
+  float draft_probability;
+  uint32_t token;
+};
+
+static_assert(sizeof(TargetVocabularyRow) == 28,
+              "Target vocabulary rows are 28 bytes on both sides");
+
+// One range of the vocabulary in such a row's draw, which one simdgroup of
+// the row's groups sums: the kept weight of its tokens other than the
+// draft's candidates, and one past the last of those with weight.
+struct TargetVocabularyRange {
+  float rest;
+  uint32_t after;
+};
+
+static_assert(sizeof(TargetVocabularyRange) == 8,
+              "Target vocabulary ranges are 8 bytes on both sides");
 
 // A penalized request's word for each vocabulary token, in its state slot's
 // row of the penalty table (ops::Sampling::loadPenaltyWords): the prompt bit

@@ -9,10 +9,6 @@
 
 namespace splash::ops {
 
-// Target sampling keeps this many top candidates per row; requests may not
-// ask for a larger top-k.
-inline constexpr uint32_t kTargetSamplingCandidates = 32;
-
 // The sampling penalties, which rewrite a lane's target logits before its
 // policy selects from them: repetition scales the logit of every token the
 // prompt or the output holds, presence and frequency lower that of every
@@ -28,6 +24,9 @@ struct SamplingPenalties final {
 };
 
 struct SamplingPolicy final {
+  // A sampling lane keeps its topK most likely tokens, or every token for 0
+  // or a topK past the vocabulary (top-k disabled), then its top-p
+  // nucleus of those.
   uint32_t topK = 1;
   float temperature = 1.0F;
   float topP = 1.0F;
@@ -52,10 +51,10 @@ struct PenaltyTable final {
 struct SamplingWorkspace final {
   uint64_t argmaxValuesBytes = 0;
   uint64_t argmaxIndicesBytes = 0;
-  uint64_t partialIdsBytes = 0;
-  uint64_t partialValuesBytes = 0;
-  uint64_t topIdsBytes = 0;
-  uint64_t topProbabilitiesBytes = 0;
+  uint64_t partialMassesBytes = 0;
+  uint64_t vocabularyRowsBytes = 0;
+  uint64_t vocabularyRangesBytes = 0;
+  uint64_t vocabularyArrivalsBytes = 0;
 };
 
 struct DraftSelectorWorkspace final {
@@ -69,18 +68,30 @@ struct DraftSelectorWorkspace final {
 struct SamplingBuffers final {
   // fp32 [rows][vocabulary].
   metal::MetalBuffer logits;
-  metal::MetalBuffer partialIds;
-  metal::MetalBuffer partialValues;
-  metal::MetalBuffer topIds;
-  metal::MetalBuffer topProbabilities;
+  // Per shard of a sampled row, its share of the row's softmax denominator
+  // (metal/abi/Sampling.h TargetShardMass).
+  metal::MetalBuffer partialMasses;
+  // Per sampled row, where its distribution ends and its draw
+  // (TargetVocabularyRow); acceptance reads a verify row's.
+  metal::MetalBuffer vocabularyRows;
   metal::MetalBuffer uniforms;
   metal::MetalBuffer constraintMasks;
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer argmaxValues;
   metal::MetalBuffer argmaxIndices;
   // Verify input tokens [rows]: row 0 of a lane is its anchor, rows 1..7 its
-  // draft tokens. Only penalized verify rows read them.
+  // draft tokens. Only penalized and sampled verify rows read them.
   metal::MetalBuffer inputTokens{};
+  // The draft's candidates and their probabilities at each proposal
+  // position (AcceptanceBuffers), which a sampled verify row draws its
+  // correction's residual from.
+  metal::MetalBuffer draftCandidates{};
+  metal::MetalBuffer draftProbabilities{};
+  // Per sampled row, the ranges of its draw (TargetVocabularyRange), which
+  // the groups that share the draw sum, and how many of those groups have
+  // finished: a count every draw returns to zero, where it starts.
+  metal::MetalBuffer vocabularyRanges{};
+  metal::MetalBuffer vocabularyArrivals{};
 };
 
 struct DraftSelectorBuffers final {
@@ -102,8 +113,7 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer proposedTokens;
   metal::MetalBuffer candidates;
   metal::MetalBuffer proposalProbabilities;
-  metal::MetalBuffer targetTopIds;
-  metal::MetalBuffer targetTopProbabilities;
+  metal::MetalBuffer targetVocabularyRows;
   metal::MetalBuffer uniforms;
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer retainedCounts;
@@ -118,8 +128,7 @@ struct AcceptanceBuffers final {
 class Sampling final {
 public:
   // rowsPerLane is the kernels' SPLASH_TARGET_VERIFY_ROWS.
-  Sampling(metal::MetalBackend &backend, uint32_t vocabulary,
-           uint32_t rowsPerLane);
+  Sampling(uint32_t vocabulary, uint32_t rowsPerLane);
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
   // Counts may cover one lane or a packed batch; the operator owns sharding.
@@ -139,7 +148,12 @@ public:
 
   // A lane whose policy has active penalties has its logits rewritten in
   // place first, from its row of the penalty table; the rows must hold the
-  // LM head's fresh output. Other lanes dispatch nothing new.
+  // LM head's fresh output. Other lanes dispatch nothing new. A greedy lane
+  // then takes each row's argmax and a sampled lane draws from each row's
+  // distribution over the whole vocabulary, both among the tokens the lane
+  // admits: the first token directly, a verify row as its draft token's
+  // probability and correction, which acceptance reads from the vocabulary
+  // rows.
   void addInitial(metal::CommandGraph &graph, const SamplingPolicy &policy,
                   SamplingBuffers buffers, uint32_t rowOffset,
                   uint32_t stopToken0, uint32_t stopToken1,
@@ -172,7 +186,6 @@ private:
                     const SamplingBuffers &buffers, const PenaltyTable &table,
                     uint32_t rowOffset, bool verify) const;
 
-  metal::MetalBackend &backend_;
   uint32_t vocabulary_ = 0;
   uint32_t rowsPerLane_ = 0;
   uint32_t maskWords_ = 0;

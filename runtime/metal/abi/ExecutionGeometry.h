@@ -23,6 +23,13 @@
 #define SPLASH_VERIFY_ATTENTION_PAGES_PER_SPLIT 16u
 #define SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS 128u
 #define SPLASH_TARGET_SAMPLING_SHARDS 16u
+// Threads of each group that selects a sampled row over the whole
+// vocabulary (decode_sample_vocabulary*); a bracket of at most this many
+// tokens is ordered in threadgroup memory, one token per thread.
+#define SPLASH_TARGET_VOCABULARY_THREADS 1024u
+// Groups that share such a row's draw, each over its own slice of the
+// vocabulary, so the eight rows of a lane spread over the GPU's cores.
+#define SPLASH_TARGET_VOCABULARY_GROUPS 8u
 #define SPLASH_DRAFT_SAMPLING_SHARDS 8u
 // Rows of one value head's recurrent state a prefill GDN scan threadgroup
 // carries through the chunk: four simdgroups whose lanes each own sixteen key

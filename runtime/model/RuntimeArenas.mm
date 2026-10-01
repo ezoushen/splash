@@ -237,10 +237,12 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<float>(r * geometry.target.vocabularySize));
   put(DecodeTensor::ArgmaxValues, samplingWorkspace.argmaxValuesBytes);
   put(DecodeTensor::ArgmaxIndices, samplingWorkspace.argmaxIndicesBytes);
-  put(DecodeTensor::TargetTopPartialIds, samplingWorkspace.partialIdsBytes);
-  put(DecodeTensor::TargetTopPartialValues, samplingWorkspace.partialValuesBytes);
-  put(DecodeTensor::TargetTopIds, samplingWorkspace.topIdsBytes);
-  put(DecodeTensor::TargetTopProbs, samplingWorkspace.topProbabilitiesBytes);
+  put(DecodeTensor::TargetPartialMasses, samplingWorkspace.partialMassesBytes);
+  put(DecodeTensor::TargetVocabularyRows, samplingWorkspace.vocabularyRowsBytes);
+  put(DecodeTensor::TargetVocabularyRanges,
+      samplingWorkspace.vocabularyRangesBytes);
+  put(DecodeTensor::TargetVocabularyArrivals,
+      samplingWorkspace.vocabularyArrivalsBytes);
   put(DecodeTensor::SamplingUniforms, bytesFor<float>(kSamplingUniformCount));
   put(DecodeTensor::ConstraintMasks,
       bytesFor<uint32_t>(uint64_t{ExecutionLimits::maximumStepTokens} *
