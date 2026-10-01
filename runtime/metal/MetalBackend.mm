@@ -226,8 +226,9 @@ struct MetalAllocation {
     uint64_t sparseVirtualBytes = 0;
     bool placementSparse = false;
     BufferStorage storage = BufferStorage::Shared;
-    // Non-empty while kept resident. The residency set retains the buffer,
-    // and with it the backing, so the last view takes it out.
+    // Non-empty while a member of the residency set: kept resident or
+    // addressed. The set retains the buffer, and with it the backing, so the
+    // last view takes it out.
     std::weak_ptr<Residency> residency;
 
     ~MetalAllocation() {
@@ -687,6 +688,11 @@ void *MetalBuffer::contents() const noexcept {
     return static_cast<uint8_t *>(base) + impl_->offsetBytes;
 }
 
+uint64_t MetalBuffer::gpuAddress() const noexcept {
+    if (!impl_ || !impl_->allocation || !impl_->allocation->buffer) return 0;
+    return impl_->allocation->buffer.gpuAddress + impl_->offsetBytes;
+}
+
 SparseHeap::SparseHeap() = default;
 SparseHeap::~SparseHeap() = default;
 SparseHeap::SparseHeap(SparseHeap &&) noexcept = default;
@@ -961,6 +967,30 @@ MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
     if (!buffer) throw MetalAllocationError("Metal buffer allocation failed");
     if (!label.empty()) buffer.label = checkedNSString(label, "buffer label");
     return impl_->registerBuffer(buffer, storage);
+}
+
+MetalBuffer MetalBackend::allocateAddressed(uint64_t bytes,
+                                            std::string_view label) {
+    checkOperation();
+    if (!bytes) throw MetalBackendError("Metal buffer size must be positive");
+    if (bytes > impl_->capabilities.maxBufferLengthBytes) {
+        throw MetalBackendError("Metal buffer exceeds maxBufferLength");
+    }
+    id<MTLBuffer> buffer = [impl_->device
+        newBufferWithLength:checkedNSUInteger(bytes, "buffer size")
+        options:MTLResourceStorageModePrivate |
+                MTLResourceHazardTrackingModeUntracked];
+    if (!buffer) throw MetalAllocationError("Metal buffer allocation failed");
+    if (buffer.allocatedSize != bytes) {
+        throw MetalAllocationError(
+            "Metal allocated " + std::to_string(buffer.allocatedSize) +
+            " bytes for an addressed buffer of " + std::to_string(bytes));
+    }
+    if (!label.empty()) buffer.label = checkedNSString(label, "buffer label");
+    MetalBuffer result = impl_->registerBuffer(buffer, BufferStorage::Private);
+    impl_->residency->join(buffer);
+    result.impl_->allocation->residency = impl_->residency;
+    return result;
 }
 
 MetalBuffer MetalBackend::allocatePlacementSparseBuffer(
@@ -1624,6 +1654,10 @@ MetalMemoryStats MetalBackend::refreshMemoryStats() const noexcept {
 uint64_t MetalBackend::submissionCount() const noexcept {
     std::lock_guard lock(impl_->asyncState->gateMutex);
     return impl_->asyncState->nextSequence;
+}
+
+bool MetalBackend::commandInFlight() const noexcept {
+    return impl_->asyncState->hasActiveSubmission();
 }
 
 size_t MetalBackend::pipelineCount() const noexcept {

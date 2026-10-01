@@ -79,6 +79,18 @@ public:
     use();
   }
 
+  // Makes the buffer a member without requesting residency. While the set is
+  // held, Metal wires it before the commit returns; after a lapse, the next
+  // command wires it with the rest of the set.
+  void join(id<MTLBuffer> buffer) {
+    dispatch_sync(queue_, ^{
+      [set_ addAllocation:buffer];
+      [set_ commit];
+    });
+    std::lock_guard lock(mutex_);
+    bytes_ += buffer.allocatedSize;
+  }
+
   void remove(id<MTLBuffer> buffer) {
     dispatch_sync(queue_, ^{
       [set_ removeAllocation:buffer];

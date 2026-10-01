@@ -79,6 +79,9 @@ public:
   [[nodiscard]] BufferStorage storage() const noexcept;
   // Returns nullptr for private buffers. The pointer covers this view only.
   [[nodiscard]] void *contents() const noexcept;
+  // GPU address of the view's first byte, for kernels that reach a buffer
+  // through an address another buffer holds.
+  [[nodiscard]] uint64_t gpuAddress() const noexcept;
   // Allocation identity and exact view range, including Private storage.
   // This compares metadata only; it never maps or reads device contents.
   [[nodiscard]] bool sameView(const MetalBuffer &other) const noexcept;
@@ -294,6 +297,16 @@ public:
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage = BufferStorage::Shared,
                  std::string_view label = {});
+  // A private, hazard-untracked buffer that kernels reach only through GPU
+  // addresses held in other buffers, as they reach KV pages. It belongs to
+  // the residency set of kept buffers until its last view is gone; the set
+  // is attached to the command queue, so every command has it resident and
+  // nothing names it per command or dispatch. While the set is held, Metal
+  // wires the buffer before this returns; after a lapse, the next command
+  // wires it with the rest of the set. Fails with MetalAllocationError unless
+  // Metal allocates exactly `bytes`, the amount admission charged.
+  [[nodiscard]] MetalBuffer allocateAddressed(uint64_t bytes,
+                                              std::string_view label = {});
 
   // Private sparse buffers use the shared 64 KiB tile ABI. Per-layer scale
   // ranges must stay tile-aligned; fewer dirty tiles reduce unmap cost.
@@ -379,6 +392,9 @@ public:
   // behind an active Metal command.
   [[nodiscard]] MetalMemoryStats refreshMemoryStats() const noexcept;
   [[nodiscard]] uint64_t submissionCount() const noexcept;
+  // True from a submission until its ticket has been consumed: while memory
+  // the command reaches through addresses must stay allocated.
+  [[nodiscard]] bool commandInFlight() const noexcept;
   [[nodiscard]] size_t pipelineCount() const noexcept;
   [[nodiscard]] bool healthy() const noexcept;
   // Serving-loop check of actual GPU commands and pending unmaps. Terminal

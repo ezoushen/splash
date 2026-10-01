@@ -548,6 +548,122 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
               << " lapses=" << lapses << '\n';
 }
 
+IMP originalNewBuffer = nullptr;
+MTLResourceOptions lastBufferOptions = 0;
+id recordBufferOptions(id device, SEL selector, NSUInteger length,
+                       MTLResourceOptions options) {
+    lastBufferOptions = options;
+    return reinterpret_cast<id (*)(id, SEL, NSUInteger, MTLResourceOptions)>(
+        originalNewBuffer)(device, selector, length, options);
+}
+
+IMP originalBufferAllocatedSize = nullptr;
+NSUInteger paddedAllocatedSize(id buffer, SEL selector) {
+    return reinterpret_cast<NSUInteger (*)(id, SEL)>(
+               originalBufferAllocatedSize)(buffer, selector) + 16384;
+}
+
+// Addressed buffers are private and untracked, allocated at exactly their
+// size and reached only through GPU addresses in a table. The residency set
+// makes them resident for every command, also once its keep-alive has
+// lapsed; one dispatch reads what the previous one wrote through them; and
+// buffers released and allocated again between commands work at once.
+void addressedBuffersThroughTables(const std::string &metallibPath) {
+    constexpr double kKeepAliveSeconds = 0.2;
+    constexpr uint32_t kBuffers = 6, kWords = 16384, kRounds = 60;
+    constexpr uint64_t kBytes = uint64_t{kWords} * sizeof(uint32_t);
+    MetalBackend backend(metallibPath, 120.0, 30000, kKeepAliveSeconds);
+    MetalBuffer table = backend.allocateBuffer(kBuffers * sizeof(uint64_t));
+    MetalBuffer mismatches = backend.allocateBuffer(sizeof(uint32_t));
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    std::vector<MetalBuffer> buffers(kBuffers);
+    {
+        MethodReplacement options(device, @selector(newBufferWithLength:options:),
+                                  reinterpret_cast<IMP>(recordBufferOptions));
+        originalNewBuffer = options.original;
+        buffers[0] = backend.allocateAddressed(kBytes, "addressed-test");
+    }
+    require(lastBufferOptions == (MTLResourceStorageModePrivate |
+                                  MTLResourceHazardTrackingModeUntracked),
+            "an addressed buffer is not private and hazard-untracked");
+    {
+        id<MTLBuffer> sample = [device newBufferWithLength:kBytes
+            options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked];
+        MethodReplacement padded(sample, @selector(allocatedSize),
+                                 reinterpret_cast<IMP>(paddedAllocatedSize));
+        originalBufferAllocatedSize = padded.original;
+        try {
+            (void)backend.allocateAddressed(kBytes);
+            fail("an addressed buffer larger than its size was accepted");
+        } catch (const MetalAllocationError &) {
+        }
+    }
+    for (uint32_t index = 1; index < kBuffers; ++index)
+        buffers[index] = backend.allocateAddressed(kBytes);
+    require(buffers[0].storage() == BufferStorage::Private && !buffers[0].contents() &&
+                buffers[0].sizeBytes() == kBytes &&
+                backend.memoryStats().allocatedBytes == before + kBuffers * kBytes,
+            "addressed buffers were not allocated or counted at their size");
+    require(buffers[0].gpuAddress() &&
+                backend.view(buffers[0], 4096, 4096).gpuAddress() ==
+                    buffers[0].gpuAddress() + 4096,
+            "a view's GPU address does not start at its offset");
+    require(backend.lapsedResidentBytes() == kBuffers * kBytes,
+            "addressed buffers are not members of the residency set");
+
+    auto *entries = static_cast<uint64_t *>(table.contents());
+    for (uint32_t index = 0; index < kBuffers; ++index)
+        entries[index] = buffers[index].gpuAddress();
+    const uint32_t words = kWords;
+    uint32_t seed = 0;
+    const std::array<ComputeDispatch, 2> command{
+        ComputeDispatch{"addressed_write_u32", {{0, table}},
+            {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+            {kWords / 256, kBuffers, 1}, {256, 1, 1}},
+        ComputeDispatch{"addressed_check_u32", {{0, table}, {3, mismatches}},
+            {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+            {kWords / 256, kBuffers, 1}, {256, 1, 1}}};
+    uint32_t regrown = 0;
+    bool lapsedRound = false;
+    for (uint32_t round = 0; round < kRounds; ++round) {
+        if (round % 5 == 4) {
+            const uint32_t index = round % kBuffers;
+            buffers[index] = {};
+            require(backend.memoryStats().allocatedBytes ==
+                        before + (kBuffers - 1) * kBytes,
+                    "a released addressed buffer is still counted");
+            buffers[index] = backend.allocateAddressed(kBytes);
+            entries[index] = buffers[index].gpuAddress();
+            ++regrown;
+        }
+        if (round == kRounds / 2) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!backend.lapsedResidentBytes() &&
+                   std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            require(backend.lapsedResidentBytes() == kBuffers * kBytes,
+                    "addressed buffers did not lapse with the residency set");
+            lapsedRound = true;
+        }
+        seed = 0x9e3779b9u * (round + 1);
+        *static_cast<uint32_t *>(mismatches.contents()) = 0;
+        auto ticket = backend.submitCommandAsync(command);
+        require(backend.commandInFlight(), "a submitted command is not in flight");
+        (void)ticket.wait();
+        require(!backend.commandInFlight(), "a consumed command is still in flight");
+        require(*static_cast<uint32_t *>(mismatches.contents()) == 0,
+                "round " + std::to_string(round) +
+                    " read wrong data through the addresses of its buffers");
+    }
+    buffers.clear();
+    require(backend.memoryStats().allocatedBytes == before &&
+                backend.lapsedResidentBytes() == 0,
+            "released addressed buffers stayed counted or in the residency set");
+    std::cout << "PASS addressed buffers through tables rounds=" << kRounds
+              << " regrown=" << regrown << " lapsed_round=" << lapsedRound << '\n';
+}
+
 id<MTLSharedEvent> submissionGate = nil;
 id<MTLSharedEvent> delayedMappingEvent = nil;
 IMP originalSparseSignal = nullptr;
@@ -1504,6 +1620,7 @@ int main(int argc, const char *argv[]) {
             keptBuffersStayResident(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);
             residencyEndsWithoutBlits(argv[1]);
+            addressedBuffersThroughTables(argv[1]);
             run(argv[1]);
         } catch (const std::exception &error) {
             std::cerr << "FAIL: unexpected exception: " << error.what()
