@@ -386,9 +386,32 @@ bool Engine::admitQueued(double now) {
       std::count_if(requests_.begin(), requests_.end(), [](const auto &entry) {
         return entry.second.stateCell.has_value();
       }) >= model::ExecutionLimits::maximumBatchWidth;
-  std::vector<PrefillAdmission> candidates;
-  for (uint64_t id : order) {
+  // Waiting for scheduling, or behind a request that was refused memory,
+  // does not consume the memory-retry deadline.
+  const auto queue = [&](uint64_t id) {
     Request &active = request(id);
+    active.admissionProbe.reset();
+    active.resourceWait = {};
+    scheduler_.deferAdmission(id);
+  };
+  // A request whose start was refused memory closes admission behind it
+  // until it starts: admission is open for order[0, open). What reclaim and
+  // finishing lanes free would otherwise keep going to later arrivals that
+  // need less of it at once, and it would wait for as long as they keep
+  // coming. Waiting for a free lane closes nothing: nothing starts without
+  // one.
+  size_t open = order.size();
+  std::vector<PrefillAdmission> candidates;
+  for (size_t index = 0; index < order.size(); ++index) {
+    const uint64_t id = order[index];
+    Request &active = request(id);
+    if (index >= open) {
+      if (!active.restore)
+        queue(id);
+      continue;
+    }
+    if (active.refusedMemory)
+      open = index + 1;
     if (active.restore || !resourceRetryReady(active, now))
       continue;
     if (cellsFull) {
@@ -407,28 +430,37 @@ bool Engine::admitQueued(double now) {
     }
     candidates.push_back({id, cached});
   }
+  const auto position = [&](uint64_t id) {
+    return static_cast<size_t>(std::find(order.begin(), order.end(), id) - order.begin());
+  };
   bool progressed = false;
   while (!candidates.empty()) {
     const auto selected = scheduler_.prefillAdmissionOrder(candidates);
     if (selected.empty())
       break;
     for (uint64_t id : selected) {
+      if (position(id) >= open)
+        continue;
       progressed = admit(request(id), now) || progressed;
       std::erase_if(candidates, [id](const auto &value) {
         return value.requestId == id;
       });
+      // Refused memory in this pass, it closes admission behind it at once.
+      if (request(id).refusedMemory)
+        open = std::min(open, position(id) + 1);
     }
-    // Failed admissions must not prevent other eligible work from running.
+    std::erase_if(candidates, [&](const auto &value) {
+      if (position(value.requestId) < open)
+        return false;
+      queue(value.requestId);
+      return true;
+    });
+    // A request that could not start holds back only what arrived after it.
     if (progressed)
       break;
   }
-  // Waiting for scheduling does not consume the memory-retry deadline.
-  for (const auto &candidate : candidates) {
-    Request &active = request(candidate.requestId);
-    active.admissionProbe.reset();
-    active.resourceWait = {};
-    scheduler_.deferAdmission(candidate.requestId);
-  }
+  for (const auto &candidate : candidates)
+    queue(candidate.requestId);
   return progressed;
 }
 
@@ -489,6 +521,7 @@ bool Engine::pendingSharedPrefill(const Request &active,
 
 bool Engine::admit(Request &active, double now) {
   const bool resuming = active.suspended;
+  active.refusedMemory = false;
   ModelRequest modelRequest = active.request.modelView();
   if (resuming)
     modelRequest.prompt = active.exactTokens;
@@ -565,6 +598,7 @@ bool Engine::admit(Request &active, double now) {
                        true});
         return true;
       }
+      active.refusedMemory = admission.failure == StateFailure::MemoryPressure;
       scheduler_.waitForResources(active.request.id);
       deferResourceRetry(active, now, denial, admission.failure);
       return false;
@@ -600,17 +634,14 @@ bool Engine::admit(Request &active, double now) {
       active.stateCell.reset();
       executorStarted = resourcesStarted = false;
       const Verdict verdict = judge(kv.denial, requestId);
-      if (verdict == Verdict::Fail && restoring) {
-        // Release the prefix pin before retrying without its memory footprint.
-        active.skipCache = true;
-        scheduler_.waitForResources(requestId);
-        deferResourceRetry(active, now, kv.denial);
-        return false;
-      }
-      if (verdict == Verdict::Fail) {
+      if (verdict == Verdict::Fail && !restoring) {
         finishCapacity(active, kv.allocation);
         return true;
       }
+      // Release the prefix pin before retrying without its memory footprint.
+      if (verdict == Verdict::Fail)
+        active.skipCache = true;
+      active.refusedMemory = true;
       scheduler_.waitForResources(requestId);
       deferResourceRetry(active, now, kv.denial);
       return false;

@@ -1756,7 +1756,9 @@ void testFullStateCellsSkipAdmissionAttempts() {
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   executor.decodeFinishes = false;
-  // Request 4 is the last of the first four admissions and meets pressure.
+  // The first pass starts the three short prompts and tries request 5, the
+  // fourth of its batch, which meets pressure. Request 4 arrived before it
+  // with a long prompt, so it is not held back and takes the last cell.
   executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 4; };
   Events events;
   engine::Engine engine({.resourceWaitTimeoutMilliseconds = 1000.0},
@@ -1767,14 +1769,17 @@ void testFullStateCellsSkipAdmissionAttempts() {
     value.deadlineMilliseconds = 100'000;
     engine.submit(std::move(value));
   };
-  for (uint64_t id = 1; id <= 4; ++id)
-    submit(id, id == 4 ? 64 : 33);
-  require(engine.tick(1) && engine.resourceWaitSnapshot(1).memory == 1,
+  for (uint64_t id = 1; id <= 3; ++id)
+    submit(id, 33);
+  submit(4, 129);
+  submit(5, 64);
+  require(engine.tick(1) && engine.resourceWaitSnapshot(1).memory == 1 &&
+              executor.lastBeginId == 5,
           "fixture did not leave one request waiting for memory");
-  submit(5, 33);
   for (double now = 2; now <= 6; ++now)
     static_cast<void>(engine.tick(now));
-  require(executor.requests.size() == 4 && executor.beginAttempts == 5,
+  require(executor.requests.size() == 4 && executor.requests.contains(4) &&
+              executor.beginAttempts == 5,
           "fixture did not make every state cell resident");
 
   for (double now : {200.0, 201.0, 1200.0, 1201.0})
@@ -1785,7 +1790,7 @@ void testFullStateCellsSkipAdmissionAttempts() {
           "full state cells retried admission or kept the memory wait limit");
   engine.cancel(1);
   require(engine.tick(1202) && executor.beginAttempts == 6 &&
-              events.startIds.back() == 4,
+              events.startIds.back() == 5,
           "a released state cell did not admit the waiting request");
   for (uint64_t id : {2, 3, 4, 5})
     engine.cancel(id);
@@ -2581,7 +2586,9 @@ void testAdmissionUsesCachedRemainingWork() {
           "cache-aware admission failed to finish");
 }
 
-void testFailedAdmissionDoesNotBlockOtherWork() {
+// A request that waits for memory closes admission behind it: the request
+// that arrived after it is not tried, and starts once the first has.
+void testMemoryWaitHoldsBackLaterArrivals() {
   Storage storage(1024);
   KvPool pool(storage);
   engine::Cache resources(pool, CacheNamespace{});
@@ -2594,12 +2601,96 @@ void testFailedAdmissionDoesNotBlockOtherWork() {
   executor.beginGrowthBlocked = [&] { return executor.beginAttempts <= 2; };
   engine.submit(request(1, std::vector<uint32_t>(4097, 47)));
   engine.submit(request(2, std::vector<uint32_t>(8193, 48)));
-  require(engine.tick(1) && executor.requests.contains(2) &&
-              !executor.requests.contains(1),
-          "failed prefill admission blocked a runnable peer");
-  runUntilIdle(engine);
+  static_cast<void>(engine.tick(1));
+  require(executor.beginAttempts == 2 && executor.requests.empty() &&
+              engine.resourceWaitSnapshot(1).memory == 1,
+          "a later arrival was tried while an earlier request waits for memory");
+  double now = 102;
+  tickUntil(engine, now, [&] { return executor.requests.contains(2); },
+            "the later arrival did not start after the request it waited behind");
+  require(events.startIds == std::vector<uint64_t>{1, 2},
+          "the requests did not start in the order they arrived");
+  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
   require(events.completedCount == 2 && events.failedCount == 0,
-          "failed admission did not recover");
+          "a request held back behind a memory wait did not finish");
+}
+
+// Beside a resident lane a request waits for memory. Nothing that arrived
+// after it starts before it does, however little it needs; a higher priority
+// is ahead of it and starts. The requests held back queue without a memory
+// wait of their own, and start in order once the waiting request has.
+void testMemoryWaitClosesAdmissionBesideAResidentLane() {
+  Storage storage(2048);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  bool refused = true;
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return refused && executor.lastBeginId == 2; };
+  double now = 1;
+  engine.submit(request(1, std::vector<uint32_t>(16385, 1)));
+  require(engine.tick(now++) && executor.requests.contains(1), "the first request did not start");
+  engine.submit(request(2, std::vector<uint32_t>(4097, 2)));
+  tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).memory == 1; },
+            "the refused request is not waiting for memory");
+  engine.submit(request(3, std::vector<uint32_t>(65, 3)));
+  for (uint32_t step = 0; step < 4; ++step)
+    static_cast<void>(engine.tick(now++));
+  require(!executor.requests.contains(3) && !events.usage.contains(3) &&
+              engine.resourceWaitSnapshot(now).memory == 1 && events.failedCount == 0,
+          "a later arrival started ahead of a request that waits for memory");
+  auto urgent = request(4, std::vector<uint32_t>(65, 4));
+  urgent.priority = RequestPriority::Foreground;
+  engine.submit(std::move(urgent));
+  tickUntil(engine, now, [&] { return executor.requests.contains(4) || events.usage.contains(4); },
+            "closed admission held back a higher priority");
+  require(!executor.requests.contains(3) && !events.usage.contains(3),
+          "admission reopened for a later arrival of the same priority");
+  refused = false;
+  now += 100;
+  tickUntil(engine, now, [&] { return executor.requests.contains(2); },
+            "the waiting request did not start once its memory was there");
+  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  const auto started = [&](uint64_t id) {
+    return std::find(events.startIds.begin(), events.startIds.end(), id) - events.startIds.begin();
+  };
+  require(events.completedCount == 4 && events.failedCount == 0 && started(2) < started(3) &&
+              executor.prefillRows == 16385 + 4097 + 65 + 65,
+          "closed admission lost work or started it out of order");
+}
+
+// The request that closed admission is cancelled: what queued behind it
+// starts without it.
+void testClosedAdmissionReopensWhenTheWaitEnds() {
+  Storage storage(2048);
+  KvPool pool(storage);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return executor.lastBeginId == 2; };
+  double now = 1;
+  engine.submit(request(1, std::vector<uint32_t>(16385, 1)));
+  require(engine.tick(now++) && executor.requests.contains(1), "the first request did not start");
+  engine.submit(request(2, std::vector<uint32_t>(4097, 2)));
+  tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).memory == 1; },
+            "the refused request is not waiting for memory");
+  engine.submit(request(3, std::vector<uint32_t>(65, 3)));
+  for (uint32_t step = 0; step < 4; ++step)
+    static_cast<void>(engine.tick(now++));
+  require(!executor.requests.contains(3) && !events.usage.contains(3),
+          "admission did not close behind the request that waits for memory");
+  engine.cancel(2);
+  tickUntil(engine, now, [&] { return executor.requests.contains(3) || events.usage.contains(3); },
+            "admission stayed closed after the waiting request was cancelled");
+  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  // The cancelled request is reported as ended, without a row of its own.
+  require(events.completedCount == 3 && events.failedCount == 0 &&
+              engine.snapshot().cancelled == 1 && executor.prefillRows == 16385 + 65,
+          "a cancelled wait left work behind");
 }
 
 void testSchedulingWaitDoesNotConsumeMemoryTimeout() {
@@ -6304,7 +6395,9 @@ int main() {
     testSingletonCapacityFailureTerminatesCleanly();
     testQueuedLongPrefillsLeaveRoomForShortWork();
     testAdmissionUsesCachedRemainingWork();
-    testFailedAdmissionDoesNotBlockOtherWork();
+    testMemoryWaitHoldsBackLaterArrivals();
+    testMemoryWaitClosesAdmissionBesideAResidentLane();
+    testClosedAdmissionReopensWhenTheWaitEnds();
     testSchedulingWaitDoesNotConsumeMemoryTimeout();
     testUnadmittedRequestsHonorCancellationAndDeadline();
     testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield();

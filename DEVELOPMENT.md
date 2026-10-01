@@ -765,7 +765,11 @@ request in service needs pauses and the cache gives memory back, a paced pass at
 a time, down to one lane's state buffers and one KV extent. A request in service
 keeps growing within `--max-memory`, first into cached pages no request holds.
 A new request waits while another is in service unless it can start from what
-the engine already holds, and with none in service it starts. Critical pressure
+the engine already holds, and with none in service it starts. A request whose
+start was refused memory, under host pressure or at `--max-memory`, holds back
+the requests that arrived after it until it starts, fails or is cancelled, so
+the lanes that finish leave their memory to it; a higher priority is not held
+back. Critical pressure
 evicts every unpinned cache entry and stops all growth. `/ready` remains healthy
 throughout.
 

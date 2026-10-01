@@ -152,6 +152,10 @@ private:
     // A failed dispatch must fit before replay can consume any model work.
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;
+    // The latest attempt to start it was refused memory. Until it starts,
+    // nothing that arrived after it is admitted (admitQueued); a pass that
+    // does not schedule it leaves that in place.
+    bool refusedMemory = false;
     std::vector<uint32_t> exactTokens;
     std::optional<CacheProbe> admissionProbe;
     std::vector<StateBoundary> stateBoundaries;
