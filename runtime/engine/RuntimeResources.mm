@@ -299,8 +299,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
     // Reject a model that cannot fit before preparing or registering its
     // weights. Beside them the plan needs at least the runtime reserves, one
-    // state cell, one KV extent and any disk tier KV staging; the full plan
-    // below adds the arenas.
+    // state cell and one KV extent; the full plan below adds the arenas.
     kv::Layout kvLayout = config.model.targetKvLayout;
     kvLayout.format = config.kvFormat;
     uint64_t requiredBytes = 0;
@@ -309,18 +308,15 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
           model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
           config.model.stateLayout.activeCellBytes(),
           uint64_t{kvLayout.minimumExtentPages()} *
-              kvLayout.bytesPerModelPage(),
-          config.maximumCacheDiskBytes ? model::KvPageTier::stagingBytesFor(kvLayout)
-                                       : 0}) {
+              kvLayout.bytesPerModelPage()}) {
       if (!checkedAdd(requiredBytes, bytes, requiredBytes))
         requiredBytes = std::numeric_limits<uint64_t>::max();
     }
     if (requiredBytes > hardBudgetBytes) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
-          "model weights with the runtime reserves, one state cell, one KV "
-          "extent and any disk tier KV staging require " +
-              std::to_string(requiredBytes) +
+          "model weights with the runtime reserves, one state cell and one "
+          "KV extent require " + std::to_string(requiredBytes) +
               " bytes but the Metal memory budget is " +
               std::to_string(hardBudgetBytes) + " bytes",
           deviceStatusJson(device), {}, RuntimeResourceFailure::EngineCapacity);
@@ -357,12 +353,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   // The engine lends it to model execution without inspecting kernel choices.
   ops::ExecutionPlans operators(device);
   model::ModelMemoryPlan modelMemoryPlan;
-  // The disk tier's KV staging is Metal memory the governor charges beside
-  // the weights, so the plan sets it aside before it sizes the KV pool.
-  const uint64_t kvStagingBytes =
-      config.maximumCacheDiskBytes
-          ? model::KvPageTier::stagingBytesFor(package.targetKvLayout(config.kvFormat))
-          : 0;
   auto prepareMemory = [&]() -> EngineMemoryPlan {
     try {
       modelMemoryPlan = model::plannedRuntimeMemory(device, package, operators, config.kvFormat);
@@ -385,7 +375,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         modelMemoryPlan.sharedDecodePlannedAllocatedBytes,
         modelMemoryPlan.pipelineReserveBytes,
         modelMemoryPlan.runtimeOverheadReserveBytes,
-        kvStagingBytes,
     };
 
     ModelMemoryProfile modelProfile{
@@ -497,12 +486,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       try {
         const uint64_t slotBytes = model::KvPageTier::slotBytesFor(*kvPages);
         kvTier = std::make_unique<model::KvPageTier>(
-            *backend, *kvPages, std::make_shared<model::SlotFile>(slotBytes, diskBudget));
+            *kvPages, std::make_shared<model::SlotFile>(slotBytes, diskBudget));
         logKernelStartup("Cache disk tier: ", config.maximumCacheDiskBytes / kMiB,
                          " MiB for KV pages of ", slotBytes / 1024, " KiB and states of ",
-                         stateBytes / kMiB, " MiB; KV pages stage through ",
-                         kvStagingBytes / kMiB, " MiB of Metal memory",
-                         stateFile ? ", states through host memory." : ".");
+                         stateBytes / kMiB, " MiB.");
       } catch (const std::exception &error) {
         logKernelStartup("Cache disk KV storage disabled; state storage remains enabled (",
                          error.what(), ").");
@@ -558,7 +545,6 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       maximumImagePatches_,
       budget.pipelineReserveBytes,
       budget.runtimeOverheadReserveBytes,
-      kvTier_.get(),
   };
 }
 
@@ -573,7 +559,6 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   report.sharedPrefillBytes = modelMemory.sharedPrefillActualAllocatedBytes;
   report.sharedDecodeBytes = modelMemory.sharedDecodeActualAllocatedBytes;
   report.kvResidentBytes = kvPages_->actualAllocatedBytes();
-  report.kvStagingBytes = kvTier_ ? kvTier_->actualAllocatedBytes() : 0;
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh current residency after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();

@@ -233,9 +233,8 @@ bool Engine::tick(double now) {
     Pending command = std::move(*pending_);
     pending_.reset();
     std::vector<ModelStepResult> results = command.ticket->wait();
-    if (!command.plan.empty())
-      apply(command.plan, results, command.ticket->wallMilliseconds(),
-            command.ticket->prefillTimingIsRepresentative());
+    apply(command.plan, results, command.ticket->wallMilliseconds(),
+          command.ticket->prefillTimingIsRepresentative());
     sweepTerminal();
     return true;
   }
@@ -261,12 +260,6 @@ bool Engine::tick(double now) {
     case Prepared::Waiting:
       break;
     }
-  }
-  // No model work runs: queued KV copies ride a command of their own, so a
-  // restore or a demotion never waits for the next batch.
-  if (auto ticket = model_.submitTransfers(completionNotifier_)) {
-    pending_ = Pending{BatchPlan{}, std::move(ticket)};
-    return true;
   }
   return progressed;
 }

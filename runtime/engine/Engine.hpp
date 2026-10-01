@@ -174,7 +174,6 @@ private:
     std::optional<Restore> restore;
   };
 
-  // An empty plan carries only KV copies for the disk tier.
   struct Pending final {
     BatchPlan plan;
     std::unique_ptr<ModelBatchTicket> ticket;

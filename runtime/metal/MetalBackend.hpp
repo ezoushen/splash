@@ -242,9 +242,9 @@ public:
   // A shared, hazard-untracked buffer that kernels reach only through GPU
   // addresses held in other buffers, as they reach KV pages: the residency
   // set makes it resident for every command, so nothing names it per command
-  // or dispatch. The CPU reaches it too, through contents(). Fails with
-  // MetalAllocationError unless Metal allocates exactly `bytes`, the amount
-  // admission charged.
+  // or dispatch. The CPU reaches it too, through contents(), which is how the
+  // disk tier moves KV pages. Fails with MetalAllocationError unless Metal
+  // allocates exactly `bytes`, the amount admission charged.
   [[nodiscard]] MetalBuffer allocateAddressed(uint64_t bytes,
                                               std::string_view label = {});
 

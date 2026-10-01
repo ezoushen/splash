@@ -329,12 +329,6 @@ public:
   std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) override {
-    // Like every production batch command, this one carries the tier's
-    // queued copies; the test finishes the transfers themselves.
-    if (tier && tier->copiesQueued()) {
-      tier->queued = false;
-      ++carryingCommands;
-    }
     // Every constrained cycle after the initial mask request waits for its
     // mask inside the ticket, as the production constrained ticket does.
     if (plan.kind == WorkKind::Decode &&
@@ -402,20 +396,6 @@ public:
       overlap->provided = true;
   }
   void end(uint64_t id) override { requests.erase(id); }
-  // A command that carries only the tier's queued copies; the test finishes
-  // the transfers themselves.
-  std::unique_ptr<ModelBatchTicket>
-  submitTransfers(std::function<void()> completion) override {
-    if (!tier || !tier->copiesQueued())
-      return nullptr;
-    tier->queued = false;
-    ++transferCommands;
-    return test::immediateTicket({}, completion);
-  }
-
-  test::TestKvTier *tier = nullptr;
-  uint32_t transferCommands = 0;
-  uint32_t carryingCommands = 0;
 
   struct Request {
     uint32_t slot = 0;
@@ -1657,7 +1637,6 @@ void testPressureReclaimFollowsTheChain() {
   test::TestKvTier tier;
   engine::Cache cache(pool, CacheNamespace{}, &tier);
   Executor executor;
-  executor.tier = &tier;
   Events events;
   engine::Engine engine({}, cache, executor, events);
   std::vector<uint32_t> prompt(129);
@@ -4614,7 +4593,7 @@ void testGrowthWaitsForTheStateWriteInFlight() {
 
 // A physical shortfall is covered in one pass: when the pool cannot map
 // backing for its free pages, the reclaim between attempts demotes as many
-// leaves as the shortfall needs, within the ring's share, and the lane waits
+// leaves as the shortfall needs, within the tier's share, and the lane waits
 // once for their pages instead of once per page.
 // A lane that cannot run must never leave the engine without a wakeup: the
 // transfer it waits for wakes it, and if that wake is missed the retry
@@ -4625,10 +4604,9 @@ void testWaitingLaneAlwaysNamesAWakeup() {
   Backing backing(8);
   KvPool pool(backing);
   test::TestKvTier tier;
-  tier.stagingSlots = 8;
+  tier.transferLimit = 8;
   engine::Cache cache(pool, CacheNamespace{}, &tier);
   Executor executor;
-  executor.tier = &tier;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   auto transfer = std::make_shared<OffloadControl>();
@@ -4644,15 +4622,13 @@ void testWaitingLaneAlwaysNamesAWakeup() {
   }
   engine.submit(request(1, std::vector<uint32_t>(97, 7)));
   static_cast<void>(engine.tick(1));
-  require(tier.demotions == 1 && executor.prefillRows == 0 && executor.transferCommands == 1,
+  require(tier.demotions == 1 && executor.prefillRows == 0,
           "the lane did not wait for a page");
-  // The copies ride a command of their own; its completion is the next wake.
-  static_cast<void>(engine.tick(2));
   const auto wakeup = engine.nextWakeupMilliseconds();
   require(wakeup.has_value() && *wakeup <= 1.0 + 100.0,
           "a waiting lane left the engine without a bounded wakeup");
   // The wait ends on its own once the pages are back.
-  for (uint32_t step = 3; step < 40 && !engine.idle(); ++step) {
+  for (uint32_t step = 2; step < 40 && !engine.idle(); ++step) {
     tier.complete();
     static_cast<void>(engine.tick(step));
   }
@@ -4669,7 +4645,6 @@ void testNothingInFlightIsNotPending() {
   tier.writableFile = false;
   engine::Cache cache(pool, CacheNamespace{}, &tier);
   Executor executor;
-  executor.tier = &tier;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   auto transfer = std::make_shared<OffloadControl>();
@@ -4695,11 +4670,10 @@ void testPhysicalShortfallDemotesInBulk() {
   Backing backing(16);
   KvPool pool(backing);
   test::TestKvTier tier;
-  tier.stagingSlots = 8;
+  tier.transferLimit = 8;
   tier.capacity = 8;
   engine::Cache cache(pool, CacheNamespace{}, &tier);
   Executor executor;
-  executor.tier = &tier;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   auto transfer = std::make_shared<OffloadControl>();
@@ -4899,7 +4873,6 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   test::TestKvTier tier;
   engine::Cache cache(pool, CacheNamespace{}, &tier);
   Executor executor;
-  executor.tier = &tier;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   std::vector<uint32_t> prompt(65, 17);
@@ -4924,8 +4897,8 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   engine.submit(request(1, prompt));
   static_cast<void>(engine.tick(1));
   require(executor.diskReads == 1 && tier.restores == 2 && executor.prefillRows == 0 &&
-              events.starts.empty() && executor.transferCommands == 1,
-          "lane ran before its pages came back, or no command carried the copies");
+              events.starts.empty(),
+          "lane ran before its pages came back");
   // The state read lands first; the lane still waits for its pages.
   executor.restoreControl->ready = true;
   static_cast<void>(engine.tick(2));
@@ -4948,10 +4921,9 @@ void testCancelledDiskPrefixStopsQueuedReads() {
   Backing backing(128);
   KvPool pool(backing);
   test::TestKvTier tier;
-  tier.stagingSlots = 1;
+  tier.transferLimit = 1;
   engine::Cache cache(pool, CacheNamespace{}, &tier);
   Executor executor;
-  executor.tier = &tier;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   const std::vector<uint32_t> prompt(129, 17);
@@ -4969,7 +4941,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
   engine.submit(request(1, prompt));
   static_cast<void>(engine.tick(1));
   require(tier.restores == 1 && executor.diskReads == 1,
-          "restore did not start within staging capacity");
+          "restore did not start within the tier's limit");
   engine.cancel(1);
   executor.restoreControl->ready = true;
   static_cast<void>(engine.tick(2));
@@ -5003,10 +4975,9 @@ void testPagesReturnFromDemotionWithoutSuspending() {
   Backing backing(8);
   KvPool pool(backing);
   test::TestKvTier tier;
-  tier.stagingSlots = 8;
+  tier.transferLimit = 8;
   engine::Cache cache(pool, CacheNamespace{}, &tier);
   Executor executor;
-  executor.tier = &tier;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   // Six cached blocks, each under a state on disk, hold six of eight pages.
@@ -5027,7 +4998,7 @@ void testPagesReturnFromDemotionWithoutSuspending() {
   // pages against two free ones.
   engine.submit(request(1, std::vector<uint32_t>(97, 7)));
   static_cast<void>(engine.tick(1));
-  require(tier.demotions == 1 && executor.transferCommands == 1 && executor.suspensions == 0 &&
+  require(tier.demotions == 1 && executor.suspensions == 0 &&
               executor.prefillRows == 0 && events.failedCount == 0,
           "the lane yielded or more than one block was written");
   static_cast<void>(engine.tick(2));
@@ -5050,18 +5021,17 @@ void testPagesReturnFromDemotionWithoutSuspending() {
 }
 
 // A lane whose pages keep landing is never failed for waiting: the resource
-// limit measures time without progress. With one staging slot every round
-// moves one page, so the restore takes many rounds and several times the
-// limit, and still completes as a prefix hit.
+// limit measures time without progress. With one transfer at a time every
+// round moves one page, so the restore takes many rounds and several times
+// the limit, and still completes as a prefix hit.
 void testWaitWithProgressOutlivesTheResourceLimit() {
   constexpr auto reuse = CacheReclaimMode::ReuseBacking;
   Backing backing(8);
   KvPool pool(backing);
   test::TestKvTier tier;
-  tier.stagingSlots = 8;
+  tier.transferLimit = 8;
   engine::Cache cache(pool, CacheNamespace{}, &tier);
   Executor executor;
-  executor.tier = &tier;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   // A three-block prefix and its state move to disk entirely.
@@ -5090,7 +5060,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
   }
   require(pool.freePageCount() == 2, "fixture pages are off");
 
-  tier.stagingSlots = 1;
+  tier.transferLimit = 1;
   executor.restoreControl->ready = true;
   EngineRequest waiting = request(1, prompt);
   waiting.deadlineMilliseconds = 1e9;
@@ -5122,10 +5092,9 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
   KvPool pool(backing);
   test::TestKvTier tier;
   tier.capacity = 64;
-  tier.stagingSlots = 8;
+  tier.transferLimit = 8;
   engine::Cache cache(pool, CacheNamespace{}, &tier);
   Executor executor;
-  executor.tier = &tier;
   executor.decodeFinishes = false;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -5205,10 +5174,9 @@ void testRestoringLaneWaitsForResidentLanes() {
   Backing backing(8);
   KvPool pool(backing);
   test::TestKvTier tier;
-  tier.stagingSlots = 8;
+  tier.transferLimit = 8;
   engine::Cache cache(pool, CacheNamespace{}, &tier);
   Executor executor;
-  executor.tier = &tier;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   // A two-block prefix and its state move to disk.
@@ -5249,9 +5217,9 @@ void testRestoringLaneWaitsForResidentLanes() {
           "the restoring lane did not run on its prefix once pages returned");
 }
 
-// A tool-using lane is runnable on every tick, so the engine never reaches
-// its copy-only command while one decodes. A restore still completes beside
-// it, on the copies that lane's own commands carry.
+// A tool-using lane is runnable on every tick and keeps the model busy. A
+// restore still completes beside it: its reads land whatever the model runs,
+// and the restoring lane starts on its prefix while the other decodes.
 void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   constexpr auto reuse = CacheReclaimMode::ReuseBacking;
   Backing backing(128);
@@ -5259,7 +5227,6 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   test::TestKvTier tier;
   engine::Cache cache(pool, CacheNamespace{}, &tier);
   Executor executor;
-  executor.tier = &tier;
   executor.decodeFinishes = false;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -5275,19 +5242,15 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
     require(cache.pollTransfers(), "block did not land");
   }
 
-  // The frontend answers every mask request on the tick that made it, and a
-  // transfer lands once a command has carried its copy.
+  // The frontend answers every mask request on the tick that made it, and
+  // transfers land between ticks.
   const std::array<uint32_t, 1> mask{1};
   uint32_t answered = 0;
-  uint32_t carried = 0;
   auto step = [&](double now) {
     static_cast<void>(engine.tick(now));
     for (; answered < events.maskRequests.size(); ++answered)
       engine.provideMask(events.maskRequests[answered].first, mask);
-    if (executor.carryingCommands != carried) {
-      carried = executor.carryingCommands;
-      tier.complete();
-    }
+    tier.complete();
   };
   EngineRequest decoding = constrainedRequest(1, 1e9);
   decoding.maxNewTokens = 1000;
@@ -5304,9 +5267,9 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   require(events.startIds.size() == 2 && events.starts[1].first == EngineCacheStatus::PrefixHit &&
               events.starts[1].second == 64 && executor.restored == 64,
           "the restore waited for the constrained lane to stop decoding");
-  require(executor.transferCommands == 0 && events.completedCount == 0 &&
-              events.failedCount == 0 && cache.snapshot().kvTier.restores == 2,
-          "the restore did not ride the constrained lane's commands");
+  require(events.completedCount == 0 && events.failedCount == 0 &&
+              cache.snapshot().kvTier.restores == 2,
+          "the constrained lane stopped, or the restore did not land whole");
 }
 
 int main() {

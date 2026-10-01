@@ -2,13 +2,15 @@
 #include "tests/engine/AllocationFailure.hpp"
 
 #include "engine/MemoryGovernor.hpp"
-#include "metal/CommandGraph.hpp"
-#include "metal/abi/KvCopy.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
-#include <functional>
 #include <iostream>
+#include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -25,16 +27,35 @@ void require(bool condition, const char *message) {
   if (!condition) throw std::runtime_error(message);
 }
 
-std::vector<std::byte> pattern(uint64_t bytes, uint64_t payload, uint32_t seed) {
+std::vector<std::byte> pattern(uint64_t bytes, uint32_t seed) {
   std::vector<std::byte> result(bytes);
   uint32_t state = seed;
-  for (uint64_t index = 0; index < payload; ++index) {
+  for (std::byte &value : result) {
     state ^= state << 13;
     state ^= state >> 17;
     state ^= state << 5;
-    result[index] = static_cast<std::byte>(state);
+    value = static_cast<std::byte>(state);
   }
   return result;
+}
+
+// A page's bytes through the extent's host memory, in the order the tier
+// stores them.
+std::vector<std::byte> contents(const kv::PageStorage &pages, uint32_t page) {
+  std::vector<std::byte> bytes;
+  for (const auto span : pages.spans(page)) bytes.insert(bytes.end(), span.begin(), span.end());
+  return bytes;
+}
+
+// Writes a pattern to a page the same way and returns it.
+std::vector<std::byte> fill(const kv::PageStorage &pages, uint32_t page, uint32_t seed) {
+  const auto bytes = pattern(pages.bytesPerPage(), seed);
+  auto next = bytes.begin();
+  for (const auto span : pages.spans(page)) {
+    std::copy_n(next, span.size(), span.begin());
+    next += static_cast<std::ptrdiff_t>(span.size());
+  }
+  return bytes;
 }
 
 std::shared_ptr<SlotFile::Slot> fileSlot(const std::shared_ptr<model::KvDiskSlot> &slot) {
@@ -47,63 +68,28 @@ std::vector<std::byte> readSlot(SlotFile &file, const std::shared_ptr<model::KvD
   return bytes;
 }
 
-// Drives the tier the way the engine and runtime do: poll, ride the queued
-// copies on a command, report its completion, poll again.
-void runUntilReady(KvPageTier &tier, metal::MetalBackend &backend, KvTransfer &transfer) {
-  for (int spin = 0; spin < 100000; ++spin) {
+// A disk slot holds its page's bytes and zeros up to its aligned size.
+bool holdsPage(const std::vector<std::byte> &slot, const std::vector<std::byte> &page) {
+  return slot.size() >= page.size() && std::equal(page.begin(), page.end(), slot.begin()) &&
+         std::all_of(slot.begin() + static_cast<std::ptrdiff_t>(page.size()), slot.end(),
+                     [](std::byte value) { return value == std::byte{0}; });
+}
+
+// Drives the tier the way the engine does: poll until the worker's IO is
+// retired.
+void runUntilReady(KvPageTier &tier, KvTransfer &transfer) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  while (std::chrono::steady_clock::now() < deadline) {
     tier.poll();
     if (transfer.ready()) return;
-    if (tier.copiesQueued()) {
-      metal::CommandGraph graph;
-      const auto report = tier.encode(graph);
-      require(report && !graph.empty(), "queued copies were not encoded");
-      static_cast<void>(backend.submitCommand(graph.dispatches()));
-      report();
-    } else {
-      std::this_thread::yield();
-    }
+    std::this_thread::yield();
   }
   throw std::runtime_error("KV transfer did not complete");
 }
 
-void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
-              kv::Format format) {
-  const kv::Layout layout{2, 2, 256, format};
-  kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
-                        layout.minimumExtentPages(), layout.minimumExtentPages());
-  const uint64_t bytes = KvPageTier::slotBytesFor(pages);
-  for (bool restoring : {false, true}) {
-    bool completed = false;
-    for (int failure = 0; failure < 64; ++failure) {
-      auto file = std::make_shared<SlotFile>(bytes, bytes);
-      KvPageTier tier(backend, pages, file, 1);
-      auto slot = tier.acquireSlot();
-      const auto payload = pattern(bytes, pages.bytesPerPage(), 123);
-      require(file->write(fileSlot(slot), {payload}, {})->wait(), "fault slot seed failed");
-      std::unique_ptr<KvTransfer> transfer;
-      allocationFailureAfter = failure;
-      try {
-        transfer = restoring ? tier.restore(slot, 0, {}) : tier.demote(0, slot, {});
-        allocationFailureAfter = -1;
-      } catch (const std::bad_alloc &) {
-        allocationFailureAfter = -1;
-        require(tier.canDemote() && !tier.copiesQueued() && file->idle(),
-                "failed transfer submission retained staging or untracked IO");
-        continue;
-      }
-      require(transfer != nullptr, "transfer refused after allocation failures");
-      runUntilReady(tier, backend, *transfer);
-      require(transfer->finish() && tier.canDemote(), "transfer did not recover");
-      completed = true;
-      break;
-    }
-    require(completed, "transfer allocation sweep never reached success");
-  }
-}
-
-// Two pages in different extents go disk -> page -> disk through a single
-// staging slot, so every copy lands on staging that still holds the other
-// page: a range the kernel skipped would surface as the wrong pattern.
+// Two pages in different extents go from their extents to disk and back.
+// Between the two the host overwrites them, so what a restore leaves in a
+// page is what the worker read; the pages beside them keep their own bytes.
 void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                kv::Layout layout) {
   const uint32_t extent = layout.minimumExtentPages();
@@ -118,204 +104,260 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   require(slotBytes >= payload && slotBytes < payload + SlotFile::kAlignmentBytes &&
               slotBytes % SlotFile::kAlignmentBytes == 0,
           "KV slot size is not the page rounded up for uncached IO");
-  auto file = std::make_shared<SlotFile>(slotBytes, 4 * slotBytes);
-  KvPageTier tier(backend, pages, file, 1);
+  auto file = std::make_shared<SlotFile>(slotBytes, 2 * slotBytes);
+  KvPageTier tier(pages, file);
   require(tier.slotBytes() == slotBytes, "tier reports another slot size");
 
-  const auto first = pattern(slotBytes, payload, 0x1234567u);
-  const auto second = pattern(slotBytes, payload, 0x89abcdefu);
+  const auto first = fill(pages, pageA, 0x1234567u);
+  const auto second = fill(pages, pageB, 0x89abcdefu);
+  const auto beforeA = fill(pages, pageA - 1, 0x600df00du);
+  const auto afterB = fill(pages, pageB + 1, 0x0ddba11u);
+  require(contents(pages, pageA) == first && contents(pages, pageB) == second,
+          "a page does not hold what the host wrote through its spans");
+
   auto slotA = tier.acquireSlot();
   auto slotB = tier.acquireSlot();
-  require(slotA && slotB, "disk slots were not granted");
-  require(file->write(fileSlot(slotA), {first}, {})->wait() &&
-              file->write(fileSlot(slotB), {second}, {})->wait(),
-          "seeding the disk slots failed");
+  require(slotA && slotB && !tier.acquireSlot(), "disk quota was not enforced");
+  auto demoteA = tier.demote(pageA, slotA, {});
+  auto demoteB = tier.demote(pageB, slotB, {});
+  require(demoteA && demoteB, "demotions within the tier's limit were refused");
+  runUntilReady(tier, *demoteA);
+  runUntilReady(tier, *demoteB);
+  require(demoteA->finish() && demoteB->finish(), "demotions did not succeed");
+  require(contents(pages, pageA) == first && contents(pages, pageB) == second,
+          "a demotion changed its page");
+  require(holdsPage(readSlot(*file, slotA), first) && holdsPage(readSlot(*file, slotB), second),
+          "disk slots do not hold their pages byte for byte");
 
-  auto restoreA = tier.restore(slotA, pageA, {});
-  require(restoreA != nullptr, "restore was refused with free staging");
-  require(!tier.restore(slotB, pageB, {}), "a second transfer found staging that does not exist");
-  runUntilReady(tier, backend, *restoreA);
-  require(restoreA->finish(), "restore did not succeed");
+  static_cast<void>(fill(pages, pageA, 0xdeadbeefu));
+  static_cast<void>(fill(pages, pageB, 0xfeedfaceu));
   auto restoreB = tier.restore(slotB, pageB, {});
-  require(restoreB != nullptr, "staging was not released after the restore");
-  runUntilReady(tier, backend, *restoreB);
-  require(restoreB->finish(), "second restore did not succeed");
+  auto restoreA = tier.restore(slotA, pageA, {});
+  require(restoreA && restoreB, "restores within the tier's limit were refused");
+  runUntilReady(tier, *restoreA);
+  runUntilReady(tier, *restoreB);
+  require(restoreA->finish() && restoreB->finish(), "restores did not succeed");
+  require(contents(pages, pageA) == first && contents(pages, pageB) == second,
+          "pages did not come back from disk byte for byte");
+  require(contents(pages, pageA - 1) == beforeA && contents(pages, pageB + 1) == afterB,
+          "a transfer wrote outside its page");
 
-  auto slotC = tier.acquireSlot();
-  auto slotD = tier.acquireSlot();
-  require(slotC && slotD && !tier.acquireSlot(), "disk quota was not enforced");
-  auto demoteA = tier.demote(pageA, slotC, {});
-  require(demoteA != nullptr, "demotion was refused with free staging");
-  {
-    metal::CommandGraph graph;
-    const auto report = tier.encode(graph);
-    static_cast<void>(backend.submitCommand(graph.dispatches()));
-    report();
-    tier.poll();
-    require(!demoteA->ready() || demoteA->finish(),
-            "demotion failed after its copy ran");
-  }
-  runUntilReady(tier, backend, *demoteA);
-  require(demoteA->finish(), "demotion did not succeed");
-  auto demoteB = tier.demote(pageB, slotD, {});
-  require(demoteB != nullptr, "staging was not released after the write");
-  runUntilReady(tier, backend, *demoteB);
-  require(demoteB->finish(), "second demotion did not succeed");
-  require(std::memcmp(readSlot(*file, slotC).data(), first.data(), payload) == 0 &&
-              std::memcmp(readSlot(*file, slotD).data(), second.data(), payload) == 0,
-          "pages did not round-trip through staging byte for byte");
-
-  // A finished transfer holds neither staging nor its slot.
+  // A finished transfer holds neither room in the tier nor its slot.
   slotA.reset();
-  require(tier.acquireSlot() != nullptr, "a released disk slot was not reusable");
+  require(tier.canDemote() && tier.acquireSlot() != nullptr,
+          "a released disk slot was not reusable");
   std::cout << "round trip " << kv::formatName(layout.format) << " "
             << layout.attentionLayers << "x" << layout.kvHeads << "x"
             << layout.headDimension << ": page_bytes=" << payload
             << " slot_bytes=" << slotBytes << '\n';
 }
 
-// Several staging slots, a read that fails, demotions limited to half the
-// ring, and a table entry that must not outlive its transfer.
-void staging(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
-              kv::Format format) {
-  const kv::Layout layout{2, 2, 256, format};
-  kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
-                        layout.minimumExtentPages(), layout.minimumExtentPages());
-  const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
-  const uint64_t payload = pages.bytesPerPage();
-  auto file = std::make_shared<SlotFile>(slotBytes, 3 * slotBytes);
-  KvPageTier tier(backend, pages, file, 2);
-  const auto bytes = pattern(slotBytes, payload, 0x5eed5eedu);
-  auto written = tier.acquireSlot();
-  require(file->write(fileSlot(written), {bytes}, {})->wait(), "seeding failed");
-
-  // An unwritten slot cannot be restored; the failure frees its staging.
-  auto empty = tier.acquireSlot();
-  auto failed = tier.restore(empty, 5, {});
-  auto good = tier.restore(written, 6, {});
-  require(failed && good, "two restores did not fit two staging slots");
-  require(!tier.canDemote() && !tier.restore(written, 8, {}),
-          "a full staging ring admitted another transfer");
-  runUntilReady(tier, backend, *failed);
-  require(!failed->finish(), "restoring an unwritten slot succeeded");
-  runUntilReady(tier, backend, *good);
-  require(good->finish(), "restore beside a failed one did not succeed");
-
-  // Both staging slots are free again. Demotions may hold half the ring, so
-  // the second waits for the first; a demotion of page 6 reproduces the
-  // pattern, and the copy table is idle afterwards so a later command with
-  // nothing queued moves nothing.
-  require(tier.canDemote(), "drained restores did not restore demotion admission");
-  auto target = tier.acquireSlot();
-  auto demote = tier.demote(6, target, {});
-  require(demote != nullptr, "staging was not released by finished transfers");
-  require(!tier.canDemote() && !tier.demote(6, empty, {}),
-          "demotions took the restores' half of the ring");
-  runUntilReady(tier, backend, *demote);
-  require(tier.canDemote(), "finished demotion did not restore admission");
-  auto second = tier.demote(6, empty, {});
-  require(second != nullptr, "a finished demotion did not free its staging");
-  runUntilReady(tier, backend, *second);
-  require(demote->finish() && second->finish() && tier.writable(), "demotions did not succeed");
-  require(std::memcmp(readSlot(*file, target).data(), bytes.data(), payload) == 0 &&
-              std::memcmp(readSlot(*file, empty).data(), bytes.data(), payload) == 0,
-          "demoted slots do not hold the page");
-  metal::CommandGraph graph;
-  require(!tier.encode(graph) && graph.empty() && !tier.copiesQueued(),
-          "an idle tier encoded copies");
-  std::cout << "staging tests passed\n";
-}
-
-// Shares of the ring: demotions hold at most half of it and restores at most
-// three quarters, so a burst of restores leaves a demotion its slot and a
-// burst of demotions leaves restores theirs.
-void shares(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
-              kv::Format format) {
+// The transfers in flight are bounded, in all and by kind: demotions take at
+// most half of the bound and restores at most three quarters, so a burst of
+// restores leaves a demotion its turn and a burst of demotions leaves
+// restores theirs. A transfer counts until poll() has retired it, and a read
+// that fails gives its room back like any other.
+void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
+            kv::Format format) {
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
   const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
   auto file = std::make_shared<SlotFile>(slotBytes, 8 * slotBytes);
-  KvPageTier tier(backend, pages, file, 4);
-  const auto bytes = pattern(slotBytes, pages.bytesPerPage(), 0x51a5e5u);
+  KvPageTier tier(pages, file, 4);
+  const auto bytes = fill(pages, 9, 0x51a5e5u);
   std::vector<std::shared_ptr<model::KvDiskSlot>> written;
-  for (int index = 0; index < 3; ++index) {
+  for (int index = 0; index < 2; ++index) {
     written.push_back(tier.acquireSlot());
     require(file->write(fileSlot(written.back()), {bytes}, {})->wait(), "seeding failed");
   }
+  // An unwritten slot cannot be restored.
+  auto empty = tier.acquireSlot();
   std::vector<std::unique_ptr<KvTransfer>> restores;
-  for (uint32_t index = 0; index < 3; ++index) {
-    restores.push_back(tier.restore(written[index], index, {}));
-    require(restores.back() != nullptr, "a restore within the share was refused");
-  }
-  require(!tier.restore(written[0], 3, {}), "restores took more than three quarters of the ring");
+  restores.push_back(tier.restore(written[0], 0, {}));
+  restores.push_back(tier.restore(empty, 1, {}));
+  restores.push_back(tier.restore(written[1], 2, {}));
+  require(restores[0] && restores[1] && restores[2], "a restore within the share was refused");
+  require(!tier.restore(written[0], 3, {}), "restores took more than three quarters of the bound");
   auto target = tier.acquireSlot();
-  auto demotion = tier.demote(3, target, {});
-  require(demotion != nullptr, "a burst of restores left no slot for a demotion");
-  require(!tier.demote(3, tier.acquireSlot(), {}), "a demotion found staging that does not exist");
-  for (auto &restore : restores) runUntilReady(tier, backend, *restore);
-  runUntilReady(tier, backend, *demotion);
-  require(demotion->finish(), "demotion beside restores did not succeed");
-  for (auto &restore : restores) require(restore->finish(), "restore did not succeed");
-  // With the ring idle, demotions hold half of it and no more.
+  auto demotion = tier.demote(9, target, {});
+  require(demotion != nullptr, "a burst of restores left no room for a demotion");
+  require(!tier.canDemote() && !tier.demote(9, tier.acquireSlot(), {}),
+          "the tier took more transfers than its bound");
+  for (auto &restore : restores) runUntilReady(tier, *restore);
+  runUntilReady(tier, *demotion);
+  require(restores[0]->finish() && !restores[1]->finish() && restores[2]->finish(),
+          "a restore beside a failed one did not succeed, or an unwritten slot was restored");
+  require(demotion->finish() && contents(pages, 0) == bytes && contents(pages, 2) == bytes &&
+              holdsPage(readSlot(*file, target), bytes),
+          "transfers of both kinds side by side moved the wrong bytes");
+
+  // With nothing in flight, demotions take half of the bound and no more.
   auto first = tier.demote(0, tier.acquireSlot(), {});
-  auto second = tier.demote(1, tier.acquireSlot(), {});
-  require(first && second && !tier.demote(2, tier.acquireSlot(), {}),
-          "demotions took more than half the ring");
-  runUntilReady(tier, backend, *first);
-  runUntilReady(tier, backend, *second);
-  require(first->finish() && second->finish(), "demotions did not succeed");
-  std::cout << "ring share tests passed\n";
+  auto second = tier.demote(2, tier.acquireSlot(), {});
+  require(first && second && !tier.canDemote() && !tier.demote(9, tier.acquireSlot(), {}),
+          "demotions took more than half of the bound");
+  require(tier.restore(written[0], 4, {}) != nullptr,
+          "a burst of demotions left no room for a restore");
+  runUntilReady(tier, *first);
+  runUntilReady(tier, *second);
+  require(first->finish() && second->finish() && tier.canDemote() && tier.writable(),
+          "demotions did not succeed or did not give their room back");
+  std::cout << "transfer limit tests passed\n";
 }
 
-// A ticket can be ready before its completion has reported the copies it
-// carried, so the engine may encode the next command first: that command must
-// not run the earlier copies again, and the late report may outlive the tier.
-void lateReport(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
-                kv::Format format) {
+// A transfer that cannot be started leaves nothing behind: no room taken in
+// the tier and no IO the tier does not track.
+void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
+                       kv::Format format) {
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
-  const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
-  auto file = std::make_shared<SlotFile>(slotBytes, 2 * slotBytes);
-  std::function<void()> late;
-  {
-    KvPageTier tier(backend, pages, file, 4);
-    auto first = tier.demote(0, tier.acquireSlot(), {});
-    require(first != nullptr, "demotion was refused with free staging");
-    metal::CommandGraph graph;
-    late = tier.encode(graph);
-    require(late != nullptr, "queued demotion was not encoded");
-    static_cast<void>(backend.submitCommand(graph.dispatches()));
-
-    auto second = tier.demote(1, tier.acquireSlot(), {});
-    require(second != nullptr, "a second demotion did not fit half the ring");
-    metal::CommandGraph next;
-    const auto report = tier.encode(next);
-    require(report && !next.empty(), "queued demotion was not encoded");
-    const auto *table = static_cast<const SplashKvCopySlot *>(
-        next.dispatches().front().buffers.back().buffer.contents());
-    uint32_t live = 0;
-    for (uint32_t slot = 0; slot < 4; ++slot) {
-      if (table[slot].direction == SPLASH_KV_COPY_NONE) continue;
-      ++live;
-      require(table[slot].page == pages.entry(1) &&
-                  table[slot].direction == SPLASH_KV_COPY_TO_STAGING,
-              "a command carried another command's copy");
+  const uint64_t bytes = KvPageTier::slotBytesFor(pages);
+  for (bool restoring : {false, true}) {
+    bool completed = false;
+    for (int failure = 0; failure < 64; ++failure) {
+      auto file = std::make_shared<SlotFile>(bytes, bytes);
+      KvPageTier tier(pages, file, 1);
+      auto slot = tier.acquireSlot();
+      const auto payload = fill(pages, 0, 123);
+      require(file->write(fileSlot(slot), {payload}, {})->wait(), "fault slot seed failed");
+      std::unique_ptr<KvTransfer> transfer;
+      allocationFailureAfter = failure;
+      try {
+        transfer = restoring ? tier.restore(slot, 0, {}) : tier.demote(0, slot, {});
+        allocationFailureAfter = -1;
+      } catch (const std::bad_alloc &) {
+        allocationFailureAfter = -1;
+        require(tier.canDemote() && file->idle(),
+                "failed transfer submission took room or left untracked IO");
+        continue;
+      }
+      require(transfer != nullptr, "transfer refused after allocation failures");
+      runUntilReady(tier, *transfer);
+      require(transfer->finish() && tier.canDemote() && contents(pages, 0) == payload,
+              "transfer did not recover");
+      completed = true;
+      break;
     }
-    require(live == 1, "the second command did not carry exactly its own copy");
-    static_cast<void>(backend.submitCommand(next.dispatches()));
-    report();
-    runUntilReady(tier, backend, *first);
-    runUntilReady(tier, backend, *second);
-    require(first->finish() && second->finish(), "demotions did not succeed");
+    require(completed, "transfer allocation sweep never reached success");
   }
-  late();
-  std::cout << "late report tests passed\n";
 }
 
-// A tier goes away with its writes still on the way out: staging is their
-// source and dies with it, so the IO worker has to be done with it first.
+// Kernels and the worker share an extent. Kernels write a page through its
+// address, and the worker writes those bytes to disk. Then one command keeps
+// writing and checking the pages around it while the worker reads the page
+// back and writes another one out; the read lands while the command runs.
+// The command sees its own data, the worker's page holds the disk's bytes,
+// and the next command reads them through the page's address.
+void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
+                    kv::Format format) {
+  const kv::Layout layout{10, 2, 256, format}; // Qwen3.6-35B
+  const uint32_t extent = layout.minimumExtentPages();
+  kv::PageStorage pages(backend, governor.allocationAdmission(), layout, extent, extent);
+  const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
+  auto file = std::make_shared<SlotFile>(slotBytes, 2 * slotBytes);
+  KvPageTier tier(pages, file);
+  constexpr uint32_t restored = 16, demoted = 25, neighbours = 8;
+  const uint64_t data = layout.dataBytesPerLayerPage();
+  const uint32_t words = static_cast<uint32_t>(data / sizeof(uint32_t));
+
+  // The GPU addresses of a page's key and value slabs in every layer.
+  std::byte *const base = pages.spans(0).front().data();
+  const uint64_t address = pages.entry(0);
+  const auto slabs = [&](uint32_t page, std::vector<uint64_t> &table) {
+    for (const auto span : pages.spans(page)) {
+      if (span.size() == data) table.push_back(address + static_cast<uint64_t>(span.data() - base));
+    }
+  };
+  std::vector<uint64_t> own, around;
+  slabs(restored, own);
+  for (uint32_t page = restored - neighbours; page <= restored + neighbours; ++page) {
+    if (page != restored) slabs(page, around);
+  }
+  const auto tableOf = [&](const std::vector<uint64_t> &entries) {
+    metal::MetalBuffer table = backend.allocateBuffer(entries.size() * sizeof(uint64_t));
+    std::memcpy(table.contents(), entries.data(), entries.size() * sizeof(uint64_t));
+    return table;
+  };
+  const metal::MetalBuffer ownTable = tableOf(own), aroundTable = tableOf(around);
+  metal::MetalBuffer mismatches = backend.allocateBuffer(sizeof(uint32_t));
+  auto *mismatched = static_cast<uint32_t *>(mismatches.contents());
+  // Writes seed ^ (131071 * entry + word) to every word of every slab of a
+  // table, or counts the words that hold something else.
+  const auto write = [&](const metal::MetalBuffer &table, size_t entries, const uint32_t &seed) {
+    return metal::ComputeDispatch{"addressed_write_u32", {{0, table}},
+        {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+        {words / 256, entries, 1}, {256, 1, 1}};
+  };
+  const auto check = [&](const metal::MetalBuffer &table, size_t entries, const uint32_t &seed) {
+    return metal::ComputeDispatch{"addressed_check_u32", {{0, table}, {3, mismatches}},
+        {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+        {words / 256, entries, 1}, {256, 1, 1}};
+  };
+
+  // Kernels write the page's slabs, the host its scales; the worker writes
+  // what both left in the extent.
+  const uint32_t ownSeed = 0x9e3779b9u;
+  static_cast<void>(fill(pages, restored, 0x5ca1ab1eu));
+  static_cast<void>(backend.submit(write(ownTable, own.size(), ownSeed)));
+  const auto expected = contents(pages, restored);
+  const auto leaving = fill(pages, demoted, 0xc0ffee11u);
+  auto slot = tier.acquireSlot();
+  auto demotion = tier.demote(restored, slot, {});
+  require(demotion != nullptr, "demotion was refused");
+  runUntilReady(tier, *demotion);
+  require(demotion->finish() && holdsPage(readSlot(*file, slot), expected),
+          "the disk does not hold what kernels wrote to the page");
+  static_cast<void>(fill(pages, restored, 0xdeadbeefu));
+
+  // The command grows until it outlasts the read.
+  uint32_t rounds = 16;
+  for (bool overlapped = false; !overlapped;) {
+    rounds *= 4;
+    require(rounds <= 4096, "no restore landed while a command was running");
+    std::vector<uint32_t> seeds(rounds);
+    std::vector<metal::ComputeDispatch> command;
+    for (uint32_t round = 0; round < rounds; ++round) {
+      seeds[round] = 0x85ebca6bu * (round + 1);
+      command.push_back(write(aroundTable, around.size(), seeds[round]));
+      command.push_back(check(aroundTable, around.size(), seeds[round]));
+    }
+    *mismatched = 0;
+    static_cast<void>(fill(pages, restored, 0xdeadbeefu + rounds));
+    auto other = tier.acquireSlot();
+    auto ticket = backend.submitCommandAsync(command);
+    auto restore = tier.restore(slot, restored, {});
+    auto leave = tier.demote(demoted, other, {});
+    require(restore && leave, "transfers beside a command were refused");
+    runUntilReady(tier, *restore);
+    overlapped = !ticket.ready();
+    runUntilReady(tier, *leave);
+    static_cast<void>(ticket.wait());
+    require(restore->finish() && leave->finish(), "transfers beside a command failed");
+    require(*mismatched == 0, "a command read other data than it wrote beside a transfer");
+    require(contents(pages, restored) == expected,
+            "a page restored beside a command does not hold the disk's bytes");
+    require(holdsPage(readSlot(*file, other), leaving) && contents(pages, demoted) == leaving,
+            "a page demoted beside a command reached the disk changed");
+    for (size_t entry = 0; entry < around.size(); ++entry) {
+      const auto *slab = reinterpret_cast<const uint32_t *>(base + (around[entry] - address));
+      for (uint32_t word = 0; word < words; ++word) {
+        require(slab[word] == (seeds.back() ^ (static_cast<uint32_t>(entry) * 131071u + word)),
+                "a transfer changed a page the command was writing");
+      }
+    }
+  }
+  // The next command reads the restored page through its address.
+  *mismatched = 0;
+  static_cast<void>(backend.submit(check(ownTable, own.size(), ownSeed)));
+  require(*mismatched == 0, "kernels read other data than the restore left in the page");
+  std::cout << "transfers beside a command " << kv::formatName(format) << ": the restore landed within "
+            << rounds << " rounds of writes and checks\n";
+}
+
+// A tier goes away with transfers still in flight. They read their pages in
+// place, so the worker has to be done with them first.
 void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
               kv::Format format) {
   const kv::Layout layout{16, 4, 256, format}; // Qwen3.8-27B
@@ -324,7 +366,7 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
   auto file = std::make_shared<SlotFile>(slotBytes, 16 * slotBytes);
   {
-    KvPageTier tier(backend, pages, file, 16);
+    KvPageTier tier(pages, file, 16);
     std::vector<std::unique_ptr<KvTransfer>> demotions;
     for (uint32_t page = 0; page < 8; ++page) {
       auto slot = tier.acquireSlot();
@@ -332,16 +374,8 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
       demotions.push_back(tier.demote(page, std::move(slot), {}));
       require(demotions.back() != nullptr, "a demotion within the share was refused");
     }
-    metal::CommandGraph graph;
-    const auto report = tier.encode(graph);
-    require(report != nullptr, "queued demotions were not encoded");
-    static_cast<void>(backend.submitCommand(graph.dispatches()));
-    report();
-    // One poll hands every copy to the worker, which is still writing when
-    // the tier goes out of scope.
-    tier.poll();
   }
-  require(file->idle(), "the tier released staging with disk IO still running");
+  require(file->idle(), "the tier left its pages with disk IO still running");
   std::cout << "teardown tests passed\n";
 }
 
@@ -353,10 +387,9 @@ void run(const std::string &metallib) {
     roundTrip(backend, governor, kv::Layout{2, 2, 256, format});
     roundTrip(backend, governor, kv::Layout{10, 2, 256, format}); // Qwen3.6-35B
     roundTrip(backend, governor, kv::Layout{16, 4, 256, format}); // Qwen3.8-27B
+    limits(backend, governor, format);
     allocationFailure(backend, governor, format);
-    staging(backend, governor, format);
-    shares(backend, governor, format);
-    lateReport(backend, governor, format);
+    besideACommand(backend, governor, format);
     teardown(backend, governor, format);
   }
   std::cout << "kv page tier tests passed\n";

@@ -324,10 +324,11 @@ public:
   virtual ~KvDiskSlot() = default;
 };
 
-// One KV page moving between its pool page and the disk tier. The copy rides
-// the next command; ready() then means the write has finished (demotion) or
-// the page holds the data (restore), and finish() reports success. The page
-// stays valid throughout, so a failed demotion loses nothing.
+// One KV page moving between its pool page and the disk tier, read from the
+// page or written to it in place, on the host, beside whatever command runs.
+// ready() means the write has finished (demotion) or the page holds the data
+// (restore), and finish() reports success. The page stays valid throughout,
+// so a failed demotion loses nothing.
 class KvTransfer {
 public:
   virtual ~KvTransfer() = default;
@@ -335,13 +336,10 @@ public:
   [[nodiscard]] virtual bool finish() = 0;
 };
 
-// The disk tier for KV pages as the engine drives it. A queued copy moves
-// only inside a Metal command, so every command the model submits for a
-// batch carries the copies queued so far, each command of a multi-command
-// ticket included, and a batch with no work of its own still submits one
-// while copies are queued. The engine adds a copy-only command
-// (Model::submitTransfers) only when no batch runs, so while the model is
-// busy its own commands keep the copies moving.
+// The disk tier for KV pages as the engine drives it. Until a transfer is
+// ready its page is the caller's to keep still: no command writes a page
+// being demoted, no command reads or writes a page being restored, and
+// neither page's extent is released.
 class KvTier {
 public:
   virtual ~KvTier() = default;
@@ -352,19 +350,17 @@ public:
   [[nodiscard]] virtual bool canDemote() const noexcept = 0;
   // Null when the disk quota is full.
   [[nodiscard]] virtual std::shared_ptr<KvDiskSlot> acquireSlot() = 0;
-  // Null when no demotion staging is available; the caller waits while
-  // transfers are in flight.
+  // Starts writing the page. Null when the tier takes no more demotions for
+  // now; the caller waits while transfers are in flight.
   [[nodiscard]] virtual std::unique_ptr<KvTransfer>
   demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot,
          std::function<void()> completion) = 0;
-  // Null when no staging is free; the caller retries later.
+  // Starts reading the page. Null when the tier takes no more restores for
+  // now; the caller retries later.
   [[nodiscard]] virtual std::unique_ptr<KvTransfer>
   restore(std::shared_ptr<KvDiskSlot> slot, uint32_t page,
           std::function<void()> completion) = 0;
-  // Copies waiting for a command; the engine submits one when the model is
-  // idle.
-  [[nodiscard]] virtual bool copiesQueued() const noexcept = 0;
-  // Engine-thread bookkeeping after commands and IO complete.
+  // Engine-thread bookkeeping after IO completes.
   virtual void poll() = 0;
 };
 
@@ -493,10 +489,6 @@ public:
   [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) = 0;
-  // A command carrying only queued KV copies, for an idle model; null when
-  // nothing is queued. Its ticket yields no step results.
-  [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>
-  submitTransfers(std::function<void()>) { return nullptr; }
   // Copies the request's committed state at its current page-aligned
   // boundary into a cache slot. Returns nullptr when no slot is free and the
   // governor denies a new one; the caller may release a cached state and

@@ -340,7 +340,7 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
   }
 
   // Then oldest first across both kinds. A state whose write must wait for
-  // the one in flight stays, as does a KV leaf the ring cannot take now; the
+  // the one in flight stays, as does a KV leaf the tier cannot take now; the
   // other kind may still give, and the next pass takes what waited.
   std::optional<CacheEvictionCandidate> state =
       states_.evictionCandidate(keepResumePoint, false);
@@ -597,8 +597,8 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
     ++kvTier_.demotionsRefused;
     return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible;
   }
-  // A quota or a ring that only transfers in flight can release is worth
-  // waiting for; one that nothing will free is not, and the leaf goes.
+  // Room in the quota or the tier that transfers in flight will free is
+  // worth waiting for; room that nothing will free is not, and the leaf goes.
   std::shared_ptr<model::KvDiskSlot> slot = acquireDiskSlot();
   if (!slot)
     return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible;

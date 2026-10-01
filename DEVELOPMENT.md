@@ -502,9 +502,9 @@ replaced or changed after `prepare` checked it is refused.
 Runtime admission counts prepared weights, draft and vision exactly once
 (`preparedModelWeightBytes`, which `tune-kernels` and the runtime oracle use
 too). Before loading, startup refuses a model whose prepared weights, with the
-pipeline and runtime reserves, one state cell, one KV extent and any disk tier
-KV staging, exceed the hard budget, so a model that can never fit is not
-prepared. File backing does not make Metal-resident pages reclaimable.
+pipeline and runtime reserves, one state cell and one KV extent, exceed the
+hard budget, so a model that can never fit is not prepared. File backing does
+not make Metal-resident pages reclaimable.
 Every buffer the backend allocates or wraps belongs to one residency set
 attached to its command queue (`MetalBackend::allocateBuffer`): weights, KV
 extents, state cells and draft rings, and scratch alike stay wired between
@@ -521,10 +521,12 @@ its pages. An extent whose last page is free stays allocated until a reclaim
 releases it, at once and only between commands: memory pressure, an admission
 the budget denies, or startup cleanup. Kernels reach a page through the GPU
 address in its request's page table, so no command binds KV; the residency
-set makes extents resident for every command. A reclaim pass releases every
-extent that is empty or that its evictions empty. `/status` reports under `kv`
-the extents allocated and released and the longest allocation and release of
-one; how long a whole pass holds the loop shows in `loop.max_tick_ms`.
+set makes extents resident for every command. The host reaches the same
+memory (`PageStorage::spans`), which is how the disk tier moves pages. A
+reclaim pass releases every extent that is empty or that its evictions empty.
+`/status` reports under `kv` the extents allocated and released and the longest
+allocation and release of one; how long a whole pass holds the loop shows in
+`loop.max_tick_ms`.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
 (`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or
@@ -914,13 +916,16 @@ once the engine loads. The tier does not raise the context limit.
 
 Writes happen when RAM reclamation selects a victim. States copy through one
 host staging buffer, freeing their RAM immediately. KV leaves needed by a state
-on them or below them copy through a 128-page staging ring and are released
+on them or below them are written straight from their extents and released
 after the write succeeds. Unneeded tails are dropped without writing, together
-with any disk copies below them. When staging is busy, admission waits for the
-transfer instead of evicting additional victims.
-Demotions may occupy half the ring and restores three quarters, leaving room
-for the other direction. Copies ride Metal commands, including a copy-only
-command when inference is idle.
+with any disk copies below them. A restored page is read straight into its
+extent. Either way the transfer runs on the file's IO worker beside whatever
+command the model runs: a cached page is never written by a command, and no
+command uses a page before its read has landed. At most 128 KV pages are in
+transfer at a time, demotions at most half of them and restores at most three
+quarters, since one worker serves both in order and a burst of either kind
+must leave the other its share. When the tier takes no more, admission waits
+for a transfer instead of evicting additional victims.
 
 A state with no available RAM cache slot can be written directly from its lane.
 Rolling checkpoints replace the least recently used copies like any state, so
@@ -941,11 +946,8 @@ reads and writes; it is not a write-rate limit. Each file retains its allocated
 high-water mark until shutdown, so filesystem space can exceed the live-slot
 quota. Closing the server releases both files.
 
-Transfers use `pread`/`pwrite` with `F_NOCACHE`. The KV staging ring, 128
-pages that the GPU copies through, is Metal memory within `--max-memory`: about
-42 MiB for 35B and 130 MiB for 27B with INT8 KV, 80 MiB and 256 MiB with BF16 KV.
-The memory plan sets it aside whenever the flag is set, even if the tier then
-fails to start, so the KV pool and the advertised context shrink by it.
+Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range
+moved through the file's own 1 MiB buffer. The KV tier takes no Metal memory.
 The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is host
 memory outside `--max-memory`.
 A quota too small for one state leaves the tier disabled.

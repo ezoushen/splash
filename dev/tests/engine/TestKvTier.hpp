@@ -9,9 +9,9 @@
 
 namespace splash::test {
 
-// A KV disk tier without a disk: slots count against a quota, every
-// transfer holds one staging slot until it finishes, and transfers finish
-// when the test says so.
+// A KV disk tier without a disk: slots count against a quota, a bounded
+// number of transfers is in flight, and transfers finish when the test says
+// so.
 class TestKvTier final : public model::KvTier {
 public:
   struct Transfer final {
@@ -22,7 +22,7 @@ public:
 
   uint64_t slotBytes() const noexcept override { return 100; }
   bool writable() const noexcept override { return writableFile; }
-  bool canDemote() const noexcept override { return writableFile && staging < stagingSlots; }
+  bool canDemote() const noexcept override { return writableFile && inFlight() < transferLimit; }
   std::shared_ptr<model::KvDiskSlot> acquireSlot() override {
     if (slots >= capacity) return {};
     return std::make_shared<Slot>(*this);
@@ -35,11 +35,10 @@ public:
   }
   std::unique_ptr<model::KvTransfer>
   restore(std::shared_ptr<model::KvDiskSlot>, uint32_t, std::function<void()>) override {
-    if (staging >= stagingSlots) return {};
+    if (inFlight() >= transferLimit) return {};
     ++restores;
     return start();
   }
-  bool copiesQueued() const noexcept override { return queued; }
   void poll() override {}
 
   // Finishes every transfer still in flight.
@@ -49,22 +48,15 @@ public:
       transfer->ready = true;
       transfer->success = success;
     }
-    queued = false;
   }
-  [[nodiscard]] uint32_t inFlight() const noexcept {
-    uint32_t count = 0;
-    for (const auto &transfer : transfers) count += !transfer->finished;
-    return count;
-  }
+  [[nodiscard]] uint32_t inFlight() const noexcept { return inFlight_; }
 
   uint32_t slots = 0;
   uint32_t capacity = 4;
-  uint32_t staging = 0;
-  uint32_t stagingSlots = 2;
+  uint32_t transferLimit = 2;
   uint32_t demotions = 0;
   uint32_t restores = 0;
   bool writableFile = true;
-  bool queued = false;
   std::vector<std::shared_ptr<Transfer>> transfers;
 
 private:
@@ -81,7 +73,7 @@ private:
     bool finish() override {
       if (!transfer_->finished) {
         transfer_->finished = true;
-        --tier_.staging;
+        --tier_.inFlight_;
       }
       return transfer_->success;
     }
@@ -94,10 +86,11 @@ private:
   std::unique_ptr<model::KvTransfer> start() {
     auto transfer = std::make_shared<Transfer>();
     transfers.push_back(transfer);
-    ++staging;
-    queued = true;
+    ++inFlight_;
     return std::make_unique<Ticket>(*this, std::move(transfer));
   }
+
+  uint32_t inFlight_ = 0;
 };
 
 } // namespace splash::test

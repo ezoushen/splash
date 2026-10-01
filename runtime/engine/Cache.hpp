@@ -68,7 +68,7 @@ struct KvTierSnapshot final {
   uint64_t writtenBytes = 0;
   uint64_t demotions = 0;
   uint64_t demotionFailures = 0;
-  // Demotions the ring had no room for; the leaf stayed and the requester
+  // Demotions the tier had no room for; the leaf stayed and the requester
   // waited.
   uint64_t demotionsRefused = 0;
   uint64_t restores = 0;
@@ -136,7 +136,8 @@ public:
     completionNotifier_ = std::move(notifier);
   }
   // Consumes finished transfers: a written state or KV page frees its RAM, a
-  // restored block becomes usable, and restores waiting for staging start.
+  // restored block becomes usable, and restores the tier had no room for
+  // start.
   [[nodiscard]] bool pollTransfers();
   void discardState(uint64_t block, const CompositeState *state) {
     states_.invalidate(block, state);
@@ -259,7 +260,7 @@ private:
     std::unique_ptr<model::KvTransfer> transfer;
   };
   struct Restore final {
-    // Null until the tier has staging for it.
+    // Null until the tier has room for it.
     std::unique_ptr<model::KvTransfer> transfer;
     std::vector<uint64_t> waiters;
   };
@@ -277,8 +278,8 @@ private:
   // a caller told to wait for nothing would wait for ever.
   enum class LeafReclaim : uint8_t {
     Started,
-    // The ring, the quota or the state write's staging buffer is held by
-    // transfers in flight.
+    // The tier's room, the quota or the state write's staging buffer is held
+    // by transfers in flight.
     Pending,
     // reclaimKvLeaf: the leaf stays for now and scans move on to the next
     // one, because a state on it is in use, a disk subtree depends on it
@@ -338,7 +339,7 @@ private:
   std::function<bool()> makeRoom_;
   std::unordered_map<uint64_t, Request> requests_;
   std::vector<Demotion> demotions_;
-  // Block IDs increase from parent to child. Refill staging in that order so
+  // Block IDs increase from parent to child. Restores start in that order so
   // cancellation can discard an unread suffix without stranding its parents.
   std::map<uint64_t, Restore> restores_;
   // Blocks whose read failed, until they have left.

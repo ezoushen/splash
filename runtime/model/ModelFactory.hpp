@@ -59,8 +59,6 @@ struct ModelPackage final {
   }
 };
 
-class KvPageTier;
-
 // Model execution resources. What a request's start allocates is admitted
 // by the engine through the state storage.
 struct RuntimeContext final {
@@ -72,7 +70,6 @@ struct RuntimeContext final {
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
-  KvPageTier *kvTier = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft

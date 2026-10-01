@@ -1,5 +1,4 @@
 #include "model/Runtime.hpp"
-#include "model/KvPageTier.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -252,7 +251,6 @@ struct Runtime::Impl {
   const ops::ExecutionPlans &operators;
   kv::PageStorage &kvPages;
   QwenStateStorage &states;
-  KvPageTier *kvTier;
   std::unique_ptr<PrefillArena> prefillArena;
   std::unique_ptr<DecodeArena> decodeArena;
   std::unordered_map<uint64_t, Request> requests;
@@ -287,7 +285,6 @@ struct Runtime::Impl {
         operators(value.operators),
         kvPages(value.kvPages),
         states(requireQwenStateStorage(value.stateStorage)),
-        kvTier(value.kvTier),
         maximumImagePatches(value.maximumImagePatches),
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
@@ -592,7 +589,6 @@ struct Runtime::Impl {
     add(prefillArena->bytes(), "warmup prefill arena");
     add(decodeArena->bytes(), "warmup decode arena");
     add(kvPages.actualAllocatedBytes(), "warmup KV pool");
-    add(kvTier ? kvTier->actualAllocatedBytes() : 0, "warmup KV staging");
     add(pipelineReserveBytes, "warmup pipeline reserve");
     add(runtimeOverheadReserveBytes, "warmup runtime reserve");
     return result;
@@ -1549,36 +1545,12 @@ struct Runtime::Impl {
     return results;
   }
 
-  // Every asynchronous command the runtime submits goes through here and
-  // carries the KV copies queued so far. The engine sends a copy-only command
-  // only when no batch runs, so a command without them would leave a restore
-  // or demotion waiting for as long as the model stays busy.
-  CommandTicket submitWithCopies(CommandGraph &graph,
-                                 std::function<void()> completion) {
-    // The copies are reported before the engine wakes, so the tick the wake
-    // starts can retire their batch in poll().
-    std::function<void()> report = kvTier ? kvTier->encode(graph) : nullptr;
-    return backend.submitCommandAsync(
-        graph.dispatches(),
-        [report = std::move(report),
-         completion = std::move(completion)](uint64_t) {
-          if (report)
-            report();
-          if (completion)
-            completion();
-        });
-  }
-  [[nodiscard]] bool copiesQueued() const noexcept {
-    return kvTier && kvTier->copiesQueued();
-  }
-
   // A constrained DFlash cycle has one host dependency between three Metal
   // commands: draft proposals define the grammar simulation, while the target
   // forward is independent of the resulting mask.  This ticket keeps the
   // scheduler batch (and therefore its DecodeArena lanes) owned across that
   // dependency.  All state transitions run on the engine thread; completion
-  // handlers only report their KV copies and wake it, so they capture the
-  // wake hook and never the ticket.
+  // handlers only wake it, so they capture the wake hook and never the ticket.
   class ConstrainedDecodeTicket final : public ModelBatchTicket {
   public:
     ConstrainedDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes,
@@ -1586,7 +1558,7 @@ struct Runtime::Impl {
                             std::span<const ModelBatchItem> items,
                             const ops::LinearDispatchStats &stats,
                             uint32_t planWidth, CommandTiming priorTiming,
-                            CommandGraph &draft,
+                            const CommandGraph &draft,
                             std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)), results_(std::move(results)),
           items_(items.begin(), items.end()), stats_(stats),
@@ -1743,11 +1715,12 @@ struct Runtime::Impl {
       Done
     };
 
-    void submit(CommandGraph &graph) {
-      command_ = impl_.submitWithCopies(graph, [wake = wake_] {
-        if (*wake)
-          (*wake)();
-      });
+    void submit(const CommandGraph &graph) {
+      command_ = impl_.backend.submitCommandAsync(
+          graph.dispatches(), [wake = wake_](uint64_t) {
+            if (*wake)
+              (*wake)();
+          });
     }
 
     void addTiming(CommandTiming value) noexcept {
@@ -2023,7 +1996,12 @@ Runtime::prefillAsync(const BatchPlan &plan,
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
-  CommandTicket command = impl_->submitWithCopies(graph, std::move(completion));
+  auto notify = [completion = std::move(completion)](uint64_t) {
+    if (completion)
+      completion();
+  };
+  CommandTicket command =
+      impl_->backend.submitCommandAsync(graph.dispatches(), std::move(notify));
   Impl *impl = impl_.get();
   auto finish = [impl, entries,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
@@ -2313,29 +2291,20 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                 planWidth, timing);
   };
 
-  // A mask stage encodes no work; while copies are queued it still submits a
-  // command for them, and the plan finishes with that command.
-  if (commandGraph.empty() && !impl_->copiesQueued()) {
+  if (commandGraph.empty()) {
     std::vector<ModelStepResult> ready = finish(CommandTiming{});
     return std::make_unique<ReadyModelTicket>(std::move(ready),
                                               priorTiming.wallSeconds * 1000.0);
   }
 
-  CommandTicket command =
-      impl_->submitWithCopies(commandGraph, std::move(completion));
+  auto notify = [completion = std::move(completion)](uint64_t) {
+    if (completion)
+      completion();
+  };
+  CommandTicket command = impl_->backend.submitCommandAsync(
+      commandGraph.dispatches(), std::move(notify));
   return std::make_unique<DeferredMetalTicket>(
       std::move(command), std::move(finish), priorTiming.wallSeconds * 1000.0);
-}
-
-std::unique_ptr<ModelBatchTicket>
-Runtime::submitTransfers(std::function<void()> completion) {
-  if (!impl_->copiesQueued())
-    return nullptr;
-  CommandGraph graph;
-  CommandTicket command = impl_->submitWithCopies(graph, std::move(completion));
-  return std::make_unique<DeferredMetalTicket>(
-      std::move(command),
-      [](CommandTiming) { return std::vector<ModelStepResult>{}; });
 }
 
 uint32_t Runtime::committedStateSlot(uint64_t requestId) {
