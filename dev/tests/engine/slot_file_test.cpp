@@ -67,9 +67,54 @@ static void testFailedWriteStopsWriting() {
           "file failure/integrity test failed");
 }
 
+// Callers' memory need not be aligned or fill a slot: spans of any size and
+// alignment, from a few bytes to more than one of the worker's chunks, move
+// through the worker's own buffer. A write zeros the slot past its spans,
+// and a read may take less than was written, scattered differently.
+static void testScatteredSpans() {
+  // Three of the worker's 1 MiB chunks, the last one partial.
+  constexpr size_t size = (2 << 20) + 3 * SlotFile::kAlignmentBytes;
+  SlotFile file(size, size);
+  auto slot = file.acquire();
+  std::vector<std::byte> source(size);
+  for (size_t index = 0; index < source.size(); ++index)
+    source[index] = static_cast<std::byte>(index * 131 + 7);
+  // Odd addresses and lengths, an empty span, and one span across the first
+  // chunk's end, adding up to less than a slot.
+  const std::span<const std::byte> bytes(source);
+  const std::vector<std::span<const std::byte>> spans{
+      bytes.subspan(1, 7), bytes.subspan(4099, 0), bytes.subspan(4099, (1 << 20) + 12345),
+      bytes.subspan(33, 999'983)};
+  std::vector<std::byte> expected;
+  for (auto span : spans) expected.insert(expected.end(), span.begin(), span.end());
+  require(expected.size() < size, "the scattered spans fill the slot");
+  expected.resize(size);
+  require(file.write(slot, spans, {})->wait() && file.writtenBytes() == size,
+          "a scattered write failed or did not store the whole slot");
+
+  // The whole slot through one unaligned span: the spans in order, zeros after.
+  std::vector<std::byte> whole(size + 1);
+  require(file.read(slot, {std::span(whole).subspan(1)}, {})->wait() &&
+              std::equal(expected.begin(), expected.end(), whole.begin() + 1),
+          "a scattered write did not store its spans in order with zeros after");
+  // Less than was written, across the first chunk's end into odd addresses:
+  // the read takes the two chunks its spans reach and nothing around them.
+  std::vector<std::byte> head(3 * 4096 + 3), tail((1 << 20) + 5);
+  const uint64_t readBefore = file.readBytes();
+  require(file.read(slot, {std::span(head).subspan(3), std::span(tail).subspan(5)}, {})->wait() &&
+              file.readBytes() - readBefore == 2 << 20,
+          "a partial read failed or did not take exactly the chunks it needs");
+  require(std::all_of(head.begin(), head.begin() + 3, [](std::byte b) { return b == std::byte{0}; }) &&
+              std::all_of(tail.begin(), tail.begin() + 5, [](std::byte b) { return b == std::byte{0}; }) &&
+              std::equal(head.begin() + 3, head.end(), expected.begin()) &&
+              std::equal(tail.begin() + 5, tail.end(), expected.begin() + (head.size() - 3)),
+          "a partial read returned the wrong bytes or wrote outside its spans");
+}
+
 int main() {
   try {
     testFailedWriteStopsWriting();
+    testScatteredSpans();
     constexpr size_t size = 4 * SlotFile::kAlignmentBytes;
     SlotFile file(size, size * 2 + 1);
     require(file.slotBytes() == size && file.capacityBytes() == size * 2 + 1 &&
@@ -130,9 +175,15 @@ int main() {
             "quota below one slot was accepted");
     require(throws<std::invalid_argument>([&] { SlotFile(size + 1, 4 * size); }),
             "unaligned slot size was accepted");
+    std::vector<std::byte> oversized(size + 1);
     require(throws<std::invalid_argument>(
-                [&] { static_cast<void>(file.read(reused, {std::span(restored).first(1)}, {})); }),
-            "invalid slot shape was accepted");
+                [&] { static_cast<void>(file.read(reused, {oversized}, {})); }) &&
+                throws<std::invalid_argument>([&] {
+                  static_cast<void>(file.write(
+                      reused, {std::span<const std::byte>(source), std::span<const std::byte>(oversized).first(1)},
+                      {}));
+                }),
+            "a transfer of more than a slot was accepted");
     {
       // Two files of different slot sizes draw on one budget.
       auto budget = std::make_shared<DiskBudget>(4 * size);

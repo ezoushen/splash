@@ -6,7 +6,10 @@
 #include <algorithm>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -43,6 +46,67 @@ bool SlotFile::Operation::wait() {
   wake_.wait(lock, [&] { return ready(); });
   return success_;
 }
+
+namespace {
+// One transfer of the worker: a whole number of alignment units.
+constexpr size_t kChunkBytes = 1 << 20;
+static_assert(kChunkBytes % SlotFile::kAlignmentBytes == 0);
+
+off_t slotOffset(uint64_t index, uint64_t slotBytes) {
+  return static_cast<off_t>(index * slotBytes);
+}
+
+template <typename Span>
+uint64_t totalBytes(const std::vector<Span> &spans) {
+  uint64_t total = 0;
+  for (auto span : spans) {
+    if (span.size() > std::numeric_limits<uint64_t>::max() - total)
+      throw std::invalid_argument("slot transfer size overflowed");
+    total += span.size();
+  }
+  return total;
+}
+
+// Walks the spans of an operation in order, one piece at a time.
+template <typename Span>
+class Pieces final {
+public:
+  explicit Pieces(const std::vector<Span> &spans) : spans_(spans), left_(totalBytes(spans)) {}
+  [[nodiscard]] bool done() const noexcept { return !left_; }
+  // The next piece of at most `bytes` bytes; empty once every span is done.
+  Span next(size_t bytes) {
+    while (span_ < spans_.size() && offset_ == spans_[span_].size()) {
+      ++span_;
+      offset_ = 0;
+    }
+    if (span_ == spans_.size()) return {};
+    const Span piece = spans_[span_].subspan(offset_, std::min(bytes, spans_[span_].size() - offset_));
+    offset_ += piece.size();
+    left_ -= piece.size();
+    return piece;
+  }
+
+private:
+  const std::vector<Span> &spans_;
+  uint64_t left_;
+  size_t span_ = 0;
+  size_t offset_ = 0;
+};
+
+// Moves one chunk of the worker's buffer through io(data, bytes, offset),
+// continuing a short transfer where it stopped.
+template <typename Io>
+bool moveChunk(std::span<std::byte> chunk, off_t offset, Io io) {
+  while (!chunk.empty()) {
+    const ssize_t count = io(chunk.data(), chunk.size(), offset);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) return false;
+    chunk = chunk.subspan(static_cast<size_t>(count));
+    offset += count;
+  }
+  return true;
+}
+} // namespace
 
 SlotFile::SlotFile(uint64_t slotBytes, uint64_t capacityBytes,
                    const std::filesystem::path &directory)
@@ -84,8 +148,14 @@ SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
   // pressure accounting still covers any transient kernel IO memory.
   if (::fcntl(backing_->descriptor, F_NOCACHE, 1) < 0)
     throw std::system_error(errno, std::generic_category(), "uncached slot file");
+  void *buffer = nullptr;
+  if (::posix_memalign(&buffer, kAlignmentBytes, kChunkBytes) != 0)
+    throw std::bad_alloc();
+  buffer_.reset(static_cast<std::byte *>(buffer));
   worker_ = std::thread([this] { run(); });
 }
+
+void SlotFile::Free::operator()(std::byte *memory) const noexcept { std::free(memory); }
 
 SlotFile::~SlotFile() {
   {
@@ -136,9 +206,8 @@ bool SlotFile::idle() const {
   return work_.empty() && !running_;
 }
 
-std::shared_ptr<SlotFile::Operation> SlotFile::submit(
-    std::function<bool(const std::atomic<bool> &)> run,
-    std::function<void()> completion) {
+std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run,
+                                                     std::function<void()> completion) {
   auto operation = std::make_shared<Operation>();
   {
     std::lock_guard lock(mutex_);
@@ -162,7 +231,7 @@ void SlotFile::run() {
       running_ = true;
     }
     bool success = false;
-    try { success = work.run(work.operation->cancelled_); }
+    try { success = work.run({buffer_.get(), kChunkBytes}, work.operation->cancelled_); }
     catch (...) { success = false; }
     work.run = {};
     // Idle before the operation reports, so whoever wakes on it sees a worker
@@ -185,84 +254,81 @@ void SlotFile::run() {
   }
 }
 
-namespace {
-constexpr size_t kChunkBytes = 1 << 20;
-
-template <typename Span>
-uint64_t totalBytes(const std::vector<Span> &spans) {
-  uint64_t total = 0;
-  for (auto span : spans) {
-    if (span.size() > std::numeric_limits<uint64_t>::max() - total)
-      throw std::invalid_argument("slot transfer size overflowed");
-    total += span.size();
-  }
-  return total;
-}
-
-// Moves the spans in order through io(data, bytes, offset), one chunk at a
-// time so that cancellation and short transfers are noticed promptly.
-template <typename Span, typename Io>
-bool transfer(const std::vector<Span> &spans, off_t offset,
-              const std::atomic<bool> &cancelled, Io io) {
-  for (auto span : spans) {
-    while (!span.empty()) {
-      if (cancelled.load(std::memory_order_relaxed)) return false;
-      const ssize_t count = io(span.data(), std::min(span.size(), kChunkBytes), offset);
-      if (count < 0 && errno == EINTR) continue;
-      if (count <= 0) return false;
-      span = span.subspan(static_cast<size_t>(count));
-      offset += count;
-    }
-  }
-  return true;
-}
-
-off_t slotOffset(uint64_t index, uint64_t slotBytes) {
-  return static_cast<off_t>(index * slotBytes);
-}
-} // namespace
-
+// A write gathers its spans into the worker's buffer one chunk at a time and
+// zeros the slot past them; a read moves the chunks its spans reach and
+// scatters each into them, ignoring the slot past them. Every pwrite and
+// pread is an aligned range of the slot, and cancellation is noticed before
+// each chunk.
 std::shared_ptr<SlotFile::Operation> SlotFile::write(
     std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
     std::function<void()> completion) {
-  if (!slot || slot->backing_ != backing_ || totalBytes(source) != backing_->slotBytes)
+  if (!slot || slot->backing_ != backing_ || totalBytes(source) > backing_->slotBytes)
     throw std::invalid_argument("slot write does not match this file's slots");
   if (!writable())
     throw std::logic_error("slot file no longer takes writes");
-  return submit([slot, source = std::move(source)](const std::atomic<bool> &cancelled) {
+  return submit([slot, source = std::move(source)](std::span<std::byte> buffer,
+                                                   const std::atomic<bool> &cancelled) {
     Backing &backing = *slot->backing_;
+    const off_t start = slotOffset(slot->index_, backing.slotBytes);
+    const auto store = [&backing](std::byte *data, size_t bytes, off_t offset) {
+      const auto count = ::pwrite(backing.descriptor, data, bytes, offset);
+      if (count > 0)
+        backing.budget->written_.fetch_add(count, std::memory_order_relaxed);
+      return count;
+    };
     slot->written_ = false;
-    if (transfer(source, slotOffset(slot->index_, backing.slotBytes), cancelled,
-                 [&backing](const std::byte *data, size_t bytes, off_t offset) {
-                   const auto count = ::pwrite(backing.descriptor, data, bytes, offset);
-                   if (count > 0)
-                     backing.budget->written_.fetch_add(count, std::memory_order_relaxed);
-                   return count;
-                 })) {
-      slot->written_ = true;
-      return true;
+    Pieces pieces(source);
+    for (uint64_t done = 0; done < backing.slotBytes;) {
+      if (cancelled.load(std::memory_order_relaxed)) return false;
+      const auto chunk = buffer.first(std::min<uint64_t>(buffer.size(), backing.slotBytes - done));
+      size_t filled = 0;
+      for (auto piece = pieces.next(chunk.size()); !piece.empty();
+           piece = pieces.next(chunk.size() - filled)) {
+        std::memcpy(chunk.data() + filled, piece.data(), piece.size());
+        filled += piece.size();
+      }
+      std::memset(chunk.data() + filled, 0, chunk.size() - filled);
+      if (!moveChunk(chunk, start + static_cast<off_t>(done), store)) {
+        backing.failed.store(true, std::memory_order_relaxed);
+        return false;
+      }
+      done += chunk.size();
     }
-    if (!cancelled.load(std::memory_order_relaxed))
-      backing.failed.store(true, std::memory_order_relaxed);
-    return false;
+    slot->written_ = true;
+    return true;
   }, std::move(completion));
 }
 
 std::shared_ptr<SlotFile::Operation> SlotFile::read(
     std::shared_ptr<Slot> slot, std::vector<std::span<std::byte>> destination,
     std::function<void()> completion) {
-  if (!slot || slot->backing_ != backing_ || totalBytes(destination) != backing_->slotBytes)
+  if (!slot || slot->backing_ != backing_ || totalBytes(destination) > backing_->slotBytes)
     throw std::invalid_argument("slot read does not match this file's slots");
-  return submit([slot, destination = std::move(destination)](const std::atomic<bool> &cancelled) {
+  return submit([slot, destination = std::move(destination)](std::span<std::byte> buffer,
+                                                             const std::atomic<bool> &cancelled) {
     if (!slot->written_) return false;
     Backing &backing = *slot->backing_;
-    return transfer(destination, slotOffset(slot->index_, slot->backing_->slotBytes), cancelled,
-                    [&backing](std::byte *data, size_t bytes, off_t offset) {
-                      const auto count = ::pread(backing.descriptor, data, bytes, offset);
-                      if (count > 0)
-                        backing.budget->read_.fetch_add(count, std::memory_order_relaxed);
-                      return count;
-                    });
+    const off_t start = slotOffset(slot->index_, backing.slotBytes);
+    const auto load = [&backing](std::byte *data, size_t bytes, off_t offset) {
+      const auto count = ::pread(backing.descriptor, data, bytes, offset);
+      if (count > 0)
+        backing.budget->read_.fetch_add(count, std::memory_order_relaxed);
+      return count;
+    };
+    Pieces pieces(destination);
+    for (uint64_t done = 0; !pieces.done();) {
+      if (cancelled.load(std::memory_order_relaxed)) return false;
+      const auto chunk = buffer.first(std::min<uint64_t>(buffer.size(), backing.slotBytes - done));
+      if (!moveChunk(chunk, start + static_cast<off_t>(done), load)) return false;
+      size_t used = 0;
+      for (auto piece = pieces.next(chunk.size()); !piece.empty();
+           piece = pieces.next(chunk.size() - used)) {
+        std::memcpy(piece.data(), chunk.data() + used, piece.size());
+        used += piece.size();
+      }
+      done += chunk.size();
+    }
+    return true;
   }, std::move(completion));
 }
 

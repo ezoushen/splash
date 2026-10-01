@@ -54,7 +54,9 @@ private:
 // Scratch storage of fixed-size slots in an unlinked temporary file, served
 // by one IO worker in submission order and bounded by a disk budget. Callers
 // own the memory an operation moves and keep it alive until the operation is
-// ready. A slot is readable only after one complete write; a failed or
+// ready. That memory may have any size and alignment: the worker moves every
+// slot through an aligned buffer of its own, so the file sees only aligned
+// transfers. A slot is readable only after one complete write; a failed or
 // cancelled write leaves it unreadable, and after a failed write the file
 // accepts no further writes. So that a file-size limit fails a write rather
 // than killing the process, a file ignores SIGXFSZ from its construction on.
@@ -62,7 +64,7 @@ class SlotFile final {
   struct Backing;
 
 public:
-  // Slot offsets stay aligned to this for uncached IO.
+  // Slot offsets and every transfer stay aligned to this for uncached IO.
   static constexpr uint64_t kAlignmentBytes = 16384;
 
   class Slot final {
@@ -126,7 +128,9 @@ public:
   // Owners drain their own operations; tests use this to check that none is
   // left.
   [[nodiscard]] bool idle() const;
-  // The spans total one slot and stay valid until the operation is ready.
+  // The spans total at most one slot and stay valid until the operation is
+  // ready. A write stores them in order from the start of the slot and zeros
+  // the rest; a read fills them from the start of the slot.
   [[nodiscard]] std::shared_ptr<Operation> write(
       std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
       std::function<void()> completion);
@@ -135,16 +139,23 @@ public:
       std::function<void()> completion);
 
 private:
+  // Runs on the worker, moving the slot through the worker's buffer.
+  using Run = std::function<bool(std::span<std::byte>, const std::atomic<bool> &)>;
   struct Work {
     std::shared_ptr<Operation> operation;
-    std::function<bool(const std::atomic<bool> &)> run;
+    Run run;
     std::function<void()> completion;
   };
-  [[nodiscard]] std::shared_ptr<Operation> submit(
-      std::function<bool(const std::atomic<bool> &)> work,
-      std::function<void()> completion);
+  struct Free {
+    void operator()(std::byte *memory) const noexcept;
+  };
+  [[nodiscard]] std::shared_ptr<Operation> submit(Run run,
+                                                  std::function<void()> completion);
   void run();
   std::shared_ptr<Backing> backing_;
+  // The worker's own, aligned for uncached IO: every transfer of the file
+  // moves through it, one chunk at a time.
+  std::unique_ptr<std::byte, Free> buffer_;
   mutable std::mutex mutex_;
   std::condition_variable wake_;
   std::deque<Work> work_;
