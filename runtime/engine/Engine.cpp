@@ -531,7 +531,7 @@ bool Engine::admit(Request &active, double now) {
       if (admission.failure == StateFailure::MemoryPressure &&
           judge(denial, active.request.id) == Verdict::Fail) {
         finishFailure(active,
-                      {"capacity_exhausted",
+                      {std::string(kCapacityExhausted),
                        std::string("could not allocate request state: ") +
                            metal::allocationFailureName(
                                admission.allocationFailure),
@@ -1432,27 +1432,15 @@ void Engine::finishFailure(Request &active, Failure failure) {
 }
 
 void Engine::finishCapacity(Request &active, const TokenAdmission &admission) {
-  if (admission.allocationFailure != metal::AllocationFailure::None &&
-      admission.allocationFailure != metal::AllocationFailure::Capacity) {
-    finishFailure(active,
-                  {"capacity_exhausted",
-                   std::string("could not allocate KV target: ") +
-                       metal::allocationFailureName(admission.allocationFailure) +
-                       " (additional_pages=" +
-                       std::to_string(admission.additionalPages) +
-                       ", logical_pages_free=" +
-                       std::to_string(admission.availablePages) + ")",
-                   true});
-    return;
-  }
-  if (active.finalized)
-    return;
-  scheduler_.fail(active.request.id);
-  active.finalized = true;
-  events_.capacityExhausted(active.request.id, admission.additionalPages,
-                            admission.availablePages, 0);
-  ++counters_.failed;
-  release(active);
+  finishFailure(active,
+                {std::string(kCapacityExhausted),
+                 std::string("could not allocate KV target: ") +
+                     metal::allocationFailureName(admission.allocationFailure) +
+                     " (additional_pages=" +
+                     std::to_string(admission.additionalPages) +
+                     ", free_pages=" + std::to_string(admission.availablePages) +
+                     ")",
+                 true});
 }
 
 void Engine::release(Request &active) {

@@ -1132,19 +1132,26 @@ class RuntimeTests(unittest.TestCase):
                 b"request deadline expired",
             )
         )
-        process.send(wire.CapacityExhaustedEvent(capacity.request_id, 40, 12, 50_000))
+        process.send(
+            wire.ErrorEvent(
+                wire.FailureClass.REQUEST_ERROR,
+                capacity.request_id,
+                True,
+                b"capacity_exhausted",
+                b"could not allocate KV target: engine budget",
+            )
+        )
         send_success(process, healthy)
 
         with self.assertRaises(engine_runtime.RequestFailed) as caught:
             request_error.result(1.0)
         self.assertTrue(caught.exception.retryable)
         self.assertEqual(caught.exception.code, b"deadline_exceeded")
-        with self.assertRaises(engine_runtime.CapacityExhausted) as caught:
+        with self.assertRaises(engine_runtime.RequestFailed) as caught:
             capacity.result(1.0)
         self.assertTrue(caught.exception.retryable)
-        self.assertEqual(caught.exception.event.retry_after_micros, 50_000)
-        self.assertIn("logical_pages_free=12", str(caught.exception))
-        self.assertIn("system memory becomes available", str(caught.exception))
+        self.assertEqual(caught.exception.code, b"capacity_exhausted")
+        self.assertIn("engine budget", str(caught.exception))
         self.assertEqual(healthy.result(1.0).done.completion_tokens, 3)
         self.assertTrue(runtime.ready)
 

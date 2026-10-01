@@ -41,7 +41,6 @@ _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
 _DONE = struct.Struct("<QBIIQQQ")
 _ERROR = struct.Struct("<BBQII")
-_CAPACITY_EXHAUSTED = struct.Struct("<QIIQ")
 _STATUS_JSON = struct.Struct("<QI")
 
 assert (
@@ -72,7 +71,6 @@ class FrameType(IntEnum):
     MASK_REQUEST = 0x0103
     DONE = 0x0104
     ERROR = 0x0105
-    CAPACITY_EXHAUSTED = 0x0106
     STATUS_JSON = 0x0107
     PROMPT_PROGRESS = 0x0108
 
@@ -351,14 +349,6 @@ class ErrorEvent:
 
 
 @dataclass(slots=True, frozen=True)
-class CapacityExhaustedEvent:
-    request_id: int
-    required_kv_pages: int
-    available_kv_pages: int
-    retry_after_micros: int
-
-
-@dataclass(slots=True, frozen=True)
 class StatusJsonEvent:
     correlation_id: int
     schema_version: int
@@ -377,7 +367,6 @@ Message: TypeAlias = (
     | MaskRequestEvent
     | DoneEvent
     | ErrorEvent
-    | CapacityExhaustedEvent
     | StatusJsonEvent
 )
 
@@ -562,8 +551,6 @@ def _payload_bounds(frame_type: FrameType, limits: ProtocolLimits) -> tuple[int,
                 _ERROR.size,
                 _ERROR.size + limits.max_error_string_bytes * 2,
             )
-        case FrameType.CAPACITY_EXHAUSTED:
-            bounds = (_CAPACITY_EXHAUSTED.size, _CAPACITY_EXHAUSTED.size)
         case FrameType.STATUS_JSON:
             bounds = (
                 _STATUS_JSON.size,
@@ -1093,28 +1080,6 @@ def _error_issue(
     return None
 
 
-def _capacity_issue(
-    event: CapacityExhaustedEvent,
-    failure: FailureClass,
-) -> ProtocolIssue | None:
-    request_id = event.request_id if type(event.request_id) is int else 0
-    try:
-        request_id = _u64(event.request_id, "capacity request id")
-        if not request_id:
-            raise ValueError("capacity event request id must be non-zero")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_REQUEST_ID, str(error), request_id)
-    try:
-        required = _u32(event.required_kv_pages, "required KV pages")
-        _u32(event.available_kv_pages, "available KV pages")
-        _u64(event.retry_after_micros, "retry delay")
-        if not required:
-            raise ValueError("capacity event required page count must be non-zero")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_COUNT, str(error), request_id)
-    return None
-
-
 def _status_issue(
     event: StatusJsonEvent,
     limits: ProtocolLimits,
@@ -1296,15 +1261,6 @@ def _encode_message(
             + message.message
         )
         frame_type = FrameType.ERROR
-    elif isinstance(message, CapacityExhaustedEvent):
-        _raise_issue(_capacity_issue(message, FailureClass.ENGINE_UNHEALTHY))
-        payload = _CAPACITY_EXHAUSTED.pack(
-            message.request_id,
-            message.required_kv_pages,
-            message.available_kv_pages,
-            message.retry_after_micros,
-        )
-        frame_type = FrameType.CAPACITY_EXHAUSTED
     elif isinstance(message, StatusJsonEvent):
         _raise_issue(_status_issue(message, limits, FailureClass.ENGINE_UNHEALTHY))
         payload = (
@@ -1713,10 +1669,6 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
             payload[message_start:],
         )
         _raise_issue(_error_issue(message, limits, FailureClass.PROTOCOL_FATAL))
-        return message
-    if frame_type is FrameType.CAPACITY_EXHAUSTED:
-        message = CapacityExhaustedEvent(*_CAPACITY_EXHAUSTED.unpack(payload))
-        _raise_issue(_capacity_issue(message, FailureClass.PROTOCOL_FATAL))
         return message
     if frame_type is FrameType.STATUS_JSON:
         correlation_id, schema = _STATUS_JSON.unpack_from(payload)

@@ -126,9 +126,6 @@ private:
                  std::span<const float> optionLogits) override;
   void failed(uint64_t requestId, std::string code, std::string message,
               bool retryable) override;
-  void capacityExhausted(uint64_t requestId, uint32_t requiredKvPages,
-                         uint32_t availableKvPages,
-                         uint64_t retryAfterMicros) override;
 
   static NativeLoopClocks defaultClocks();
   static uint64_t durationMicros(double startMilliseconds,

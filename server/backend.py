@@ -791,8 +791,6 @@ class NativeBackend:
             }
             status = 503 if error.retryable else 400 if code in request_codes else 500
             return APIError(status, message, code)
-        if isinstance(error, engine_runtime.CapacityExhausted):
-            return APIError(503, str(error), "capacity_exhausted")
         if isinstance(error, engine_runtime.MaskComputationFailed):
             if error.retryable:
                 return APIError(503, str(error), "runtime_busy")

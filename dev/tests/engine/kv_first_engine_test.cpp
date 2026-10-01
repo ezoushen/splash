@@ -497,11 +497,10 @@ public:
   void failed(uint64_t, std::string code, std::string message,
               bool retryable) override {
     ++failedCount;
+    if (code == kCapacityExhausted)
+      ++capacityExhaustedCount;
     failures.push_back(std::move(code));
     failureDetails.emplace_back(std::move(message), retryable);
-  }
-  void capacityExhausted(uint64_t, uint32_t, uint32_t, uint64_t) override {
-    ++capacityExhaustedCount;
   }
 
   std::unordered_map<uint64_t, std::vector<uint32_t>> progress;
@@ -2226,7 +2225,7 @@ void testSingletonCapacityFailureTerminatesCleanly() {
 
   engine.submit(request(40, std::vector<uint32_t>(33, 40)));
   runUntilIdle(engine);
-  require(events.completedCount == 0 && events.failedCount == 0 &&
+  require(events.completedCount == 0 && events.failedCount == 1 &&
               events.capacityExhaustedCount == 1 && engine.idle(),
           "B1 capacity failure did not emit exactly one terminal event");
   require(resources.snapshot().activeRequests == 0 && executor.requests.empty(),

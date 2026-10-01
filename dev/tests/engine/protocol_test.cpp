@@ -383,7 +383,6 @@ std::vector<Message> everyOtherMessage() {
                  "Metal command buffer failed"},
       ErrorEvent{FailureClass::ProtocolFatal, 0, false, "bad_frame",
                  "stream framing cannot be trusted"},
-      CapacityExhaustedEvent{92, 40, 12, 50'000},
       StatusJsonEvent{808, kStatusSchemaVersion,
                       "{\n  \"schema_version\": 4, \"ready\": true\n}"},
   };
@@ -937,9 +936,6 @@ void testFailureTaxonomyAndCapacityEvent() {
   if (unhealthy.issue) {
     CHECK(test, unhealthy.issue->failureClass == FailureClass::EngineUnhealthy);
   }
-
-  CapacityExhaustedEvent capacity{8, 24, 3, 100'000};
-  CHECK(test, roundTrip(capacity) == capacity);
 
   TokensEvent overflow{8, std::numeric_limits<uint32_t>::max(), {1}};
   auto overflowResult = serializeMessage(Message{overflow});

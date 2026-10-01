@@ -71,9 +71,9 @@ public:
                          std::span<const float> optionLogits) = 0;
   virtual void failed(uint64_t requestId, std::string code, std::string message,
                       bool retryable) = 0;
-  virtual void capacityExhausted(uint64_t requestId, uint32_t requiredKvPages,
-                                 uint32_t availableKvPages,
-                                 uint64_t retryAfterMicros) = 0;
 };
+
+// The code of a request the engine could not give memory to.
+inline constexpr std::string_view kCapacityExhausted = "capacity_exhausted";
 
 } // namespace splash::engine

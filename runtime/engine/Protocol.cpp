@@ -32,7 +32,6 @@ constexpr uint64_t kTokensFixedBytes = 16;
 constexpr uint64_t kMaskRequestFixedBytes = 24;
 constexpr uint64_t kDoneFixedBytes = 45;
 constexpr uint64_t kErrorFixedBytes = 18;
-constexpr uint64_t kCapacityExhaustedFixedBytes = 24;
 constexpr uint64_t kStatusJsonFixedBytes = 12;
 
 struct PayloadBounds {
@@ -136,8 +135,6 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
       return std::nullopt;
     }
     return bounded(kErrorFixedBytes, maximum);
-  case FrameType::CapacityExhausted:
-    return bounded(kCapacityExhaustedFixedBytes, kCapacityExhaustedFixedBytes);
   case FrameType::StatusJson:
     if (!checkedAdd(kStatusJsonFixedBytes, limits.maxStatusJsonBytes,
                     maximum)) {
@@ -187,7 +184,6 @@ bool validFrameType(uint16_t raw, FrameType &type) {
   case FrameType::MaskRequest:
   case FrameType::Done:
   case FrameType::Error:
-  case FrameType::CapacityExhausted:
   case FrameType::StatusJson:
     type = static_cast<FrameType>(raw);
     return true;
@@ -642,20 +638,6 @@ std::optional<ProtocolIssue> validateError(const ErrorEvent &event,
   return std::nullopt;
 }
 
-std::optional<ProtocolIssue>
-validateCapacityExhausted(const CapacityExhaustedEvent &event,
-                          FailureClass failureClass) {
-  if (!event.requestId) {
-    return makeIssue(failureClass, IssueCode::InvalidRequestId, 0,
-                     "capacity event request id must be non-zero");
-  }
-  if (!event.requiredKvPages) {
-    return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
-                     "capacity event required page count must be non-zero");
-  }
-  return std::nullopt;
-}
-
 std::optional<ProtocolIssue> validateStatusJson(const StatusJsonEvent &event,
                                                 const ProtocolLimits &limits,
                                                 FailureClass failureClass) {
@@ -871,20 +853,6 @@ ProtocolResult<Frame> encodeError(const ErrorEvent &event,
   writer.text(event.code);
   writer.text(event.message);
   return success(Frame{FrameType::Error, writer.take()});
-}
-
-ProtocolResult<Frame>
-encodeCapacityExhausted(const CapacityExhaustedEvent &event) {
-  if (auto issue =
-          validateCapacityExhausted(event, FailureClass::EngineUnhealthy)) {
-    return failure<Frame>(std::move(*issue));
-  }
-  Writer writer(kCapacityExhaustedFixedBytes);
-  writer.u64(event.requestId);
-  writer.u32(event.requiredKvPages);
-  writer.u32(event.availableKvPages);
-  writer.u64(event.retryAfterMicros);
-  return success(Frame{FrameType::CapacityExhausted, writer.take()});
 }
 
 ProtocolResult<Frame> encodeStatusJson(const StatusJsonEvent &event,
@@ -1230,23 +1198,6 @@ ProtocolResult<Message> decodeError(const Frame &frame,
   return success(Message{std::move(event)});
 }
 
-ProtocolResult<Message> decodeCapacityExhausted(const Frame &frame) {
-  Reader reader(frame.payload);
-  CapacityExhaustedEvent event;
-  if (!reader.u64(event.requestId) || !reader.u32(event.requiredKvPages) ||
-      !reader.u32(event.availableKvPages) ||
-      !reader.u64(event.retryAfterMicros) || reader.remaining()) {
-    return failure<Message>(
-        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
-                  0, "capacity exhausted payload has an invalid length"));
-  }
-  if (auto issue =
-          validateCapacityExhausted(event, FailureClass::ProtocolFatal)) {
-    return failure<Message>(std::move(*issue));
-  }
-  return success(Message{event});
-}
-
 ProtocolResult<Message> decodeStatusJson(const Frame &frame,
                                          const ProtocolLimits &limits) {
   Reader reader(frame.payload);
@@ -1288,8 +1239,6 @@ std::string_view frameTypeName(FrameType type) {
     return "done";
   case FrameType::Error:
     return "error";
-  case FrameType::CapacityExhausted:
-    return "capacity_exhausted";
   case FrameType::StatusJson:
     return "status_json";
   }
@@ -1405,8 +1354,6 @@ ProtocolResult<Frame> encodeMessage(const Message &message,
             return encodeDone(value);
           } else if constexpr (std::is_same_v<T, ErrorEvent>) {
             return encodeError(value, limits);
-          } else if constexpr (std::is_same_v<T, CapacityExhaustedEvent>) {
-            return encodeCapacityExhausted(value);
           } else {
             return encodeStatusJson(value, limits);
           }
@@ -1478,8 +1425,6 @@ ProtocolResult<Message> decodeFrame(const Frame &frame,
       return decodeDone(frame);
     case FrameType::Error:
       return decodeError(frame, limits);
-    case FrameType::CapacityExhausted:
-      return decodeCapacityExhausted(frame);
     case FrameType::StatusJson:
       return decodeStatusJson(frame, limits);
     }

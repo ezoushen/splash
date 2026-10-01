@@ -112,11 +112,6 @@ public:
     observations_[requestId].failure = std::move(code) + ":" + message;
   }
 
-  void capacityExhausted(uint64_t requestId, uint32_t, uint32_t,
-                         uint64_t) override {
-    observations_[requestId].failure = "capacity_exhausted";
-  }
-
   [[nodiscard]] const Observation &get(uint64_t requestId) const {
     auto found = observations_.find(requestId);
     if (found == observations_.end())

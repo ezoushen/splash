@@ -36,7 +36,6 @@ enum class FrameType : uint16_t {
   MaskRequest = 0x0103,
   Done = 0x0104,
   Error = 0x0105,
-  CapacityExhausted = 0x0106,
   StatusJson = 0x0107,
   PromptProgress = 0x0108,
 };
@@ -328,15 +327,6 @@ struct ErrorEvent {
   bool operator==(const ErrorEvent &) const = default;
 };
 
-struct CapacityExhaustedEvent {
-  uint64_t requestId = 0;
-  uint32_t requiredKvPages = 0;
-  uint32_t availableKvPages = 0;
-  uint64_t retryAfterMicros = 0;
-
-  bool operator==(const CapacityExhaustedEvent &) const = default;
-};
-
 // JSON is deliberately opaque to the transport.  Its independent schema
 // number is always present, and the frame length carries the exact JSON byte
 // count (including whitespace) without line or C-string assumptions.
@@ -352,7 +342,7 @@ using Message =
     std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
                  StatusRequestFrame, ReadyEvent, StartEvent,
                  PromptProgressEvent, TokensEvent, MaskRequestEvent, DoneEvent,
-                 ErrorEvent, CapacityExhaustedEvent, StatusJsonEvent>;
+                 ErrorEvent, StatusJsonEvent>;
 
 struct Frame {
   FrameType type = FrameType::Request;

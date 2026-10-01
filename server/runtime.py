@@ -87,22 +87,6 @@ class RequestFailed(EngineRuntimeError):
         )
 
 
-class CapacityExhausted(EngineRuntimeError):
-    retryable = True
-
-    def __init__(self, event: wire.CapacityExhaustedEvent):
-        self.event = event
-        super().__init__(
-            f"request {event.request_id} could not allocate its KV target "
-            f"(target_pages={event.required_kv_pages}, "
-            f"logical_pages_free={event.available_kv_pages}); retry after "
-            "other requests finish or system memory becomes available"
-        )
-
-    def restate(self) -> CapacityExhausted:
-        return CapacityExhausted(self.event)
-
-
 class EngineUnhealthy(EngineRuntimeError):
     pass
 
@@ -1136,11 +1120,6 @@ class MultiplexedRuntime:
             return
         if isinstance(message, wire.ErrorEvent):
             self._dispatch_error(generation, message)
-            return
-        if isinstance(message, wire.CapacityExhaustedEvent):
-            call = self._require_call(generation, message.request_id)
-            call._emit(message)
-            self._finish_call(call, error=CapacityExhausted(message))
             return
         if isinstance(message, wire.StartEvent):
             call = self._require_call(generation, message.request_id)

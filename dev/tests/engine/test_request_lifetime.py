@@ -89,7 +89,13 @@ class RequestLifetimeTests(unittest.TestCase):
                     send_success(process, call, tokens=(4,))
                 elif outcome == "capacity":
                     process.send(
-                        wire.CapacityExhaustedEvent(call.request_id, 40, 12, 50000)
+                        wire.ErrorEvent(
+                            wire.FailureClass.REQUEST_ERROR,
+                            call.request_id,
+                            True,
+                            b"capacity_exhausted",
+                            b"could not allocate KV target: engine budget",
+                        )
                     )
                 elif outcome == "shutdown":
                     backend.close()

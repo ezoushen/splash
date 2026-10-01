@@ -589,20 +589,9 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
 
 void NativeRuntime::failed(uint64_t requestId, std::string code,
                            std::string message, bool retryable) {
-  requestError(requestId, std::move(code), std::move(message), retryable);
-  pendingMasks_.erase(requestId);
-  telemetry_.erase(requestId);
-}
-
-void NativeRuntime::capacityExhausted(uint64_t requestId,
-                                      uint32_t requiredKvPages,
-                                      uint32_t availableKvPages,
-                                      uint64_t retryAfterMicros) {
-  send(protocol::CapacityExhaustedEvent{requestId, requiredKvPages,
-                                        availableKvPages, retryAfterMicros});
-  if (config_.metrics) {
+  if (config_.metrics && code == kCapacityExhausted)
     config_.metrics->capacityFailed();
-  }
+  requestError(requestId, std::move(code), std::move(message), retryable);
   pendingMasks_.erase(requestId);
   telemetry_.erase(requestId);
 }

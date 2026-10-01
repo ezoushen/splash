@@ -116,7 +116,6 @@ int main() {
                     "gpu_fault", "Metal command buffer failed"});
     show(ErrorEvent{FailureClass::ProtocolFatal, 0, false,
                     "bad_frame", "stream framing cannot be trusted"});
-    show(CapacityExhaustedEvent{92, 40, 12, 50000});
     show(StatusJsonEvent{
         808, kStatusSchemaVersion,
         "{\n  \"schema_version\": 4, \"ready\": true\n}"});
@@ -233,7 +232,6 @@ def all_messages():
             b"bad_frame",
             b"stream framing cannot be trusted",
         ),
-        p.CapacityExhaustedEvent(92, 40, 12, 50_000),
         p.StatusJsonEvent(
             808,
             p.STATUS_SCHEMA_VERSION,
@@ -1042,10 +1040,6 @@ class ProtocolPythonTests(unittest.TestCase):
         for expected in errors:
             frame = parse_all(p.serialize_message(expected))[0]
             self.assertEqual(p.decode_frame(frame), expected)
-
-        capacity = p.CapacityExhaustedEvent(8, 24, 3, 100_000)
-        frame = parse_all(p.serialize_message(capacity))[0]
-        self.assertEqual(p.decode_frame(frame), capacity)
 
         invalid = replace(
             example_request(),

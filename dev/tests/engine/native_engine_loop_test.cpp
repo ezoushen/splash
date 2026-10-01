@@ -597,11 +597,14 @@ void testCapacityFailureHasOneTerminalFrame() {
   uint32_t errors = 0;
   uint32_t done = 0;
   for (const protocol::Message &message : decodeMessages(output)) {
-    capacity += std::holds_alternative<protocol::CapacityExhaustedEvent>(message);
-    errors += std::holds_alternative<protocol::ErrorEvent>(message);
+    if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+      ++errors;
+      capacity += error->failureClass == protocol::FailureClass::RequestError &&
+                  error->retryable && error->code == engine::kCapacityExhausted;
+    }
     done += std::holds_alternative<protocol::DoneEvent>(message);
   }
-  require(capacity == 1 && errors == 0 && done == 0,
+  require(capacity == 1 && errors == 1 && done == 0,
           "capacity failure emitted more than one terminal frame");
   require(loop.engineHealthy(),
           "request-scoped capacity failure made the engine unhealthy");
