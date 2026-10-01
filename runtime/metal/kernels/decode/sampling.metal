@@ -2,14 +2,15 @@
 #include "metal/kernels/common/split_reduce.h"
 
 // The rows of the target policy. A greedy lane takes each row's argmax. A
-// sampled lane draws from each row's top-k/top-p distribution over the whole
-// vocabulary: a sharded scan sums the row's softmax denominator, one group
-// per row finds the last token the distribution keeps in the order of the
-// logits (logit descending, id ascending) without sorting the vocabulary,
-// and the draw takes one pass over the kept tokens in id order, shared by
-// the row's kVocabularyGroups groups: each sums ranges of the vocabulary, and
-// the one that finishes last (split_arrive_last) draws. Every reduction runs
-// in a fixed order, so a row selects the same token on every run.
+// sampled lane draws from each row's min-p/top-k/top-p distribution over the
+// whole vocabulary: a sharded scan sums the row's softmax denominator, one
+// group per row finds the last token the distribution keeps in the order of
+// the logits (logit descending, id ascending) without sorting the
+// vocabulary, and the draw takes one pass over the kept tokens in id order,
+// shared by the row's kVocabularyGroups groups: each sums ranges of the
+// vocabulary, and the one that finishes last (split_arrive_last) draws.
+// Every reduction runs in a fixed order, so a row selects the same token on
+// every run.
 
 // The row a lane selects from: its logits, the tokens it admits (its
 // constraint mask row, less the stop tokens when the lane ignores
@@ -515,10 +516,11 @@ inline Selection select_last(TargetRow row, OrderBoundary floor,
           bracket.hi_mass + float(keep) * weight};
 }
 
-// The last token of the row's distribution: its top_k, then within those the
-// top_p nucleus, whose mass is measured against the top-k mass (top-k
-// first). A row that keeps every admitted token ends at {kNoKey, 0}.
-inline OrderBoundary distribution_end(TargetRow row, uint top_k,
+// The last token of the row's distribution: the tokens that weigh at least
+// min_p of the heaviest, then the top_k of those, then within those the top_p
+// nucleus, whose mass is measured against the mass of what the two cuts
+// before it keep. A row that keeps every admitted token ends at {kNoKey, 0}.
+inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
                                       float top_p, float mass, uint admitted,
                                       threadgroup VocabularyScratch &scratch,
                                       uint thread_index, uint lane,
@@ -526,8 +528,32 @@ inline OrderBoundary distribution_end(TargetRow row, uint top_k,
   OrderBoundary end{kNoKey, 0};
   Bracket bracket{kLowestKey, logit_key(row.maximum) + 1, admitted, 0, mass,
                   0.0f};
-  if (top_k < admitted) {
-    const Selection top = select_last(row, end, bracket,
+  if (min_p > 0.0f) {
+    // A token weighs min_p of the heaviest, which weighs 1, at the logit
+    // -temperature * log(min_p) below the maximum. The tokens at or above
+    // that logit stay, the heaviest always.
+    const float lowest =
+        min(row.maximum + row.temperature * log(min_p), row.maximum);
+    uint pivots[kPivots];
+    for (uint pivot = 0; pivot < kPivots; ++pivot)
+      pivots[pivot] = logit_key(lowest);
+    measure_pivots(row, LogitOrder{}, end, pivots, scratch, thread_index, lane,
+                   simd_group);
+    const uint kept = scratch.total_counts[0];
+    const float kept_mass = scratch.total_masses[0];
+    // Every thread reads the totals before the next pass rewrites them.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (kept < admitted) {
+      end = {pivots[0], 0xffffffffu};
+      bracket.lo = end.key;
+      bracket.lo_count = kept;
+      bracket.lo_mass = kept_mass;
+    }
+  }
+  if (top_k < bracket.lo_count) {
+    // A min_p cut ends on a whole key, which the bracket bounds from below,
+    // so this search needs no floor.
+    const Selection top = select_last(row, {kNoKey, 0}, bracket,
                                       {false, top_k - 1, 0.0f}, scratch,
                                       thread_index, lane, simd_group);
     end = top.last;
@@ -733,7 +759,7 @@ inline bool vocabulary_draw(
 // admitted count, then the search. The record keeps them with the end; the
 // draw reads the maximum and the end.
 inline void search_row(TargetRow row, device const TargetShardMass *masses,
-                       uint top_k, float top_p,
+                       float min_p, uint top_k, float top_p,
                        device TargetVocabularyRow &record,
                        threadgroup VocabularyScratch &scratch,
                        uint thread_index, uint lane, uint simd_group) {
@@ -741,7 +767,7 @@ inline void search_row(TargetRow row, device const TargetShardMass *masses,
       merge_masses(masses, SPLASH_TARGET_SAMPLING_SHARDS, row.temperature);
   row.maximum = merged.maximum;
   const OrderBoundary end =
-      distribution_end(row, top_k, top_p, merged.sum, merged.admitted,
+      distribution_end(row, min_p, top_k, top_p, merged.sum, merged.admitted,
                        scratch, thread_index, lane, simd_group);
   if (thread_index == 0)
     record = {merged.maximum, merged.sum, merged.admitted, end.key, end.last,
@@ -761,8 +787,8 @@ kernel void decode_sample_vocabulary_search(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup VocabularyScratch scratch;
   search_row(first_token_row(logits, token_mask, params), partial_masses,
-             params.top_k, params.top_p, vocabulary_rows[0], scratch,
-             thread_index, lane, simd_group);
+             params.min_p, params.top_k, params.top_p, vocabulary_rows[0],
+             scratch, thread_index, lane, simd_group);
 }
 
 kernel void decode_sample_vocabulary_draw(
@@ -813,7 +839,7 @@ kernel void decode_sample_vocabulary_search_batch(
     return;
   search_row(verify_row(logits, token_mask, params, global_row),
              partial_masses + ulong(global_row) * SPLASH_TARGET_SAMPLING_SHARDS,
-             params.top_k[batch], params.top_p[batch],
+             params.min_p[batch], params.top_k[batch], params.top_p[batch],
              vocabulary_rows[global_row], scratch, thread_index, lane,
              simd_group);
 }

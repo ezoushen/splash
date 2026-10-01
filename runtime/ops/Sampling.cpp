@@ -160,6 +160,7 @@ void Sampling::addInitial(metal::CommandGraph &graph,
                                     effectiveTopK(policy, vocabulary_),
                                     policy.temperature,
                                     policy.topP,
+                                    policy.minP,
                                     maskWords_,
                                     0,
                                     policy.constrained ? 1U : 0U,
@@ -225,6 +226,7 @@ void Sampling::addVerify(metal::CommandGraph &graph,
       params.top_k[lane] = effectiveTopK(policy, vocabulary_);
       params.temperature[lane] = policy.temperature;
       params.top_p[lane] = policy.topP;
+      params.min_p[lane] = policy.minP;
       params.sampling_mask |= uint32_t{1} << lane;
     }
     if (policy.constrained)

@@ -24,9 +24,9 @@ struct SamplingPenalties final {
 };
 
 struct SamplingPolicy final {
-  // A sampling lane keeps its topK most likely tokens, or every token for 0
-  // or a topK past the vocabulary (top-k disabled), then its top-p
-  // nucleus of those.
+  // A sampling lane keeps the tokens minP leaves it, then its topK most
+  // likely of those, or every one for 0 or a topK past the vocabulary (top-k
+  // disabled), then its top-p nucleus of those.
   uint32_t topK = 1;
   float temperature = 1.0F;
   float topP = 1.0F;
@@ -36,6 +36,9 @@ struct SamplingPolicy final {
   bool excludesStopTokens = false;
   // Greedy lanes take the argmax of the penalized logits.
   SamplingPenalties penalties{};
+  // A sampling lane first drops the tokens less likely than minP times its
+  // most likely one; 0 drops none.
+  float minP = 0.0F;
 
   [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F; }
 };
@@ -122,7 +125,7 @@ struct AcceptanceBuffers final {
 };
 
 // Target token policy. This operator owns the sampling penalties,
-// top-k/top-p, constrained selection, stop-token exclusion and greedy
+// min-p/top-k/top-p, constrained selection, stop-token exclusion and greedy
 // argmax pipeline ABIs; the model only supplies policy, buffers, penalty
 // words and its stop tokens.
 class Sampling final {

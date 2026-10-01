@@ -266,6 +266,7 @@ class TextCompletionTests(unittest.TestCase):
             presence_penalty=1.5,
             frequency_penalty=-0.5,
             repetition_penalty=1.1,
+            min_p=0.25,
             seed=7,
             priority="foreground",
         )
@@ -273,14 +274,15 @@ class TextCompletionTests(unittest.TestCase):
         request = runtime.requests[0]
         self.assertEqual(request.cohort, wire.Cohort.SAMPLING)
         self.assertEqual(
-            request.sampling, wire.SamplingParameters(0.7, 0.5, 5, 1.5, -0.5, 1.1)
+            request.sampling,
+            wire.SamplingParameters(0.7, 0.5, 5, 1.5, -0.5, 1.1, 0.25),
         )
         self.assertEqual(request.seed, 7)
         self.assertEqual(request.priority, wire.RequestPriority.FOREGROUND)
         invalid = (
             ({"temperature": -1}, "temperature must be a number in [0, 2]"),
             ({"top_k": -2}, "top_k must be 0 or -1 (disabled) or a positive"),
-            ({"min_p": 0.1}, "min_p is not supported with speculative decoding"),
+            ({"min_p": 1.1}, "min_p must be a number in [0, 1]"),
             ({"presence_penalty": 3}, "presence_penalty must be a number in [-2, 2]"),
             ({"repetition_penalty": 0}, "repetition_penalty must be a positive number"),
             ({"logit_bias": {"1": 2}}, "logit_bias is not supported with speculative"),

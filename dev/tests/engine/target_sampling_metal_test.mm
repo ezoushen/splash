@@ -6,13 +6,14 @@
 // tokens of rows 1..r; every other logit stays bitwise. The policy then
 // selects from them, among the tokens each lane admits: a greedy row takes
 // its argmax, and a sampled row draws from its distribution over the whole
-// vocabulary (its top-k, then top-p of the renormalized top-k mass). Its
-// softmax denominator, its draft token's probability and its draw must match
-// an evaluation of the same rules in double: the draw must fall where the
-// reference distribution's cumulative sum in token order places the uniform.
-// DFlash acceptance must accept and correct as a sequential decode would.
-// Data within float rounding of a top_p cut or of a draw's boundary fail as
-// ambiguous, or are allowed either way, instead of passing by chance.
+// vocabulary (the tokens min_p leaves, the top-k of those, then top-p of
+// their renormalized mass). Its softmax denominator, its draft token's
+// probability and its draw must match an evaluation of the same rules in
+// double: the draw must fall where the reference distribution's cumulative
+// sum in token order places the uniform. DFlash acceptance must accept and
+// correct as a sequential decode would. Data within float rounding of a
+// min_p or top_p cut or of a draw's boundary fail as ambiguous, or are
+// allowed either way, instead of passing by chance.
 // Extreme repetition penalties saturate to exact, finite outcomes. The host
 // word helpers and the lifecycle that rebuilds a resumed request's words are
 // checked bitwise.
@@ -201,14 +202,19 @@ uint32_t referenceArgmax(const float *row, uint32_t vocabulary,
 // top-k mass, before float sums over the whole vocabulary could keep or cut
 // that token either way.
 constexpr double kTopPMargin = 1e-5;
+// How close a logit may lie to the min_p cut, relative to the larger of the
+// cut and the row's maximum, before the float cut could keep or drop it.
+constexpr double kMinPMargin = 1e-5;
 
 // A row's distribution: its admitted tokens in the order of the logits
-// (value descending, id ascending), the first top_k of them (all of them
-// for 0 or a top_k past the vocabulary), then those whose preceding mass is
-// at most top_p of the top-k mass, each weighing exp((logit - max) / T).
-// margin is the distance of the top_p target from the nearest preceding
-// mass, relative to the top-k mass; the tokens within kTopPMargin of it are
-// ambiguous.
+// (value descending, id ascending); those that weigh at least min_p of the
+// heaviest, which are the ones whose logits are at least max + T * log(min_p);
+// the first top_k of them (all of them for 0 or a top_k past the
+// vocabulary); then those whose preceding mass is at most top_p of the mass
+// kept so far, each weighing exp((logit - max) / T). margin is the distance
+// of the top_p target from the nearest preceding mass, relative to that
+// mass; the tokens within kTopPMargin of it, and those within kMinPMargin of
+// the min_p cut that top_k would keep, are ambiguous.
 struct Distribution final {
   std::vector<uint32_t> order;
   float maximum = 0.0F;
@@ -244,26 +250,48 @@ Distribution referenceDistribution(const float *row, uint32_t vocabulary,
   };
   for (const uint32_t token : order)
     result.admittedMass += weight(token);
+  result.ambiguous.assign(vocabulary, false);
+  if (policy.minP > 0.0F) {
+    const double cut =
+        maximum + double(policy.temperature) * std::log(double(policy.minP));
+    const double tolerance =
+        kMinPMargin * std::max({1.0, std::fabs(cut), std::fabs(maximum)});
+    size_t kept = 0;
+    for (size_t rank = 0;
+         rank < order.size() && row[order[rank]] >= cut - tolerance; ++rank) {
+      if (row[order[rank]] >= cut)
+        kept = rank + 1;
+      // The heaviest token and its ties always stay.
+      if (std::fabs(row[order[rank]] - cut) <= tolerance &&
+          row[order[rank]] != result.maximum &&
+          (!policy.topK || rank < policy.topK)) {
+        result.ambiguous[order[rank]] = true;
+        result.ambiguousMass += weight(order[rank]);
+      }
+    }
+    order.resize(kept);
+  }
   if (policy.topK && policy.topK < order.size())
     order.resize(policy.topK);
   double topMass = 0.0;
   for (const uint32_t token : order)
     topMass += weight(token);
-  result.ambiguous.assign(vocabulary, false);
   if (policy.topP < 1.0F) {
+    // The tokens min_p may keep or drop move the mass top_p measures against.
+    const double slack = kTopPMargin + result.ambiguousMass / topMass;
     const double target = double(policy.topP) * topMass;
     size_t kept = order.size();
     double before = 0.0;
     for (size_t rank = 0; rank < order.size(); ++rank) {
       const double distance = std::fabs(before - target) / topMass;
       result.margin = std::min(result.margin, distance);
-      if (distance <= kTopPMargin) {
+      if (distance <= slack) {
         result.ambiguous[order[rank]] = true;
         result.ambiguousMass += weight(order[rank]);
       }
       if (before > target && kept == order.size())
         kept = rank;
-      if (before > target * (1.0 + kTopPMargin) + kTopPMargin * topMass)
+      if (before > target * (1.0 + slack) + slack * topMass)
         break;
       before += weight(order[rank]);
     }
@@ -942,9 +970,14 @@ void fillShaped(float *row, uint32_t vocabulary, Shape shape, Random &random) {
 // batches beside greedy lanes that are constrained or ignore end-of-sequence
 // too, over every row shape: every sampled row as requireSampledRow checks
 // it, and every greedy row's argmax among the tokens its lane admits. The
-// first token after a prompt follows the same rules.
-void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
-  Random random(0x77696465 + uint64_t{vocabulary} * 8 + lanes);
+// first token after a prompt follows the same rules. With minP the sampled
+// lanes cut by min_p first: alone, before a top-k and a nucleus, at 1, which
+// leaves the most likely token and its ties, and so low that it drops
+// nothing; a greedy lane ignores it.
+void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
+                 bool minP) {
+  Random random(0x77696465 + uint64_t{vocabulary} * 8 + lanes +
+                (minP ? 64 : 0));
   Sampling sampling(vocabulary, kRows);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   const SamplingPolicy narrow{20, 0.9F, 0.95F, false};
@@ -955,10 +988,20 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
   const SamplingPolicy greedy{1, 0.0F, 1.0F, false};
   const SamplingPolicy maskedGreedy{1, 0.0F, 1.0F, true};
   const SamplingPolicy stoplessGreedy{1, 0.0F, 1.0F, false, true};
-  const std::array<std::vector<SamplingPolicy>, kLanes> batches{
-      std::vector{disabled}, std::vector{fifty, maskedGreedy},
-      std::vector{beyond, narrow, stoplessGreedy},
-      std::vector{disabled, thousand, greedy, fifty}};
+  const SamplingPolicy floor{0, 1.0F, 1.0F, false, false, {}, 0.05F};
+  const SamplingPolicy floorNucleus{50, 0.8F, 0.9F, true, false, {}, 0.2F};
+  const SamplingPolicy heaviest{0, 0.9F, 1.0F, false, false, {}, 1.0F};
+  const SamplingPolicy floorless{20, 0.9F, 0.95F, false, true, {}, 1e-30F};
+  const SamplingPolicy floorGreedy{1, 0.0F, 1.0F, false, false, {}, 0.5F};
+  const std::array<std::vector<SamplingPolicy>, kLanes> batches =
+      minP ? std::array<std::vector<SamplingPolicy>, kLanes>{
+                 std::vector{floor}, std::vector{floorNucleus, floorGreedy},
+                 std::vector{heaviest, floorless, stoplessGreedy},
+                 std::vector{floor, floorNucleus, greedy, heaviest}}
+           : std::array<std::vector<SamplingPolicy>, kLanes>{
+                 std::vector{disabled}, std::vector{fifty, maskedGreedy},
+                 std::vector{beyond, narrow, stoplessGreedy},
+                 std::vector{disabled, thousand, greedy, fifty}};
   const std::vector<SamplingPolicy> &policies = batches[lanes - 1];
   for (uint32_t index = 0; index < lanes * (kRows + 1) * batch.maskWords();
        ++index)
@@ -1001,8 +1044,9 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
       batch.uniforms()[lane * 2 * kRows + uniform] =
           0.5F * (random.unit() + 1.0F);
   }
-  const std::string label = "sampled rows B" + std::to_string(lanes) +
-                            " vocabulary " + std::to_string(vocabulary);
+  const std::string label = std::string(minP ? "min_p" : "sampled") +
+                            " rows B" + std::to_string(lanes) + " vocabulary " +
+                            std::to_string(vocabulary);
 
   batch.poison();
   CommandGraph verify;
@@ -1037,7 +1081,8 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
       const Admission admits{policy.constrained ? batch.masks() : nullptr,
                              policy.excludesStopTokens};
       const std::string rowLabel = label + " initial top_k " +
-                                   std::to_string(policy.topK) + " offset " +
+                                   std::to_string(policy.topK) + " min_p " +
+                                   std::to_string(policy.minP) + " offset " +
                                    std::to_string(offset);
       if (policy.samples())
         requireInitialDraw(batch,
@@ -1126,23 +1171,100 @@ void ties(MetalBackend &backend) {
   }
 }
 
+// Where min_p cuts, on rows whose weights are known: the heaviest token
+// weighs 1, ten weigh 0.3, twenty 0.1 and a hundred 0.01 at temperature 1.
+// min_p keeps the classes that weigh at least it, each tie whole; top_k then
+// counts and top_p measures within what it kept, not within the row; and the
+// cut follows the temperature, which squares the weights at 0.5. Draft
+// tokens of the last class kept and of the first one dropped test the cut
+// from both sides: one has its probability, the other none.
+void minPCuts(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 4096;
+  Sampling sampling(vocabulary, kRows);
+  const Batch batch = makeBatch(backend, vocabulary, 1);
+  struct Class final {
+    uint32_t first;
+    uint32_t count;
+    float weight;
+  };
+  constexpr std::array<Class, 4> classes{
+      Class{5, 1, 1.0F}, Class{100, 10, 0.3F}, Class{200, 20, 0.1F},
+      Class{300, 100, 0.01F}};
+  Random random(0x6d696e70);
+  for (uint32_t row = 0; row < kRows; ++row) {
+    float *logits = batch.row(row);
+    std::fill(logits, logits + vocabulary, -1000.0F);
+    for (const Class &c : classes)
+      for (uint32_t index = 0; index < c.count; ++index)
+        logits[c.first + index] = std::log(c.weight);
+  }
+  batch.inputTokens()[0] = 7;
+  struct Case final {
+    const char *name;
+    SamplingPolicy policy;
+    // The tokens the distribution keeps, a token of the last class it keeps
+    // and one of the first class it drops.
+    uint32_t kept;
+    uint32_t last;
+    uint32_t dropped;
+  };
+  for (const Case &c :
+       {Case{"min_p 0.2", {0, 1.0F, 1.0F, false, false, {}, 0.2F}, 11, 109,
+             200},
+        Case{"min_p 0.05", {0, 1.0F, 1.0F, false, false, {}, 0.05F}, 31, 219,
+             300},
+        Case{"min_p 0.31 drops a whole tie",
+             {0, 1.0F, 1.0F, false, false, {}, 0.31F}, 1, 5, 109},
+        Case{"min_p 0.05 at temperature 0.5",
+             {0, 0.5F, 1.0F, false, false, {}, 0.05F}, 11, 109, 200},
+        Case{"min_p 0.2 then top_k 5",
+             {5, 1.0F, 1.0F, false, false, {}, 0.2F}, 5, 103, 104},
+        Case{"min_p 0.05 then top_p 0.5 of what it kept",
+             {0, 1.0F, 0.5F, false, false, {}, 0.05F}, 8, 106, 107},
+        Case{"min_p 1", {0, 1.0F, 1.0F, false, false, {}, 1.0F}, 1, 5, 100}}) {
+    const Distribution target =
+        referenceDistribution(batch.row(0), vocabulary, c.policy);
+    require(target.order.size() == c.kept && target.ambiguousMass == 0.0 &&
+                target.probability(c.last) > 0.0 &&
+                target.probability(c.dropped) == 0.0,
+            std::string(c.name) + ": the reference keeps " +
+                std::to_string(target.order.size()) + " tokens");
+    for (uint32_t position = 0; position < kPositions; ++position) {
+      const uint32_t draft = position % 2 ? c.dropped : c.last;
+      setDraft(batch, 0, position, {draft}, draft, random);
+    }
+    for (uint32_t uniform = 0; uniform < 2 * kRows; ++uniform)
+      batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
+    batch.poison();
+    CommandGraph verify;
+    sampling.addVerify(verify, {&c.policy, 1}, batch.buffers, kStopTokens[0],
+                       kStopTokens[1]);
+    static_cast<void>(backend.submitCommand(verify.dispatches()));
+    for (uint32_t row = 0; row < kRows; ++row)
+      requireSampledRow(batch, row, target,
+                        std::string(c.name) + " row " + std::to_string(row));
+  }
+}
+
 // DFlash acceptance over broad distributions against a sequential decode,
-// beside a lane with the default top-k of 20. The draft proposes each
-// position's most likely token with all of its mass, until a lane's wrong
-// position, where it proposes a token the target keeps with little
-// probability. Acceptance must keep the right tokens, reject the wrong one
-// and correct it from the target less the draft token, or take the bonus
-// token from the last row.
+// beside a lane with the default top-k of 20 and one that min_p cuts. The
+// draft proposes each position's most likely token with all of its mass,
+// until a lane's wrong position, where it proposes a token the target keeps
+// with little probability. Acceptance must keep the right tokens, reject the
+// wrong one and correct it from the target less the draft token, or take the
+// bonus token from the last row.
 void speculativeWholeVocabulary(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 5003;
-  constexpr uint32_t lanes = 3;
-  constexpr std::array<uint32_t, lanes> kWrongAt{2, kPositions, 4};
+  constexpr uint32_t lanes = 4;
+  constexpr std::array<uint32_t, lanes> kWrongAt{2, kPositions, 4, 6};
   Random random(0x77686f6c);
   Sampling sampling(vocabulary, kRows);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
-  const std::vector<SamplingPolicy> policies{{0, 1.0F, 1.0F, false},
-                                             {2000, 0.8F, 0.97F, false},
-                                             {20, 0.9F, 0.9F, false}};
+  const std::vector<SamplingPolicy> policies{
+      {0, 1.0F, 1.0F, false},
+      {2000, 0.8F, 0.97F, false},
+      {20, 0.9F, 0.9F, false},
+      {0, 1.0F, 1.0F, false, false, {}, 0.02F}};
   AcceptanceBuffers acceptance{
       allocate(backend, uint64_t{lanes} * kPositions * sizeof(uint32_t)),
       batch.buffers.draftCandidates,
@@ -1216,7 +1338,7 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
   CommandGraph graph;
   sampling.addVerify(graph, policies, batch.buffers, kStopTokens[0],
                      kStopTokens[1]);
-  const std::array<uint32_t, lanes> maximumRetained{kRows, kRows, kRows};
+  const std::array<uint32_t, lanes> maximumRetained{kRows, kRows, kRows, kRows};
   sampling.addAcceptance(graph, acceptance, maximumRetained, policies,
                          kStopTokens[0], kStopTokens[1]);
   static_cast<void>(backend.submitCommand(graph.dispatches()));
@@ -1554,6 +1676,8 @@ int main(int argc, char **argv) {
     invalidSampled(backend);
     stage = "ties";
     ties(backend);
+    stage = "min_p cuts";
+    minPCuts(backend);
     stage = "speculative acceptance over broad distributions";
     speculativeWholeVocabulary(backend);
     stage = "over-proposed residual";
@@ -1570,7 +1694,9 @@ int main(int argc, char **argv) {
         stage = "argmax penalties" + batch;
         penalties(backend, vocabulary, lanes, true, changedSelections);
         stage = "sampled rows" + batch;
-        sampledRows(backend, vocabulary, lanes);
+        sampledRows(backend, vocabulary, lanes, false);
+        stage = "min_p rows" + batch;
+        sampledRows(backend, vocabulary, lanes, true);
       }
       require(changedSelections > 0,
               "the penalties changed no greedy selection");

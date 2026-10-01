@@ -724,7 +724,8 @@ struct Runtime::Impl {
             enabled ? entry.sampling.topP : 1.0F,
             entry.constraint == ConstraintMode::TokenMask,
             (entry.flags & RequestIgnoreEndOfSequence) != 0,
-            samplingPenalties(entry)};
+            samplingPenalties(entry),
+            enabled ? entry.sampling.minP : 0.0F};
   }
 
   template <class Get>
@@ -1899,7 +1900,8 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   if (entry.cohort != expected || !std::isfinite(entry.sampling.temperature) ||
       entry.sampling.temperature < 0.0F ||
       !std::isfinite(entry.sampling.topP) || entry.sampling.topP <= 0.0F ||
-      entry.sampling.topP > 1.0F) {
+      entry.sampling.topP > 1.0F || !(entry.sampling.minP >= 0.0F) ||
+      entry.sampling.minP > 1.0F) {
     throw std::invalid_argument("request sampling/cohort contract is invalid");
   }
   // The penalties' ranges, as the API takes them.

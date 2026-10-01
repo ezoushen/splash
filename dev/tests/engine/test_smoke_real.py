@@ -460,7 +460,7 @@ class SmokeRealTests(unittest.TestCase):
                 )
 
     def test_sampling_requires_repeats_the_tool_call_and_the_whole_budget(self):
-        def serve(repeat=True, arguments=None, ignored=32):
+        def serve(repeat=True, arguments=None, ignored=32, heaviest="x"):
             answers = iter(("first", "second", "second" if repeat else "third"))
 
             def answer(port, method, path, body=None, **_kwargs):
@@ -473,7 +473,12 @@ class SmokeRealTests(unittest.TestCase):
                     }
                     return 200, {"choices": [{"message": {"tool_calls": [call]}}]}
                 usage = {"completion_tokens": ignored if body.get("ignore_eos") else 5}
-                content = "mon, tue" if body.get("temperature") else next(answers, "x")
+                if body.get("min_p") == 1:
+                    content = heaviest
+                elif body.get("temperature"):
+                    content = "mon, tue"
+                else:
+                    content = next(answers, "x")
                 return 200, {
                     "choices": [{"message": {"content": content}}],
                     "usage": usage,
@@ -488,6 +493,7 @@ class SmokeRealTests(unittest.TestCase):
             smoke_real.run_sampling(8000, "test-model")
         for failure, server in (
             ("did not repeat", serve(repeat=False)),
+            ("min_p 1 did not answer", serve(heaviest="y")),
             ("tool call failed", serve(arguments={"value": "no"})),
             ("stopped early", serve(ignored=7)),
         ):

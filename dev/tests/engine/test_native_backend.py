@@ -192,6 +192,7 @@ def make_job(request_id=101, *, constraint=None, temperature=0.0):
             presence_penalty=1.5,
             frequency_penalty=-0.25,
             repetition_penalty=1.125,
+            min_p=0.125,
         ),
         deadline=time.monotonic() + 10.0,
         priority=backend_api.REQUEST_PRIORITIES["foreground"],
@@ -313,7 +314,7 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(
             frame.sampling,
             wire.SamplingParameters(
-                frame.sampling.temperature, 0.75, 17, 1.5, -0.25, 1.125
+                frame.sampling.temperature, 0.75, 17, 1.5, -0.25, 1.125, 0.125
             ),
         )
         self.assertEqual(frame.seed, 0x123456789ABCDEF0)

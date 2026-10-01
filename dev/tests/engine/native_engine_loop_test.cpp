@@ -505,11 +505,11 @@ void testSamplingReachesTheModel() {
       {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
   loop.announceReady();
   auto greedy = request(1);
-  greedy.sampling = {0.0f, 1.0f, 0, 1.5f, 0.0f, 1.1f};
+  greedy.sampling = {0.0f, 1.0f, 0, 1.5f, 0.0f, 1.1f, 0.2f};
   auto sampled = request(2);
   sampled.cohort = protocol::Cohort::Sampling;
   sampled.seed = 77;
-  sampled.sampling = {0.7f, 0.8f, 20, -0.5f, 2.0f, 0.9f};
+  sampled.sampling = {0.7f, 0.8f, 20, -0.5f, 2.0f, 0.9f, 0.05f};
   for (const auto &input : {greedy, sampled}) {
     auto encoded = protocol::serializeMessage(protocol::Message{input});
     require(encoded && loop.receive(*encoded.value), "sampled request wire failed");
@@ -523,10 +523,11 @@ void testSamplingReachesTheModel() {
            sampling.seed == input.seed &&
            sampling.presencePenalty == sent.presencePenalty &&
            sampling.frequencyPenalty == sent.frequencyPenalty &&
-           sampling.repetitionPenalty == sent.repetitionPenalty;
+           sampling.repetitionPenalty == sent.repetitionPenalty &&
+           sampling.minP == sent.minP;
   };
   require(matches(1, greedy) && matches(2, sampled),
-          "a penalty did not reach the model");
+          "a penalty or min_p did not reach the model");
 }
 
 void testFatalFramingClosesConnection() {

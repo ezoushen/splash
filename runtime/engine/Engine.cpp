@@ -95,6 +95,7 @@ void Engine::submit(EngineRequest value) {
         value.constraint != ConstraintMode::None || !value.images.empty() ||
         value.sampling.temperature != 0.0f || value.sampling.topP != 1.0f ||
         value.sampling.topK != 0 || value.sampling.penalized() ||
+        value.sampling.minP != 0.0f ||
         value.scoreTokens.size() < model::ExecutionLimits::minimumScoreOptions ||
         value.scoreTokens.size() > model::ExecutionLimits::maximumScoreOptions) {
       throw std::invalid_argument("invalid score request");

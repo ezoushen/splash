@@ -2150,17 +2150,19 @@ int main(int argc, char **argv) {
         return presence != 0.0F || frequency != 0.0F || repetition != 1.0F;
       }
     };
-    // A sampling request keeps its topK tokens, all of them for 0, then its
-    // topP nucleus.
+    // A sampling request keeps the tokens minP leaves it, the topK of those,
+    // all of them for 0, then its topP nucleus.
     const auto runPreemption = [&](BatchCohort cohort, uint32_t preemptionMode,
                                    Penalties penalties = {},
                                    uint32_t topK = 20, float topP = 0.95F,
-                                   uint32_t flags = 0) {
+                                   uint32_t flags = 0, float minP = 0.0F) {
       const bool preempt = preemptionMode != 0;
       EngineRequest sequence = makeRequest(80, prompt129, 24, cohort);
       sequence.flags = flags;
-      if (cohort == BatchCohort::Sampling)
+      if (cohort == BatchCohort::Sampling) {
         sequence.sampling = {0.8F, topP, topK, 91199};
+        sequence.sampling.minP = minP;
+      }
       if (cohort == BatchCohort::Constrained)
         sequence.constraint = ConstraintMode::TokenMask;
       sequence.sampling.presencePenalty = penalties.presence;
@@ -2498,6 +2500,35 @@ int main(int argc, char **argv) {
       std::cout << "top_k -1 top_p=" << topP
                 << " transcript_equal=" << (resumed.transcript == reference.transcript)
                 << " rows=" << reference.transcript.size() << '\n';
+    }
+    // Sampled requests that min_p alone cuts (top_k and top_p keep every
+    // token) keep the preemption guarantees and repeat under a fixed seed. At
+    // min_p 1 each row keeps its most likely token only, so the request
+    // selects what a greedy one does, draft tokens and corrections included.
+    {
+      const auto run = [&](uint32_t preemptionMode, float minP) {
+        return runPreemption(BatchCohort::Sampling, preemptionMode, {}, 0, 1.0F,
+                             RequestIgnoreEndOfSequence, minP);
+      };
+      const auto reference = run(0, 0.1F);
+      require(run(1, 0.1F).transcript == reference.transcript,
+              "prompt recomputation changed a min_p transcript");
+      const auto resumed = run(2, 0.1F);
+      require(std::equal(resumed.transcript.begin(),
+                         resumed.transcript.begin() +
+                             resumed.pendingAnchorIndex + 1,
+                         reference.transcript.begin()) &&
+                  run(2, 0.1F).transcript == resumed.transcript,
+              "min_p recomputation is not deterministic");
+      const auto greedy = runPreemption(BatchCohort::Greedy, 0, {}, 20, 0.95F,
+                                        RequestIgnoreEndOfSequence);
+      const auto heaviest = run(0, 1.0F);
+      require(heaviest.transcript == greedy.transcript,
+              "min_p 1 did not select each row's most likely token");
+      std::cout << "min_p 0.1 transcript_equal="
+                << (resumed.transcript == reference.transcript)
+                << " rows=" << reference.transcript.size()
+                << " min_p 1 greedy_rows=" << greedy.transcript.size() << '\n';
     }
 
     const auto rowsBeforeInvalidWarmup = executor.telemetry().targetPrefillRows;

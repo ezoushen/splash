@@ -14,6 +14,7 @@ struct TargetSamplingParams {
   uint32_t top_k;
   float temperature;
   float top_p;
+  float min_p;
   uint32_t mask_words;
   uint32_t mask_row_offset;
   uint32_t constrained;
@@ -24,8 +25,8 @@ struct TargetSamplingParams {
   uint32_t stop_token_1;
 };
 
-static_assert(sizeof(TargetSamplingParams) == 44,
-              "Target sampling parameters are 44 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 48,
+              "Target sampling parameters are 48 bytes on both sides");
 
 struct TargetSamplingBatchParams {
   uint32_t vocabulary;
@@ -35,6 +36,7 @@ struct TargetSamplingBatchParams {
   uint32_t top_k[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   float top_p[SPLASH_MAXIMUM_BATCH_WIDTH];
+  float min_p[SPLASH_MAXIMUM_BATCH_WIDTH];
   // Lanes that sample; the others take the argmax.
   uint32_t sampling_mask;
   uint32_t constrained_mask;
@@ -44,8 +46,8 @@ struct TargetSamplingBatchParams {
   uint32_t stop_token_1;
 };
 
-static_assert(sizeof(TargetSamplingBatchParams) == 84,
-              "Batched target sampling parameters are 84 bytes on both sides");
+static_assert(sizeof(TargetSamplingBatchParams) == 100,
+              "Batched target sampling parameters are 100 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its
@@ -61,7 +63,7 @@ static_assert(sizeof(TargetShardMass) == 12,
 
 // A sampled row's selection over the whole vocabulary. The search merges
 // its shards' masses into the row's largest admitted logit, softmax
-// denominator and admitted count, and records where its top-k/top-p
+// denominator and admitted count, and records where its min-p/top-k/top-p
 // distribution ends in the order of the logits (the key and id of its last
 // token, metal/kernels/decode/sampling.metal). The draw writes the target
 // probability of the row's draft token and the token it draws: for a verify

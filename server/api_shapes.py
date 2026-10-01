@@ -601,6 +601,7 @@ def responses_to_chat_body(body, previous_items=()):
         "presence_penalty",
         "frequency_penalty",
         "repetition_penalty",
+        "min_p",
         "logit_bias",
         "seed",
         "timeout",

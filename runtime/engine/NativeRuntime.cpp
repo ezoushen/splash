@@ -289,7 +289,8 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
         .seed = request.seed,
         .presencePenalty = request.sampling.presencePenalty,
         .frequencyPenalty = request.sampling.frequencyPenalty,
-        .repetitionPenalty = request.sampling.repetitionPenalty};
+        .repetitionPenalty = request.sampling.repetitionPenalty,
+        .minP = request.sampling.minP};
     engineRequest.constraint = mapConstraint(request.constraint);
     engineRequest.flags = request.flags;
     engineRequest.returnProgress = request.returnProgress;

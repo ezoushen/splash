@@ -51,6 +51,9 @@ struct SamplingParameters final {
   float presencePenalty = 0.0F;
   float frequencyPenalty = 0.0F;
   float repetitionPenalty = 1.0F;
+  // Sampling drops the tokens less likely than minP times the most likely
+  // one, before top-k and top-p; 0 drops none.
+  float minP = 0.0F;
 
   [[nodiscard]] bool penalized() const noexcept {
     return presencePenalty != 0.0F || frequencyPenalty != 0.0F ||

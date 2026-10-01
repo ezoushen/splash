@@ -800,11 +800,13 @@ def run(port: int, model: str) -> None:
 
 
 def run_sampling(port: int, model: str) -> None:
-    """The sampling penalties and top_k on the real model: a penalized greedy
-    request repeats itself exactly once its prompt is cached (the first run
-    chunks the prompt differently), and penalized requests of every cohort
-    finish side by side with an unpenalized one and with sampled ones whose
-    top_k keeps every token."""
+    """The sampling penalties, top_k and min_p on the real model: a penalized
+    greedy request repeats itself exactly once its prompt is cached (the first
+    run chunks the prompt differently), a sampled request whose min_p of 1
+    leaves each row its most likely token answers what a greedy one does, and
+    penalized requests of every cohort finish side by side with an
+    unpenalized one and with sampled ones whose top_k keeps every token or
+    which min_p cuts."""
     prompt = "Name the days of the week, three times over, separated by commas."
     penalized = chat_body(
         model,
@@ -820,6 +822,33 @@ def run_sampling(port: int, model: str) -> None:
         require(code == 200, f"penalized greedy Chat failed: {chat!r}")
         answers.append(answer_text(chat))
     require(answers[1] == answers[2], "a penalized greedy request did not repeat")
+
+    code, greedy = request(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        chat_body(model, prompt, max_completion_tokens=48),
+    )
+    require(code == 200, f"greedy Chat failed: {greedy!r}")
+    code, heaviest = request(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        chat_body(
+            model,
+            prompt,
+            temperature=1.0,
+            top_k=-1,
+            top_p=1.0,
+            min_p=1.0,
+            seed=13,
+            max_completion_tokens=48,
+        ),
+    )
+    require(
+        code == 200 and answer_text(heaviest) == answer_text(greedy),
+        f"min_p 1 did not answer as a greedy request: {heaviest!r}",
+    )
 
     bodies = {
         "greedy": penalized,
@@ -839,6 +868,14 @@ def run_sampling(port: int, model: str) -> None:
             top_k=0,
             top_p=1.0,
             seed=11,
+            max_completion_tokens=48,
+        ),
+        "min_p": chat_body(
+            model,
+            prompt,
+            temperature=0.8,
+            min_p=0.1,
+            seed=17,
             max_completion_tokens=48,
         ),
         "tool": chat_body(
@@ -874,7 +911,7 @@ def run_sampling(port: int, model: str) -> None:
         results["ignore_eos"][1]["usage"]["completion_tokens"] == 32,
         "ignore_eos beside penalized requests stopped early",
     )
-    print("sampling penalties and top_k: PASS", flush=True)
+    print("sampling penalties, top_k and min_p: PASS", flush=True)
 
 
 def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:

@@ -27,7 +27,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIfffQBIII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQBIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -47,7 +47,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 84
+assert _REQUEST.size == 88
 assert _IMAGE_SPAN.size == 32
 assert _START.size == 21
 assert _DONE.size == 41
@@ -185,7 +185,8 @@ _REQUEST_FLAG_BITS = int(RequestFlag.IGNORE_END_OF_SEQUENCE)
 class SamplingParameters:
     """The defaults are greedy selection with nothing changing the logits,
     which score requests require. A top_k of 0, or one past the vocabulary,
-    keeps every token; the default penalties change nothing."""
+    keeps every token; the default penalties change nothing, and a min_p of
+    0 drops no token."""
 
     temperature: float = 0.0
     top_p: float = 1.0
@@ -193,6 +194,7 @@ class SamplingParameters:
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    min_p: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -447,6 +449,7 @@ def _sampling_values(sampling: SamplingParameters) -> tuple:
         _float32(sampling.presence_penalty, "presence_penalty"),
         _float32(sampling.frequency_penalty, "frequency_penalty"),
         _float32(sampling.repetition_penalty, "repetition_penalty"),
+        _float32(sampling.min_p, "min_p"),
     )
 
 
@@ -780,14 +783,17 @@ def _request_issue(
         )
     try:
         sampling = _sampling_values(request.sampling)
-        temperature, top_p, _, presence, frequency, repetition = sampling
+        temperature, top_p, _, presence, frequency, repetition, min_p = sampling
         if (
             not math.isfinite(temperature)
             or temperature < 0.0
             or not math.isfinite(top_p)
             or not 0.0 < top_p <= 1.0
+            or not 0.0 <= min_p <= 1.0
         ):
-            raise ValueError("sampling requires temperature>=0 and top_p in (0,1]")
+            raise ValueError(
+                "sampling requires temperature>=0, top_p in (0,1] and min_p in [0,1]"
+            )
         if (
             not abs(presence) <= 2.0
             or not abs(frequency) <= 2.0
@@ -1436,6 +1442,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         presence_penalty,
         frequency_penalty,
         repetition_penalty,
+        min_p,
         seed,
         return_progress,
         score_count,
@@ -1512,6 +1519,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
             presence_penalty,
             frequency_penalty,
             repetition_penalty,
+            min_p,
         ),
         seed,
         _decode_enum(

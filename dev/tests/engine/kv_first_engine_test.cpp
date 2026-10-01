@@ -610,7 +610,7 @@ void tickUntil(engine::Engine &engine, double &now, const std::function<bool()> 
 }
 
 // A score request reads raw logits, so the engine refuses one that carries
-// a penalty, as it refuses any other sampling.
+// a penalty or a min_p, as it refuses any other sampling.
 void testScoreRequestsCarryNoSamplingOptions() {
   Storage storage(64);
   KvPool pool(storage);
@@ -618,13 +618,14 @@ void testScoreRequestsCarryNoSamplingOptions() {
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
-  for (uint32_t field = 0; field < 3; ++field) {
+  for (uint32_t field = 0; field < 4; ++field) {
     EngineRequest score = request(1, std::vector<uint32_t>(8, 7));
     score.maxNewTokens = 0;
     score.scoreTokens = {3, 4};
     float *options[] = {&score.sampling.presencePenalty,
                         &score.sampling.frequencyPenalty,
-                        &score.sampling.repetitionPenalty};
+                        &score.sampling.repetitionPenalty,
+                        &score.sampling.minP};
     *options[field] += 0.5F;
     bool refused = false;
     try {
@@ -632,7 +633,7 @@ void testScoreRequestsCarryNoSamplingOptions() {
     } catch (const std::invalid_argument &) {
       refused = true;
     }
-    require(refused, "a score request with a penalty was accepted");
+    require(refused, "a score request with a penalty or min_p was accepted");
   }
   require(engine.idle(), "a refused score request was queued");
   EngineRequest neutral = request(1, std::vector<uint32_t>(8, 7));

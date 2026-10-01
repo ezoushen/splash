@@ -6275,7 +6275,8 @@ class ServerTest(unittest.TestCase):
             self.body(top_p=1e-46),
             self.body(presence_penalty=False),
             self.body(repetition_penalty=True),
-            self.body(min_p=0.1),
+            self.body(min_p=1.1),
+            self.body(min_p=True),
             self.body(logit_bias={"1": 2}),
             self.body(stream="true"),
             self.body(messages=[{"role": "system", "content": "instructions"}]),
@@ -6352,8 +6353,8 @@ class ServerTest(unittest.TestCase):
     def test_sampling_fields_reach_the_engine_and_are_validated_per_field(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime)
-        # Qwen's recommended non-thinking sampling, whose min_p of 0 changes
-        # nothing, and penalties beyond it.
+        # Qwen's recommended non-thinking sampling, whose min_p of 0 drops
+        # nothing, penalties beyond it, and min_p up to its limit.
         accepted = (
             (
                 {
@@ -6369,6 +6370,8 @@ class ServerTest(unittest.TestCase):
             ({"repetition_penalty": 2.5, "frequency_penalty": -2}, {}),
             ({"presence_penalty": 2, "frequency_penalty": 2, "top_k": 32}, {}),
             ({"repetition_penalty": 1e-40, "frequency_penalty": 0.25}, {}),
+            ({"temperature": 0.7, "min_p": 0.25}, {}),
+            ({"min_p": 1}, {}),
         )
         for fields, neutral in accepted:
             with self.subTest(fields=fields):
@@ -6401,8 +6404,9 @@ class ServerTest(unittest.TestCase):
             ({"temperature": 2.5}, "temperature must be a number in [0, 2]"),
             ({"temperature": -0.5}, "temperature must be a number in [0, 2]"),
             ({"top_p": 0}, "top_p must be a number in (0, 1]"),
-            ({"min_p": 0.05}, "min_p is not supported with speculative decoding"),
-            ({"min_p": 1.5}, "min_p is not supported with speculative decoding"),
+            ({"min_p": 1.5}, "min_p must be a number in [0, 1]"),
+            ({"min_p": -0.1}, "min_p must be a number in [0, 1]"),
+            ({"min_p": "0.1"}, "min_p must be a number in [0, 1]"),
             ({"presence_penalty": 2.5}, "presence_penalty must be a number in [-2, 2]"),
             (
                 {"frequency_penalty": -3},
@@ -6472,6 +6476,7 @@ class ServerTest(unittest.TestCase):
             "presence_penalty": 1.5,
             "frequency_penalty": 0.5,
             "repetition_penalty": 1.05,
+            "min_p": 0.25,
         }
         status, _, payload = harness.request(
             "POST", "/v1/responses", self.responses_body(store=False, **fields)
@@ -6483,6 +6488,7 @@ class ServerTest(unittest.TestCase):
         for refused, message in (
             ({"logit_bias": {"1": 2}}, "logit_bias is not supported with speculative"),
             ({"presence_penalty": 3}, "presence_penalty must be a number"),
+            ({"min_p": 2}, "min_p must be a number in [0, 1]"),
         ):
             with self.subTest(fields=refused):
                 status, _, payload = harness.request(

@@ -168,24 +168,24 @@ void testRequestWireAndRoundTrip() {
   const auto &wire = *serialized.value;
 
   CHECK(test, wire.size() ==
-                  kFrameHeaderBytes + 84 + request.promptTokens.size() * 4);
+                  kFrameHeaderBytes + 88 + request.promptTokens.size() * 4);
   CHECK(test, std::string(wire.begin(), wire.begin() + 4) == "SPLH");
   CHECK(test, loadU16(wire, 4) == kProtocolVersion);
   CHECK(test, loadU16(wire, 6) == kFrameHeaderBytes);
   CHECK(test, loadU16(wire, 8) == static_cast<uint16_t>(FrameType::Request));
   CHECK(test, loadU16(wire, 10) == 0);
-  CHECK(test, loadU64(wire, 12) == 84 + request.promptTokens.size() * 4);
+  CHECK(test, loadU64(wire, 12) == 88 + request.promptTokens.size() * 4);
   CHECK(test, loadU32(wire, 20) == 0);
   CHECK(test, loadU64(wire, kFrameHeaderBytes) == request.requestId);
   CHECK(test,
         loadU32(wire, kFrameHeaderBytes + 31) == request.promptTokens.size());
   CHECK(test, loadU32(wire, kFrameHeaderBytes + 35) == 0);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 72) == 0);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 76) ==
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 76) == 0);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 80) ==
                   request.generationPromptTokens);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 80) == request.flags);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 84) == 0);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 84 + 16) == 0xffffffffU);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 84) == request.flags);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 88) == 0);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 88 + 16) == 0xffffffffU);
   RequestFrame decoded = roundTrip(request);
   CHECK(test, decoded == request);
 
@@ -195,7 +195,7 @@ void testRequestWireAndRoundTrip() {
   if (!imageWire)
     return;
   const size_t spanOffset =
-      kFrameHeaderBytes + 84 + withImage.promptTokens.size() * 4;
+      kFrameHeaderBytes + 88 + withImage.promptTokens.size() * 4;
   CHECK(test, imageWire.value->size() ==
                   spanOffset + 32 + withImage.imagePixels.size());
   CHECK(test, loadU32(*imageWire.value, kFrameHeaderBytes + 35) == 1);
@@ -217,10 +217,10 @@ void testScoreRequestAndDoneLogits() {
     return;
   const auto &wire = *serialized.value;
   const size_t scoreOffset =
-      kFrameHeaderBytes + 84 + request.promptTokens.size() * 4;
+      kFrameHeaderBytes + 88 + request.promptTokens.size() * 4;
   CHECK(test, wire.size() == scoreOffset + request.scoreTokens.size() * 4);
   CHECK(test, loadU32(wire, kFrameHeaderBytes + 27) == 0);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 72) ==
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 76) ==
                   request.scoreTokens.size());
   CHECK(test, roundTrip(request) == request);
 
@@ -251,7 +251,7 @@ void testScoreRequestAndDoneLogits() {
 
   auto oversizedWire = wire;
   oversizedWire.resize(scoreOffset + tooMany.scoreTokens.size() * 4);
-  storeU32(oversizedWire, kFrameHeaderBytes + 72, tooMany.scoreTokens.size());
+  storeU32(oversizedWire, kFrameHeaderBytes + 76, tooMany.scoreTokens.size());
   storeU64(oversizedWire, 12, oversizedWire.size() - kFrameHeaderBytes);
   for (size_t index = 0; index < tooMany.scoreTokens.size(); ++index)
     storeU32(oversizedWire, scoreOffset + index * 4, tooMany.scoreTokens[index]);
@@ -789,16 +789,16 @@ void testPromptAndImageSpanRejections() {
     return;
   // Only the fixed fields and the prompt tokens: drop the tokens.
   auto emptyWire = *serialized.value;
-  emptyWire.resize(kFrameHeaderBytes + 84);
+  emptyWire.resize(kFrameHeaderBytes + 88);
   storeU32(emptyWire, kFrameHeaderBytes + 31, 0);
-  storeU64(emptyWire, 12, 84);
+  storeU64(emptyWire, 12, 88);
   expectDecodeIssue(emptyWire, IssueCode::LimitExceeded);
   auto wholePromptWire = *serialized.value;
-  storeU32(wholePromptWire, kFrameHeaderBytes + 76,
+  storeU32(wholePromptWire, kFrameHeaderBytes + 80,
            wholePrompt.generationPromptTokens);
   expectDecodeIssue(wholePromptWire, IssueCode::InvalidCount);
   const size_t spanOffset =
-      kFrameHeaderBytes + 84 + image.promptTokens.size() * 4;
+      kFrameHeaderBytes + 88 + image.promptTokens.size() * 4;
   auto tokensWire = *imageWire.value;
   storeU32(tokensWire, spanOffset + 4, 2);
   expectDecodeIssue(tokensWire, IssueCode::InvalidCount);
@@ -809,25 +809,26 @@ void testPromptAndImageSpanRejections() {
 }
 
 // The sampling parameters are one block after the image span count:
-// temperature, top_p, top_k and the presence, frequency and repetition
-// penalties. Each codec takes any top_k and refuses a penalty outside its
-// range, and a score request anything but the defaults.
+// temperature, top_p, top_k, the presence, frequency and repetition
+// penalties, and min_p. Each codec takes any top_k and refuses a penalty or
+// a min_p outside its range, and a score request anything but the defaults.
 void testSamplingBlock() {
   constexpr std::string_view test = "sampling block";
   RequestFrame request = exampleRequest();
-  request.sampling = {0.8f, 0.95f, 32, 1.5f, -0.5f, 1.1f};
+  request.sampling = {0.8f, 0.95f, 32, 1.5f, -0.5f, 1.1f, 0.05f};
   auto serialized = serializeMessage(Message{request});
   CHECK(test, serialized);
   if (!serialized)
     return;
   const auto &wire = *serialized.value;
-  const std::array<float, 6> expected{0.8f, 0.95f, 0.0f, 1.5f, -0.5f, 1.1f};
+  const std::array<float, 7> expected{0.8f,  0.95f, 0.0f, 1.5f,
+                                      -0.5f, 1.1f,  0.05f};
   for (size_t field = 0; field < expected.size(); ++field) {
     const uint32_t bits = loadU32(wire, kFrameHeaderBytes + 39 + 4 * field);
     CHECK(test, field == 2 ? bits == 32
                            : bits == std::bit_cast<uint32_t>(expected[field]));
   }
-  CHECK(test, loadU64(wire, kFrameHeaderBytes + 63) == request.seed);
+  CHECK(test, loadU64(wire, kFrameHeaderBytes + 67) == request.seed);
   CHECK(test, roundTrip(request) == request);
 
   auto expectInvalid = [&](const RequestFrame &invalid) {
@@ -836,12 +837,13 @@ void testSamplingBlock() {
     if (encoded.issue)
       CHECK(test, encoded.issue->code == IssueCode::InvalidSampling);
     auto mutated = wire;
-    const float penalties[] = {invalid.sampling.presencePenalty,
-                               invalid.sampling.frequencyPenalty,
-                               invalid.sampling.repetitionPenalty};
-    for (size_t field = 0; field < 3; ++field)
+    const float values[] = {invalid.sampling.presencePenalty,
+                            invalid.sampling.frequencyPenalty,
+                            invalid.sampling.repetitionPenalty,
+                            invalid.sampling.minP};
+    for (size_t field = 0; field < 4; ++field)
       storeU32(mutated, kFrameHeaderBytes + 51 + 4 * field,
-               std::bit_cast<uint32_t>(penalties[field]));
+               std::bit_cast<uint32_t>(values[field]));
     auto decoded = decodeFrame(decodeSingleFrame(mutated));
     CHECK(test, !decoded);
     if (decoded.issue) {
@@ -864,13 +866,18 @@ void testSamplingBlock() {
     invalid.sampling.repetitionPenalty = repetition;
     expectInvalid(invalid);
   }
-  // The limits themselves, the smallest and largest repetition, and any
-  // top_k, 0 keeping every token.
+  for (const float minP : {-0.01f, 1.01f, nan, inf, -inf}) {
+    RequestFrame invalid = request;
+    invalid.sampling.minP = minP;
+    expectInvalid(invalid);
+  }
+  // The limits themselves, the smallest and largest repetition, min_p's 0
+  // and 1, and any top_k, 0 keeping every token.
   for (const SamplingParameters limit :
        {SamplingParameters{0.8f, 0.95f, 32, -2.0f, 2.0f,
-                           std::numeric_limits<float>::denorm_min()},
+                           std::numeric_limits<float>::denorm_min(), 0.0f},
         SamplingParameters{0.8f, 0.95f, 32, 2.0f, -2.0f,
-                           std::numeric_limits<float>::max()},
+                           std::numeric_limits<float>::max(), 1.0f},
         SamplingParameters{0.8f, 0.95f, 0}, SamplingParameters{0.8f, 1.0f, 1000},
         SamplingParameters{1.0f, 0.9f, 0xffffffffU}}) {
     RequestFrame valid = request;
@@ -878,17 +885,20 @@ void testSamplingBlock() {
     CHECK(test, roundTrip(valid) == valid);
   }
 
-  // Greedy requests carry penalties too; score requests carry none.
+  // Greedy requests carry penalties and min_p too; score requests carry
+  // none.
   RequestFrame greedy = exampleScoreRequest();
   greedy.scoreTokens.clear();
   greedy.logicalMaxOutputTokens = 16;
   greedy.sampling.presencePenalty = 1.5f;
+  greedy.sampling.minP = 0.1f;
   CHECK(test, roundTrip(greedy) == greedy);
-  for (size_t field = 0; field < 3; ++field) {
+  for (size_t field = 0; field < 4; ++field) {
     RequestFrame score = exampleScoreRequest();
     float *values[] = {&score.sampling.presencePenalty,
                        &score.sampling.frequencyPenalty,
-                       &score.sampling.repetitionPenalty};
+                       &score.sampling.repetitionPenalty,
+                       &score.sampling.minP};
     *values[field] += 0.5f;
     auto encoded = encodeMessage(Message{score});
     CHECK(test, !encoded);
@@ -911,7 +921,7 @@ void testRequestFlags() {
   CHECK(test, serialized);
   if (!serialized)
     return;
-  CHECK(test, loadU32(*serialized.value, kFrameHeaderBytes + 80) ==
+  CHECK(test, loadU32(*serialized.value, kFrameHeaderBytes + 84) ==
                   RequestIgnoreEndOfSequence);
   CHECK(test, roundTrip(request) == request);
 
@@ -929,7 +939,7 @@ void testRequestFlags() {
     CHECK(test, wire);
     if (!wire)
       return;
-    storeU32(*wire.value, kFrameHeaderBytes + 80, invalid.flags);
+    storeU32(*wire.value, kFrameHeaderBytes + 84, invalid.flags);
     auto decoded = decodeFrame(decodeSingleFrame(*wire.value));
     CHECK(test, !decoded);
     if (decoded.issue) {

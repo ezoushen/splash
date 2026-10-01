@@ -118,12 +118,8 @@ SAMPLING_NUMBERS = {
         lambda value: MIN_FLOAT32_SUBNORMAL <= value <= FLOAT32_MAX,
         "a positive number",
     ),
+    "min_p": (0.0, lambda value: 0 <= value <= 1, "a number in [0, 1]"),
 }
-
-# vLLM refuses a nonzero min_p and any logit_bias with speculative decoding,
-# which Splash always uses, so a request may send them only with the values
-# that change nothing.
-SPECULATIVE_DECODING_NEUTRAL = {"min_p": (None, 0), "logit_bias": (None, {})}
 
 
 RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
@@ -1153,11 +1149,10 @@ class Frontend:
             stop_sequences = tuple(stop)
         else:
             raise APIError(400, "stop must be a string or up to four strings")
-        for name, neutral in SPECULATIVE_DECODING_NEUTRAL.items():
-            if body.get(name) not in neutral:
-                raise APIError(
-                    400, f"{name} is not supported with speculative decoding"
-                )
+        # vLLM refuses any logit_bias with speculative decoding, which Splash
+        # always uses, so a request may send only an empty one.
+        if body.get("logit_bias") not in (None, {}):
+            raise APIError(400, "logit_bias is not supported with speculative decoding")
         ignore_eos = body.get("ignore_eos", False)
         if not isinstance(ignore_eos, bool):
             raise APIError(400, "ignore_eos must be a boolean")
