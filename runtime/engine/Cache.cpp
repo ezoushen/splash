@@ -350,11 +350,7 @@ Cache::Eviction Cache::evictOneKvBlock() {
 
 uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
                              bool keepResumePoint, bool keepRunway) {
-  // Pages whose copies are being written count toward the target. A pass
-  // that releases extents reports how long it held the serving thread,
-  // evictions between its releases included.
-  const auto start = std::chrono::steady_clock::now();
-  const uint64_t passStart = pool_.snapshot().extentReleases;
+  // Pages whose copies are being written count toward the target.
   uint64_t released = reclaimEmptyExtents(keepRunway);
   auto needsMore = [&] { return !reclaimMet(released, targetBytes, evictAll); };
   while (needsMore()) {
@@ -363,11 +359,6 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
     if (!result.madeProgress)
       break;
     released += result.reclaimedBytes;
-  }
-  if (pool_.snapshot().extentReleases != passStart) {
-    const std::chrono::duration<double, std::milli> held =
-        std::chrono::steady_clock::now() - start;
-    pool_.recordReleasePass(held.count());
   }
   return released;
 }

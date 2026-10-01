@@ -20,8 +20,10 @@ struct KvPoolSnapshot {
   uint32_t reclaimableExtents = 0;
   uint64_t residentBackingBytes = 0;
   uint64_t reclaimableBackingBytes = 0;
-  // Extents allocated and released through the pool, the longest growth and
-  // the longest release pass: what memory costs the serving loop.
+  // Extents allocated and released through the pool, and the longest
+  // allocation and release of one: what memory costs the serving loop per
+  // extent. How long a whole reclaim pass holds the loop shows in its
+  // longest tick.
   uint64_t extentAllocations = 0;
   uint64_t extentReleases = 0;
   double extentAllocateMaxMilliseconds = 0.0;
@@ -77,9 +79,6 @@ public:
   [[nodiscard]] uint32_t
   reclaimEmptyExtents(bool keepRunway,
                       uint32_t limit = std::numeric_limits<uint32_t>::max());
-  // A reclaim pass that released extents between its evictions held the
-  // serving thread this long; the snapshot keeps the longest pass.
-  void recordReleasePass(double milliseconds) noexcept;
   [[nodiscard]] KvPoolSnapshot snapshot() const;
 
 private:

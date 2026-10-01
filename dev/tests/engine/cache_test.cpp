@@ -43,7 +43,13 @@ public:
     for (uint32_t index = first; index < first + count; ++index) {
       resident_.at(index) = false;
     }
+    const auto start = std::chrono::steady_clock::now();
     std::this_thread::sleep_for(releaseTime);
+    const double taken = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+    longestRelease = std::max(longestRelease, taken);
+    totalRelease += taken;
     ++releasedExtents;
     return true;
   }
@@ -63,6 +69,10 @@ public:
   uint32_t releasedExtents = 0;
   // How long releasing one extent takes.
   std::chrono::milliseconds releaseTime{0};
+  // What the releases took as measured here, in milliseconds: the longest,
+  // and all of them together.
+  double longestRelease = 0.0;
+  double totalRelease = 0.0;
 private:
   std::vector<bool> resident_;
   uint32_t maximumResidentPages_;
@@ -315,12 +325,13 @@ void testReclaimPassReleasesEveryEmptyExtent() {
           "a pass did not evict the cache and release its extent");
 }
 
-// A pass that releases extents as its evictions empty them reports how long
-// it held the serving thread, not its longest single release.
-void testReleasePassTimeCoversTheWholePass() {
+// A pass that releases extents as its evictions empty them reports the
+// longest release of one extent, as growth reports the longest allocation of
+// one; the loop's longest tick covers the whole pass.
+void testReleaseTimeCoversOneExtent() {
   constexpr uint32_t extents = 6;
   Backing backing(4 * extents);
-  backing.releaseTime = std::chrono::milliseconds(2);
+  backing.releaseTime = std::chrono::milliseconds(5);
   KvPool pool(backing);
   engine::Cache resources(pool, cacheNamespace());
   for (uint32_t chain = 0; chain < extents; ++chain) {
@@ -337,10 +348,13 @@ void testReleasePassTimeCoversTheWholePass() {
           "release time setup geometry changed");
   static_cast<void>(
       resources.reclaimCache(std::numeric_limits<uint64_t>::max(), true));
-  require(backing.releasedExtents == extents &&
-              resources.snapshot().pool.extentReleaseMaxMilliseconds >=
-                  2.0 * extents,
-          "the release time is not the whole pass's");
+  // The pool's timer runs around one release: no less than the storage saw
+  // its longest release take, and less than all of them took together. No
+  // bound in milliseconds holds on a loaded machine.
+  const double longest = resources.snapshot().pool.extentReleaseMaxMilliseconds;
+  require(backing.releasedExtents == extents && longest >= backing.longestRelease &&
+              longest < backing.totalRelease,
+          "the release time is not one extent's");
 }
 
 } // namespace
@@ -348,7 +362,7 @@ void testReleasePassTimeCoversTheWholePass() {
 int main() {
   try {
     testReclaimPassReleasesEveryEmptyExtent();
-    testReleasePassTimeCoversTheWholePass();
+    testReleaseTimeCoversOneExtent();
     testCanonicalPagesAndSparseState();
     testKvDeeperThanStateAndDependencyEviction();
     testActiveTipProtectsTheContentChain();

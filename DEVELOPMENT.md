@@ -523,8 +523,8 @@ the budget denies, or startup cleanup. Kernels reach a page through the GPU
 address in its request's page table, so no command binds KV; the residency
 set makes extents resident for every command. A reclaim pass releases every
 extent that is empty or that its evictions empty. `/status` reports under `kv`
-the extents allocated and released, the longest growth and the longest release
-pass, evictions within it included.
+the extents allocated and released and the longest allocation and release of
+one; how long a whole pass holds the loop shows in `loop.max_tick_ms`.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
 (`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or
