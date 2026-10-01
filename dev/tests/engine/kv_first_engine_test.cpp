@@ -195,7 +195,7 @@ public:
       return {{}, StateFailure::MemoryPressure, beginAllocationFailure};
     if (deniedBegins) {
       --deniedBegins;
-      return {{}, StateFailure::MemoryPressure};
+      return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::EngineBudget};
     }
     for (uint32_t slot = 0; slot < maximumCells; ++slot) {
       const bool used = std::any_of(
@@ -222,7 +222,7 @@ public:
   StateAdmission resume(const ModelRequest &request) override {
     ++resumeAttempts;
     if (resumeDenied)
-      return {{}, StateFailure::MemoryPressure};
+      return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::HostPressure};
     const uint64_t id = request.id;
     Request &entry = requests.at(id);
     for (uint32_t slot = 0; slot < maximumCells; ++slot) {
@@ -433,6 +433,7 @@ public:
   uint32_t beginAttempts = 0;
   // The request of the latest begin(), for hooks that refuse only some.
   uint64_t lastBeginId = 0;
+  // Begins the budget refuses, and resumes the host refuses.
   uint32_t deniedBegins = 0;
   uint32_t suspensions = 0;
   uint32_t resumptions = 0;
@@ -3140,14 +3141,16 @@ void testFailedResumeRestoreKeepsTheKvTarget() {
   require(executor.diskReads == 1 && executor.prefillRows == 128 &&
               engine.snapshot().resourceResumptions == 0,
           "resumption did not wait for its disk state");
-  // The read fails and the retry finds no free cell; reclaiming for one
-  // empties the cache and releases the KV backing. Afterwards one extent
-  // (128 tokens) can come back: room for replay to start, not for the
-  // dispatch that suspended the request.
+  // The read fails and the host refuses the retry its cell; the pressure
+  // controller's pass then empties the cache and releases the KV extents.
+  // Afterwards one extent (128 tokens) can come back: room for replay to
+  // start, not for the dispatch that suspended the request.
   executor.resumeDenied = true;
   executor.restoreControl->ready = true;
   executor.restoreControl->success = false;
   static_cast<void>(engine.tick(104));
+  static_cast<void>(engine.reclaimMemory(
+      {.reclaimEmptyKvExtents = true, .evictAllUnpinnedPrefixes = true}));
   require(cache.snapshot().stateCache.entries == 0 && pool.snapshot().pagesResident == 0 &&
               engine.snapshot().resourceResumptions == 0,
           "fixture did not release the failed resumption's memory");

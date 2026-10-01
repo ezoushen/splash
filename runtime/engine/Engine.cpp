@@ -525,13 +525,11 @@ bool Engine::admit(Request &active, double now) {
       // Memory the tier is already freeing does not hold the recovery drain.
       if (admission.failure == StateFailure::MemoryPressure && !denial.pending)
         allocationFailed_ = true;
-      // Reclaim ran until it freed nothing more, so a cell the budget or the
-      // driver refused stays refused; any other refusal passes by itself.
       denial.allocationFailure = admission.allocationFailure;
-      denial.retryable =
-          admission.allocationFailure != metal::AllocationFailure::EngineBudget &&
-          admission.allocationFailure != metal::AllocationFailure::DriverRejected;
-      if (judge(denial, active.request.id) == Verdict::Fail) {
+      // Without a free lane the request waits for one; only memory it could
+      // not get may fail it.
+      if (admission.failure == StateFailure::MemoryPressure &&
+          judge(denial, active.request.id) == Verdict::Fail) {
         finishFailure(active,
                       {"capacity_exhausted",
                        std::string("could not allocate request state: ") +
@@ -1099,7 +1097,7 @@ Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
     return Verdict::Wait;
   // Pages held by resident lanes come back when they finish; only a lane
   // that cannot fit on its own has hit the capacity.
-  if (growthPaused() || denial.retryable || anotherResident(requestId) ||
+  if (growthPaused() || anotherResident(requestId) ||
       denial.allocationFailure == metal::AllocationFailure::HostPressure)
     return Verdict::Yield;
   return Verdict::Fail;

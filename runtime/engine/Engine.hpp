@@ -230,9 +230,6 @@ private:
     // On its way back: pages whose copies are being written, or a reclaim
     // that waits for the transfer in flight. The lane waits; nobody yields.
     bool pending = false;
-    // A refusal that passes by itself, one neither the budget nor the
-    // driver made: waiting or yielding beats failing.
-    bool retryable = false;
   };
   struct KvAdmission {
     TokenAdmission allocation;
@@ -241,7 +238,7 @@ private:
   // What a lane does about memory it could not get. Pending memory returns
   // by itself: the lane waits. Otherwise a lane fails only when it is alone
   // with nothing left to reclaim; while other lanes hold memory, growth is
-  // paused or the refusal passes by itself, a running lane yields its memory
+  // paused or the host is short of memory, a running lane yields its memory
   // and a lane being admitted waits.
   enum class Verdict : uint8_t { Wait, Yield, Fail };
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
