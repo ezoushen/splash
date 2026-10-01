@@ -78,8 +78,6 @@ public:
   // serving thread this long; the snapshot keeps the longest pass.
   void recordReleasePass(double milliseconds) noexcept;
   [[nodiscard]] uint32_t reclaimableExtentCount() const noexcept;
-  // Advances with every extent released.
-  [[nodiscard]] uint64_t releaseGeneration() const noexcept;
   [[nodiscard]] KvPoolSnapshot snapshot() const;
 
 private:
@@ -128,7 +126,6 @@ private:
   uint64_t extentReleases_ = 0;
   double extentAllocateMaxMilliseconds_ = 0.0;
   double extentReleaseMaxMilliseconds_ = 0.0;
-  uint64_t releaseGeneration_ = 0;
   std::vector<PageRecord> pages_;
   std::vector<ExtentRecord> extents_;
   uint32_t freeResidentPages_ = 0;

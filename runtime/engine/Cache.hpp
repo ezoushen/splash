@@ -231,7 +231,6 @@ public:
   // Recycles exactly one unpinned state, preferring checkpoints, for a
   // required state publication; the disk tier keeps it when it admits it.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
-  [[nodiscard]] uint64_t releaseGeneration() const noexcept;
   // Startup cleanup only: releases unused backing without evicting cache
   // data, keeping one runway extent.
   void releaseUnusedKvBacking();

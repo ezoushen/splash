@@ -230,8 +230,8 @@ private:
     // On its way back: pages whose copies are being written, or a reclaim
     // that waits for the transfer in flight. The lane waits; nobody yields.
     bool pending = false;
-    // Still moving: a release or a reclaim in progress, or a budget that
-    // can recover. Waiting or yielding beats failing.
+    // A refusal that passes by itself, one neither the budget nor the
+    // driver made: waiting or yielding beats failing.
     bool retryable = false;
   };
   struct KvAdmission {
@@ -241,16 +241,14 @@ private:
   // What a lane does about memory it could not get. Pending memory returns
   // by itself: the lane waits. Otherwise a lane fails only when it is alone
   // with nothing left to reclaim; while other lanes hold memory, growth is
-  // paused or the budget may recover, a running lane yields its memory and
-  // a lane being admitted waits.
+  // paused or the refusal passes by itself, a running lane yields its memory
+  // and a lane being admitted waits.
   enum class Verdict : uint8_t { Wait, Yield, Fail };
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
   // Runs one page admission, reclaiming cache between attempts while that
   // makes progress.
   [[nodiscard]] KvAdmission admitKv(const std::function<TokenAdmission()> &attempt);
-  [[nodiscard]] bool budgetMayRecover(metal::AllocationFailure failure,
-                                      uint64_t generation, bool reclaimed) const;
   void suspendForGrowth(Request &request, uint64_t workEnd,
                         metal::AllocationFailure failure,
                         double nowMilliseconds);

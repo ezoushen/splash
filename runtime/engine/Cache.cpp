@@ -354,7 +354,7 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
   // that releases extents reports how long it held the serving thread,
   // evictions between its releases included.
   const auto start = std::chrono::steady_clock::now();
-  const uint64_t passStart = pool_.releaseGeneration();
+  const uint64_t passStart = pool_.snapshot().extentReleases;
   uint64_t released = reclaimEmptyExtents(keepRunway);
   auto needsMore = [&] { return !reclaimMet(released, targetBytes, evictAll); };
   while (needsMore()) {
@@ -364,7 +364,7 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
       break;
     released += result.reclaimedBytes;
   }
-  if (pool_.releaseGeneration() != passStart) {
+  if (pool_.snapshot().extentReleases != passStart) {
     const std::chrono::duration<double, std::milli> held =
         std::chrono::steady_clock::now() - start;
     pool_.recordReleasePass(held.count());
@@ -526,9 +526,6 @@ bool Cache::reclaimMet(uint64_t releasedBytes, uint64_t targetBytes,
   return !evictAll && releasedBytes + pendingBytes() >= targetBytes;
 }
 
-uint64_t Cache::releaseGeneration() const noexcept {
-  return pool_.releaseGeneration();
-}
 
 void Cache::releaseUnusedKvBacking() {
   static_cast<void>(pool_.reclaimEmptyExtents(true));

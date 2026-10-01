@@ -195,12 +195,7 @@ bool KvPool::releaseBacking(uint32_t page) {
   if (!backing_.releaseBackingForPage(page))
     return false;
   ++extentReleases_;
-  ++releaseGeneration_;
   return true;
-}
-
-uint64_t KvPool::releaseGeneration() const noexcept {
-  return releaseGeneration_;
 }
 
 KvPoolSnapshot KvPool::snapshot() const {

@@ -497,9 +497,7 @@ bool Engine::admit(Request &active, double now) {
     const auto activate = [&] {
       return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest);
     };
-    const uint64_t releaseGeneration = cache_.releaseGeneration();
     StateAdmission admission = activate();
-    bool reclaimedForAdmission = false;
     Denial denial;
     while (!admission.granted() &&
            admission.failure == StateFailure::MemoryPressure) {
@@ -508,7 +506,6 @@ bool Engine::admit(Request &active, double now) {
       const CacheReclaimResult reclaimed =
           hostPressure ? CacheReclaimResult{reclaimIdleState()} : reclaimForGrowth();
       if (reclaimed.madeProgress) {
-        reclaimedForAdmission = true;
         admission = activate();
         continue;
       }
@@ -528,14 +525,12 @@ bool Engine::admit(Request &active, double now) {
       // Memory the tier is already freeing does not hold the recovery drain.
       if (admission.failure == StateFailure::MemoryPressure && !denial.pending)
         allocationFailed_ = true;
-      // A cell the budget or the driver refused comes back only with a
-      // release in flight; any other refusal passes by itself.
-      const bool refused =
-          admission.allocationFailure == metal::AllocationFailure::EngineBudget ||
-          admission.allocationFailure == metal::AllocationFailure::DriverRejected;
+      // Reclaim ran until it freed nothing more, so a cell the budget or the
+      // driver refused stays refused; any other refusal passes by itself.
       denial.allocationFailure = admission.allocationFailure;
-      denial.retryable = !refused || budgetMayRecover(admission.allocationFailure,
-                                                      releaseGeneration, reclaimedForAdmission);
+      denial.retryable =
+          admission.allocationFailure != metal::AllocationFailure::EngineBudget &&
+          admission.allocationFailure != metal::AllocationFailure::DriverRejected;
       if (judge(denial, active.request.id) == Verdict::Fail) {
         finishFailure(active,
                       {"capacity_exhausted",
@@ -1111,8 +1106,6 @@ Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
 }
 
 Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attempt) {
-  const uint64_t releaseGeneration = cache_.releaseGeneration();
-  bool reclaimed = false;
   bool pendingReclaim = false;
   TokenAdmission admission = attempt();
   while (!admission.granted() &&
@@ -1126,7 +1119,6 @@ Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attem
       pendingReclaim = progress.pending;
       break;
     }
-    reclaimed = true;
     admission = attempt();
   }
   Denial denial;
@@ -1136,18 +1128,10 @@ Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attem
     // Pages on their way back end the shortage without the residents.
     if (!denial.pending)
       allocationFailed_ = true;
-    denial.retryable = budgetMayRecover(admission.allocationFailure, releaseGeneration,
-                                        reclaimed);
   }
   return {admission, denial};
 }
 
-bool Engine::budgetMayRecover(metal::AllocationFailure failure,
-                             uint64_t generation, bool reclaimed) const {
-  if (failure != metal::AllocationFailure::EngineBudget)
-    return false;
-  return reclaimed || cache_.releaseGeneration() != generation;
-}
 
 bool Engine::growthPaused() const {
   return config_.growthPaused && config_.growthPaused();

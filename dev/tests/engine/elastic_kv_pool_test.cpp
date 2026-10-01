@@ -141,11 +141,11 @@ void testFailedGrowthKeepsItsExtentsForTheRetry() {
     TestBacking backing(16, 4);
     backing.failExtent = 2;
     KvPool pool(backing);
-    const auto before = pool.releaseGeneration();
+    const auto before = pool.snapshot().extentReleases;
     auto pages = pool.acquirePages(9, false);
     auto status = pool.snapshot();
     require(!pages.granted() && backing.releasedExtents == 0 &&
-                pool.releaseGeneration() == before &&
+                pool.snapshot().extentReleases == before &&
                 status.pagesResident == 8 && status.reclaimableExtents == 2 &&
                 status.pagesFreeResident == 8 && status.pagesActive == 0 &&
                 status.extentAllocations == 2,
@@ -225,10 +225,10 @@ void testPassReleasesEveryEmptyExtent() {
     release(pool, pages.pages);
     require(pool.reclaimableExtentCount() == extents,
             "every empty resident extent was not reclaimable");
-    const auto before = pool.releaseGeneration();
+    const auto before = pool.snapshot().extentReleases;
     require(pool.reclaimEmptyExtents(true) == extents - 1 &&
                 backing.releasedExtents == extents - 1 &&
-                pool.releaseGeneration() == before + extents - 1 &&
+                pool.snapshot().extentReleases == before + extents - 1 &&
                 pool.reclaimableExtentCount() == 1,
             "a pass did not release every empty extent but the runway");
     require(pool.reclaimEmptyExtents(false) == 1 &&

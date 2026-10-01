@@ -2863,9 +2863,10 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
   }
 }
 
-// A budget denial stays retryable when the denied admission released or
-// reclaimed memory, as the next attempt may fit; one that frees nothing
-// fails as exhausted capacity.
+// A budget denial releases every empty extent and tries again at once; if
+// that admits the request it runs, and if reclaim has nothing more to free
+// the lone request fails as exhausted capacity in the same tick, since a
+// release takes effect when it is made.
 void testBudgetDenialRetriesAfterRelease() {
   for (bool recovers : {true, false}) {
     Backing backing(8);
@@ -2887,22 +2888,21 @@ void testBudgetDenialRetriesAfterRelease() {
     engine.submit(request(284, {284}));
     static_cast<void>(engine.tick(1));
     // The denial released every empty extent at once, then retried.
-    require(executor.beginAttempts == 2 && events.failedCount == 0,
+    require(executor.beginAttempts == 2,
             "a denied admission did not retry after releasing the empty extents");
-    if (recovers)
-      require(executor.requests.size() == 1,
+    if (recovers) {
+      require(executor.requests.size() == 1 && events.failedCount == 0,
               "the retry after the release did not admit the request");
-    else
-      require(pool.snapshot().pagesResident == 0 && !engine.idle(),
-              "a denied admission kept the empty extents or stopped waiting");
-    for (double now = 2; now < 400 && !engine.idle(); ++now)
-      static_cast<void>(engine.tick(now));
-    if (recovers)
+      for (double now = 2; now < 400 && !engine.idle(); ++now)
+        static_cast<void>(engine.tick(now));
       require(events.completedCount == 1 && events.failedCount == 0,
               "state admission did not proceed once its release made room");
-    else
-      require(events.failures == std::vector<std::string>{"capacity_exhausted"},
-              "a budget that nothing frees did not fail as exhausted capacity");
+    } else {
+      require(pool.snapshot().pagesResident == 0 && engine.idle() &&
+                  events.failures == std::vector<std::string>{"capacity_exhausted"},
+              "a budget that nothing more frees did not fail as exhausted "
+              "capacity at once");
+    }
     require(engine.idle() && cache.snapshot().activeRequests == 0 &&
                 executor.requests.empty(),
             "a budget denial leaked request ownership");
