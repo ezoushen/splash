@@ -51,12 +51,6 @@ public:
   [[nodiscard]] virtual bool releaseBackingForPage(uint32_t page) = 0;
   [[nodiscard]] virtual uint32_t extentFirstPage(uint32_t page) const = 0;
   [[nodiscard]] virtual uint32_t extentPageCount(uint32_t page) const = 0;
-  // Physical release is asynchronous and paced: while a previous release is
-  // still being torn down by the kernel, callers keep the next empty extent
-  // resident instead of queueing more unmap work. Test backings are always
-  // ready; awaitRelease() blocks only at startup and shutdown.
-  [[nodiscard]] virtual bool releaseReady() const noexcept { return true; }
-  virtual void awaitRelease() {}
 };
 
 // One attention layer of the pool as kernels address it: where its region

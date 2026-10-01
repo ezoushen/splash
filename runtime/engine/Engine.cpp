@@ -1146,8 +1146,7 @@ bool Engine::budgetMayRecover(metal::AllocationFailure failure,
                              uint64_t generation, bool reclaimed) const {
   if (failure != metal::AllocationFailure::EngineBudget)
     return false;
-  const bool pending = cache_.releasePending();
-  return pending || reclaimed || cache_.releaseGeneration() != generation;
+  return reclaimed || cache_.releaseGeneration() != generation;
 }
 
 bool Engine::growthPaused() const {
@@ -1256,9 +1255,8 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
   if (cache_.reclaimMet(fromCache, remaining,
                         directive.evictAllUnpinnedPrefixes))
     return {released, ReclaimOutcome::Met};
-  return {released, cache_.releaseDeferred() || cache_.transfersInFlight()
-                        ? ReclaimOutcome::Pending
-                        : ReclaimOutcome::Exhausted};
+  return {released, cache_.transfersInFlight() ? ReclaimOutcome::Pending
+                                               : ReclaimOutcome::Exhausted};
 }
 
 void Engine::apply(const BatchPlan &plan,

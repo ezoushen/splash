@@ -409,12 +409,8 @@ int runNative(const NativeArguments &arguments) {
     pressurePolicy.reclaimed(directive, reclaim);
     governor.reclaimed(reclaim.outcome);
     static_cast<void>(resources.backend().refreshMemoryStats());
-    // KV backing is returned one extent at a time, and a target that
-    // transfers held back continues as they land. Ask to run again at the
-    // next command-free point meanwhile, so the rest follows without a
-    // burst of kernel work.
-    return published->nativeLoop().reclaimDeferred() ||
-           reclaim.outcome == engine::ReclaimOutcome::Pending;
+    // What transfers held back continues at the next command-free point.
+    return reclaim.outcome == engine::ReclaimOutcome::Pending;
   });
   const auto exit = transport.run(bootstrap->nativeLoop());
   switch (exit) {

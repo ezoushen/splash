@@ -848,8 +848,7 @@ void testTieredStateLifecycle() {
   require(snapshot.bytes == 0 && snapshot.diskBytes == 100 && snapshot.entries == 1 &&
               snapshot.offloads == 1 && control->slots == 1,
           "demoted entry did not become its disk copy");
-  require(!fixture.cache.releasePending() && !fixture.cache.pollTransfers(),
-          "unfinished write was reported as pending backing or consumed early");
+  require(!fixture.cache.pollTransfers(), "unfinished write was consumed early");
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TestState>(100), true);
   require(fixture.cache.reclaimOne().reclaimedBytes == 100,
           "pending write prevented disposable checkpoint reclamation");

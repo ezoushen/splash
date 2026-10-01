@@ -38,13 +38,7 @@ public:
     for (uint32_t i = first; i < first + extentPageCount(page); ++i) {
       resident_.at(i) = false;
     }
-    releasePending = deferRelease;
     return true;
-  }
-  bool releaseReady() const noexcept override {
-    if (completeReleaseOnPoll)
-      releasePending = false;
-    return !releasePending;
   }
   uint32_t extentFirstPage(uint32_t page) const override {
     return page - page % 4;
@@ -52,9 +46,6 @@ public:
   uint32_t extentPageCount(uint32_t page) const override {
     return std::min<uint32_t>(4, resident_.size() - extentFirstPage(page));
   }
-  bool deferRelease = false;
-  mutable bool releasePending = false;
-  bool completeReleaseOnPoll = false;
   bool growthBlocked = false;
   metal::AllocationFailure allocationFailure = metal::AllocationFailure::Capacity;
   uint32_t growthAttempts = 0;
@@ -2872,145 +2863,142 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
   }
 }
 
-void testStateAdmissionWaitsForKvRelease() {
-  enum class Outcome { Recover, CompleteOnPoll, NoCapacity, Cancel, Timeout };
-  for (uint32_t pageCount : {4U, 8U}) {
-    for (auto outcome : {Outcome::Recover, Outcome::CompleteOnPoll,
-                         Outcome::NoCapacity, Outcome::Cancel, Outcome::Timeout}) {
-      if (pageCount != 4 && outcome == Outcome::CompleteOnPoll)
-        continue;
-      Backing backing(pageCount);
-      KvPool pool(backing);
-      engine::Cache cache(pool, CacheNamespace{});
-      auto pages = pool.acquirePages(pageCount, false);
-      require(pages.granted(), "could not seed resident KV backing");
-      for (uint32_t page : pages.pages)
-        pool.releasePage(page, false);
-      backing.deferRelease = true;
-      backing.completeReleaseOnPoll = outcome == Outcome::CompleteOnPoll;
-      Executor executor(1);
-      executor.beginGrowthBlocked = [&] {
-        return pool.snapshot().pagesResident != 0 || backing.releasePending ||
-               outcome == Outcome::NoCapacity;
-      };
-      executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
-      Events events;
-      EngineConfig config;
-      config.resourceWaitTimeoutMilliseconds = 500;
-      engine::Engine engine(config, cache, executor, events);
-      engine.submit(request(284, {284}));
-      static_cast<void>(engine.tick(1));
-      require(!engine.idle() && events.failedCount == 0 &&
-                  executor.prefillRows == 0,
-              "in-flight KV release became terminal state admission failure");
-      const uint32_t attempts = executor.beginAttempts;
-      static_cast<void>(engine.tick(50));
-      require(executor.beginAttempts == attempts,
-              "pending release bypassed resource retry backoff");
-      if (outcome == Outcome::Recover || outcome == Outcome::CompleteOnPoll ||
-          outcome == Outcome::NoCapacity) {
-        backing.releasePending = false;
-        backing.deferRelease = false;
-        for (double now = 101; now < 400 && !engine.idle(); ++now)
-          static_cast<void>(engine.tick(now));
-        if (outcome == Outcome::NoCapacity)
-          require(events.failures == std::vector<std::string>{"capacity_exhausted"},
-                  "true capacity exhaustion kept waiting after reclamation");
-        else
-          require(events.completedCount == 1 && events.failedCount == 0,
-                  "state admission did not resume after KV release");
-      } else if (outcome == Outcome::Cancel) {
-        engine.cancel(284);
-        static_cast<void>(engine.tick(51));
-      } else {
-        static_cast<void>(engine.tick(502));
-        require(events.failures == std::vector<std::string>{"resource_timeout"} &&
-                    events.failureDetails.back().first ==
-                        "memory did not become available within the resource wait limit",
-                "pending release bypassed resource wait deadline, or a budget "
-                "wait blamed macOS");
-      }
-      require(engine.idle() && cache.snapshot().activeRequests == 0 &&
-                  executor.requests.empty(),
-              "pending-release state admission leaked ownership");
-    }
+// A budget denial stays retryable when the denied admission released or
+// reclaimed memory, as the next attempt may fit; one that frees nothing
+// fails as exhausted capacity.
+void testBudgetDenialRetriesAfterRelease() {
+  for (bool recovers : {true, false}) {
+    Backing backing(8);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    auto pages = pool.acquirePages(8, false);
+    require(pages.granted(), "could not seed resident KV backing");
+    for (uint32_t page : pages.pages)
+      pool.releasePage(page, false);
+    Executor executor(1);
+    executor.beginGrowthBlocked = [&] {
+      return pool.snapshot().pagesResident != 0 || !recovers;
+    };
+    executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
+    Events events;
+    EngineConfig config;
+    config.resourceWaitTimeoutMilliseconds = 500;
+    engine::Engine engine(config, cache, executor, events);
+    engine.submit(request(284, {284}));
+    static_cast<void>(engine.tick(1));
+    // The denial released every empty extent at once, then retried.
+    require(executor.beginAttempts == 2 && events.failedCount == 0,
+            "a denied admission did not retry after releasing the empty extents");
+    if (recovers)
+      require(executor.requests.size() == 1,
+              "the retry after the release did not admit the request");
+    else
+      require(pool.snapshot().pagesResident == 0 && !engine.idle(),
+              "a denied admission kept the empty extents or stopped waiting");
+    for (double now = 2; now < 400 && !engine.idle(); ++now)
+      static_cast<void>(engine.tick(now));
+    if (recovers)
+      require(events.completedCount == 1 && events.failedCount == 0,
+              "state admission did not proceed once its release made room");
+    else
+      require(events.failures == std::vector<std::string>{"capacity_exhausted"},
+              "a budget that nothing frees did not fail as exhausted capacity");
+    require(engine.idle() && cache.snapshot().activeRequests == 0 &&
+                executor.requests.empty(),
+            "a budget denial leaked request ownership");
   }
 }
 
-void testAdmissionsWaitForBackgroundRelease() {
-  enum class Outcome { Recover, CompleteOnPoll, NoCapacity, Cancel, Timeout };
-  enum class Path { State, RunningKv, ResumeKv };
-  for (auto path : {Path::State, Path::RunningKv, Path::ResumeKv}) {
-    const bool stateAdmission = path == Path::State;
-    const bool resuming = path == Path::ResumeKv;
-    for (auto outcome : {Outcome::Recover, Outcome::CompleteOnPoll,
-                         Outcome::NoCapacity, Outcome::Cancel, Outcome::Timeout}) {
-      Backing backing(8);
-      KvPool pool(backing);
-      engine::Cache cache(pool, CacheNamespace{});
-      Executor executor(1);
-      Events events;
-      EngineConfig config;
-      config.resourceWaitTimeoutMilliseconds = 500;
-      engine::Engine engine(config, cache, executor, events);
-      engine.submit(request(285, {285}));
-      if (resuming) {
-        backing.growthBlocked = true;
-        backing.allocationFailure = metal::AllocationFailure::HostPressure;
-        static_cast<void>(engine.tick(1));
-        require(executor.suspensions == 1, "fixture did not suspend request");
-        backing.growthBlocked = false;
-      }
-      auto pages = pool.acquirePages(4, false);
-      require(pages.granted(), "could not seed background KV release");
-      for (uint32_t page : pages.pages)
-        pool.releasePage(page, false);
-      backing.deferRelease = true;
-      require(pool.reclaimEmptyExtents(false) == 1,
-              "fixture did not start background release");
-      backing.completeReleaseOnPoll = outcome == Outcome::CompleteOnPoll;
-      backing.allocationFailure = metal::AllocationFailure::EngineBudget;
-      backing.growthAllowed = [&] {
-        return !backing.releasePending && outcome != Outcome::NoCapacity;
-      };
-      if (stateAdmission) {
-        executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
-        executor.beginGrowthBlocked = [&] { return !backing.growthAllowed(); };
-      }
-      const double start = resuming ? 101 : 1;
-      static_cast<void>(engine.tick(start));
-      require(events.failedCount == 0 && events.capacityExhaustedCount == 0,
-              "pending/just-completed release became terminal KV failure");
-      if (outcome != Outcome::CompleteOnPoll) {
-        const auto attempts = backing.growthAttempts + executor.beginAttempts;
-        static_cast<void>(engine.tick(start + 50));
-        require(backing.growthAttempts + executor.beginAttempts == attempts,
-                "KV release wait bypassed retry backoff");
-      }
-      if (outcome == Outcome::Cancel) {
-        engine.cancel(285);
-        static_cast<void>(engine.tick(start + 51));
-        require(events.completedCount == 1, "KV release wait ignored cancel");
-      } else if (outcome == Outcome::Timeout) {
-        static_cast<void>(engine.tick(start + 501));
-        require(events.failures == std::vector<std::string>{"resource_timeout"},
-                "KV release wait ignored timeout");
-      } else {
-        backing.releasePending = false;
-        for (double now = start + 100; now < start + 400 && !engine.idle(); ++now)
-          static_cast<void>(engine.tick(now));
-        if (outcome == Outcome::NoCapacity)
-          require(events.failures == std::vector<std::string>{"capacity_exhausted"},
-                  "true KV exhaustion kept waiting after release");
-        else
-          require(events.completedCount == 1 && events.failedCount == 0,
-                  "KV allocation did not recover after release");
-      }
-      require(engine.idle() && executor.requests.empty() &&
-                  cache.snapshot().activeRequests == 0 &&
-                  cache.snapshot().pool.pagesActive == 0,
-              "KV release wait leaked request ownership");
+// A prefill chunk that needs more new extents than the budget has room for
+// takes that room once: its retries, each after one cached prefix is
+// evicted, reuse the extents the denied attempts allocated rather than
+// releasing and allocating them again.
+void testDeniedGrowthAllocatesEachExtentOnce() {
+  constexpr uint32_t cachedExtents = 24;
+  constexpr uint32_t budgetExtents = 32;
+  Backing backing(4 * 128);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  for (uint32_t chain = 0; chain < cachedExtents; ++chain) {
+    const uint64_t id = 5000 + chain;
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, 128).granted(), "could not seed a cached prefix");
+    static_cast<void>(cache.publishCommittedBlocks(
+        id, std::vector<uint32_t>(129, 7000 + chain), 128));
+    cache.endRequest(id);
+  }
+  backing.allocationFailure = metal::AllocationFailure::EngineBudget;
+  backing.growthAllowed = [&] {
+    return pool.snapshot().pagesResident / 4 < budgetExtents;
+  };
+  const KvPoolSnapshot before = pool.snapshot();
+  // The first chunk's 64 pages need 16 new extents; the budget has room for
+  // 8, and evicting cached prefixes frees the other 32 pages.
+  engine.submit(request(286, std::vector<uint32_t>(16 * 4 * 32 + 1, 286)));
+  static_cast<void>(engine.tick(1));
+  const KvPoolSnapshot after = pool.snapshot();
+  require(executor.prefillRows == 2048 && events.failedCount == 0,
+          "the chunk was not admitted once evictions made room");
+  require(after.extentAllocations - before.extentAllocations ==
+                  budgetExtents - cachedExtents &&
+              after.extentReleases == before.extentReleases,
+          "denied attempts allocated and released the same extents again");
+}
+
+// A lone request whose chunk needs more extents than the budget holds, with
+// nothing to evict, fails as exhausted capacity at once: the extents its
+// denied growth allocated stay for later requests, and keeping them is no
+// release after which the budget may recover.
+void testGrowthBeyondTheBudgetFailsAtOnce() {
+  Backing backing(4 * 32);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  backing.allocationFailure = metal::AllocationFailure::EngineBudget;
+  backing.growthAllowed = [&] { return pool.snapshot().pagesResident / 4 < 8; };
+  engine.submit(request(287, std::vector<uint32_t>(16 * 4 * 32 + 1, 287)));
+  static_cast<void>(engine.tick(1));
+  const KvPoolSnapshot after = pool.snapshot();
+  require(engine.idle() && executor.prefillRows == 0 &&
+              events.failures == std::vector<std::string>{"capacity_exhausted"},
+          "a request beyond the budget did not fail at once");
+  require(after.extentAllocations == 8 && after.extentReleases == 0 &&
+              after.reclaimableExtents == 8,
+          "the denied growth did not keep the extents it allocated");
+}
+
+// One reclaim pass releases every empty extent, however many there are,
+// and reports what is left: nothing for a target, no target otherwise.
+void testReclaimPassReleasesEveryEmptyExtent() {
+  constexpr uint32_t extents = 200;
+  for (bool targeted : {true, false}) {
+    Backing backing(4 * extents);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    auto pages = pool.acquirePages(4 * extents, false);
+    require(pages.granted(), "could not seed resident KV backing");
+    for (uint32_t page : pages.pages)
+      pool.releasePage(page, false);
+    Executor executor(1);
+    Events events;
+    engine::Engine engine({}, cache, executor, events);
+    MemoryReclaimDirective directive{.reclaimEmptyKvExtents = true};
+    if (targeted) {
+      directive.evictAllUnpinnedPrefixes = true;
+      directive.targetBytes = std::numeric_limits<uint64_t>::max();
     }
+    const MemoryReclaimResult result = engine.reclaimMemory(directive);
+    require(result.outcome == (targeted ? ReclaimOutcome::Exhausted
+                                        : ReclaimOutcome::Untargeted) &&
+                result.releasedBytes == uint64_t{extents} * 4 * 4096 &&
+                pool.snapshot().pagesResident == 0 &&
+                pool.reclaimableExtentCount() == 0,
+            "a pass did not release every empty extent or report what was left");
   }
 }
 
@@ -5328,8 +5316,10 @@ int main() {
     testAdmissionReopensAfterLastSuspendedRequestResumes();
     testRecoveryAdmitsFailedKvTargetBeforeReplaying();
     testFailedResumeRestoreKeepsTheKvTarget();
-    testStateAdmissionWaitsForKvRelease();
-    testAdmissionsWaitForBackgroundRelease();
+    testBudgetDenialRetriesAfterRelease();
+    testDeniedGrowthAllocatesEachExtentOnce();
+    testGrowthBeyondTheBudgetFailsAtOnce();
+    testReclaimPassReleasesEveryEmptyExtent();
     testAllocationCausesRemainRetryableAndDistinct();
     testAdmissionRespectsPriorityBeforeHashOrder();
     testConstraintMaskOverlapsInsideOneSchedulerBatch();

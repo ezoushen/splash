@@ -952,7 +952,6 @@ int main(int argc, char **argv) {
     // Fault only physical KV admission, after actual state activation. This
     // exercises Runtime::warmupPrefill's failure propagation and cleanup.
     require(pages.releaseBackingForPage(0), "warmup refusal fixture was not resident");
-    pages.awaitRelease();
     const uint64_t beforeWarmupRows = executor.telemetry().targetPrefillRows;
     for (auto failure : {metal::AllocationFailure::HostPressure,
                          metal::AllocationFailure::EngineBudget,

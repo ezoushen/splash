@@ -48,11 +48,11 @@ struct KvPageAcquisition {
 };
 
 // Sole owner of logical KV page references and backing residency. Resource
-// policy may ask for pages or release references, but cannot directly map or
-// unmap Metal memory. Free resident pages are handed out from the extent with
-// the most live pages first, so partially used extents fill up, empty extents
-// are touched last, and cold extents drain to empty, the only state in which
-// their backing can be released.
+// policy may ask for pages or release references, but cannot directly
+// allocate or release Metal memory. Free resident pages are handed out from
+// the extent with the most live pages first, so partially used extents fill
+// up, empty extents are touched last, and cold extents drain to empty, the
+// only state in which their backing can be released.
 class KvPool final {
 public:
   explicit KvPool(KvBacking &backing);
@@ -71,20 +71,15 @@ public:
   [[nodiscard]] bool pageFree(uint32_t page) const;
   [[nodiscard]] uint64_t residentBackingBytes() const noexcept;
 
-  // Reclaims only completely unreferenced extents. keepRunway retains one
-  // resident extent to avoid adding mapping latency to the next request.
-  // Releases stop at maxExtents and whenever the backing is still tearing
-  // down a previous release; the remaining empty extents stay reclaimable.
-  [[nodiscard]] uint32_t reclaimEmptyExtents(
-      bool keepRunway,
-      uint32_t maxExtents = std::numeric_limits<uint32_t>::max());
+  // Releases every completely unreferenced extent. keepRunway retains one
+  // resident extent to avoid adding allocation latency to the next request.
+  [[nodiscard]] uint32_t reclaimEmptyExtents(bool keepRunway);
+  // A reclaim pass that released extents between its evictions held the
+  // serving thread this long; the snapshot keeps the longest pass.
+  void recordReleasePass(double milliseconds) noexcept;
   [[nodiscard]] uint32_t reclaimableExtentCount() const noexcept;
-  [[nodiscard]] bool releaseReady() const noexcept;
-  // Changes on release submission and observed completion; does not poll.
+  // Advances with every extent released.
   [[nodiscard]] uint64_t releaseGeneration() const noexcept;
-  // Startup only: the serving path never waits on a release, and shutdown
-  // pacing belongs to the backing's destructor.
-  void awaitRelease();
   [[nodiscard]] KvPoolSnapshot snapshot() const;
 
 private:
@@ -133,8 +128,7 @@ private:
   uint64_t extentReleases_ = 0;
   double extentAllocateMaxMilliseconds_ = 0.0;
   double extentReleaseMaxMilliseconds_ = 0.0;
-  mutable uint64_t releaseGeneration_ = 0;
-  mutable bool releaseOutstanding_ = false;
+  uint64_t releaseGeneration_ = 0;
   std::vector<PageRecord> pages_;
   std::vector<ExtentRecord> extents_;
   uint32_t freeResidentPages_ = 0;

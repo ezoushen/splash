@@ -112,8 +112,8 @@ enum class ReclaimOutcome : uint8_t {
   Untargeted,
   // Released, counting the pages whose copies are being written.
   Met,
-  // Transfers or a release in flight hold back the rest, which a pass can
-  // take once they land.
+  // Transfers in flight hold back the rest, which a pass can take once they
+  // land.
   Pending,
   // Nothing is left to release.
   Exhausted,

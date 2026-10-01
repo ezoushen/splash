@@ -27,8 +27,7 @@ public:
             throw std::invalid_argument("invalid test backing geometry");
         }
     }
-    // Explicit extent sizes, e.g. a shorter trailing extent as the real
-    // storage produces when the pool is not a whole number of extents.
+    // Explicit extent sizes: the pool accepts extents of different sizes.
     TestBacking(std::vector<uint32_t> extentSizes, uint32_t residentExtents)
         : resident_(extentSizes.size(), false) {
         for (uint32_t size : extentSizes) {
@@ -66,17 +65,8 @@ public:
         if (!resident_.at(extent)) return false;
         resident_[extent] = false;
         ++releasedExtents;
-        if (pacedReleases) ready = false;
         return true;
     }
-    bool releaseReady() const noexcept override { return ready; }
-    void awaitRelease() override {
-        ++awaitedReleases;
-        ready = true;
-    }
-    bool ready = true;
-    bool pacedReleases = false;
-    uint32_t awaitedReleases = 0;
     uint32_t extentFirstPage(uint32_t page) const override {
         return firstPage_.at(extentOf_.at(page));
     }
@@ -125,6 +115,8 @@ void testGrowthPacksResidentExtents() {
                 reclaimed.reclaimableExtents == 1 &&
                 backing.releasedExtents == 1,
             "empty physical extent was not returned exactly");
+    require(reclaimed.extentAllocations == 1 && reclaimed.extentReleases == 1,
+            "the pool did not count its growth and release");
 }
 
 void testFailedGrowthRollsBackAtomically() {
@@ -138,35 +130,35 @@ void testFailedGrowthRollsBackAtomically() {
             "failed physical growth was not reported as physical capacity");
     auto status = pool.snapshot();
     require(status.pagesFree == 12 && status.pagesActive == 0 &&
-                status.pagesPrefix == 0 && status.pagesResident == 0 &&
-                backing.mappingAttempts == 2 &&
-                backing.releasedExtents == 1,
-            "failed physical growth leaked references or backing");
+                status.pagesPrefix == 0 && backing.mappingAttempts == 2,
+            "failed physical growth leaked references");
 }
 
-// A failed acquisition returns the extents it mapped the way reclaim does:
-// only while the backing is ready, so the rollback never waits behind an
-// in-flight release. The rest stay resident and reclaimable.
-void testFailedGrowthRollbackIsPaced() {
-    for (bool releaseInFlight : {false, true}) {
-        TestBacking backing(12, 4);
-        backing.failExtent = 2;
-        backing.pacedReleases = true;
-        backing.ready = !releaseInFlight;
-        KvPool pool(backing);
-        auto pages = pool.acquirePages(9, false);
-        const uint32_t released = releaseInFlight ? 0 : 1;
-        auto status = pool.snapshot();
-        require(!pages.granted() && backing.releasedExtents == released &&
-                    status.pagesResident == 4 * (2 - released) &&
-                    status.reclaimableExtents == 2 - released &&
-                    status.pagesFree == 12 && status.pagesActive == 0,
-                "allocation rollback released backing behind a release");
-        backing.ready = true;
-        require(pool.reclaimEmptyExtents(false) == 1 &&
-                    backing.releasedExtents == released + 1,
-                "rolled-back extent was not left to paced reclaim");
-    }
+// A failed acquisition keeps the extents it allocated, resident and
+// reclaimable: the retry takes their pages instead of allocating them
+// again, and a reclaim pass returns them if nothing does.
+void testFailedGrowthKeepsItsExtentsForTheRetry() {
+    TestBacking backing(16, 4);
+    backing.failExtent = 2;
+    KvPool pool(backing);
+    const auto before = pool.releaseGeneration();
+    auto pages = pool.acquirePages(9, false);
+    auto status = pool.snapshot();
+    require(!pages.granted() && backing.releasedExtents == 0 &&
+                pool.releaseGeneration() == before &&
+                status.pagesResident == 8 && status.reclaimableExtents == 2 &&
+                status.pagesFreeResident == 8 && status.pagesActive == 0 &&
+                status.extentAllocations == 2,
+            "a failed acquisition did not keep the extents it allocated");
+    backing.failExtent.reset();
+    pages = pool.acquirePages(9, false);
+    require(pages.granted() && pool.snapshot().extentAllocations == 3 &&
+                backing.releasedExtents == 0,
+            "the retry allocated again the extents it was denied with");
+    release(pool, pages.pages);
+    require(pool.reclaimEmptyExtents(false) == 3 &&
+                pool.snapshot().pagesResident == 0,
+            "a reclaim pass did not return the extents the retry left");
 }
 
 // A backing that throws while mapping leaves every page free and the
@@ -221,53 +213,28 @@ void testPressureReusesResidentPagesAndDeniesGrowth() {
             "pressure cleanup did not reclaim the empty extent");
 }
 
-void testReleasesArePacedBehindTheBacking() {
-    TestBacking backing(16, 4, 4);
+// One pass releases every empty extent but the runway, however many there
+// are; a pass without the runway releases that one too.
+void testPassReleasesEveryEmptyExtent() {
+    constexpr uint32_t extents = 200;
+    TestBacking backing(4 * extents, 4, extents);
     KvPool pool(backing);
-    auto pages = pool.acquirePages(16, false);
-    require(pages.granted() && pool.snapshot().pagesResident == 16,
-            "paced-release setup did not acquire every page");
+    auto pages = pool.acquirePages(4 * extents, false);
+    require(pages.granted() && pool.snapshot().pagesResident == 4 * extents,
+            "release setup did not acquire every page");
     release(pool, pages.pages);
-    require(pool.reclaimableExtentCount() == 4 && pool.releaseReady(),
-            "four empty resident extents were not reclaimable");
-
-    // A release still being torn down blocks further unmaps without
-    // touching the remaining empty extents.
-    backing.ready = false;
-    require(pool.reclaimEmptyExtents(false) == 0 && !pool.releaseReady() &&
-                pool.reclaimableExtentCount() == 4 &&
-                backing.releasedExtents == 0,
-            "pool released backing while the previous release was in flight");
-    // Deferral never escalates to a wait on the serving path, however many
-    // passes find the release still in flight.
-    for (int pass = 0; pass < 3; ++pass)
-      require(pool.reclaimEmptyExtents(false) == 0,
-              "pool released backing behind an in-flight release");
-    require(backing.awaitedReleases == 0,
-            "serving-path reclaim waited on an in-flight release");
-    backing.ready = true;
-    require(pool.reclaimEmptyExtents(false, 2) == 2 &&
-                pool.reclaimableExtentCount() == 2 &&
-                pool.snapshot().pagesResident == 8,
-            "extent release limit was not honored");
-
-    // A paced backing becomes busy after each release: one extent per pass,
-    // and awaitRelease() makes the next pass possible.
-    backing.pacedReleases = true;
-    require(pool.reclaimEmptyExtents(false) == 1 && !pool.releaseReady() &&
+    require(pool.reclaimableExtentCount() == extents,
+            "every empty resident extent was not reclaimable");
+    const auto before = pool.releaseGeneration();
+    require(pool.reclaimEmptyExtents(true) == extents - 1 &&
+                backing.releasedExtents == extents - 1 &&
+                pool.releaseGeneration() == before + extents - 1 &&
                 pool.reclaimableExtentCount() == 1,
-            "paced backing did not stop after one release");
-    require(pool.reclaimEmptyExtents(false) == 0,
-            "pool ignored an in-flight paced release");
-    pool.awaitRelease();
-    require(backing.awaitedReleases == 1 && pool.releaseReady() &&
-                pool.reclaimEmptyExtents(true) == 0 &&
-                pool.reclaimableExtentCount() == 1,
-            "runway was not retained by the paced final pass");
+            "a pass did not release every empty extent but the runway");
     require(pool.reclaimEmptyExtents(false) == 1 &&
                 pool.snapshot().pagesResident == 0 &&
-                backing.releasedExtents == 4,
-            "final paced release did not return the last extent");
+                pool.snapshot().extentReleases == extents,
+            "a pass without the runway did not release it");
 }
 
 void testFullestExtentFillsFirstSoColdExtentsDrain() {
@@ -302,8 +269,8 @@ void testFullestExtentFillsFirstSoColdExtentsDrain() {
 }
 
 void testShorterTrailingExtentIsNotPreferredForBeingSmall() {
-    // The real storage ends with a shorter extent. Having fewer free pages
-    // only because it is small must not rank it as the fullest.
+    // Having fewer free pages only because an extent is small must not rank
+    // it as the fullest.
     TestBacking backing({4, 4, 2}, 3);
     KvPool pool(backing);
     auto all = pool.acquirePages(10, false);
@@ -344,38 +311,16 @@ void testPrefixAndActiveReferencesShareResidency() {
             "last prefix release did not make extent reclaimable");
 }
 
-void testReleaseProgressIncludesAllocationRollback() {
-    TestBacking backing(8, 4);
-    KvPool pool(backing);
-    backing.failExtent = 1;
-    backing.pacedReleases = true;
-    const auto before = pool.releaseGeneration();
-    auto allocation = pool.acquirePages(8, false);
-    require(!allocation.granted() && pool.releaseGeneration() != before &&
-                !pool.releaseReady(),
-            "allocation rollback did not record its pending release");
-    const auto pending = pool.releaseGeneration();
-    backing.ready = true;
-    require(pool.releaseReady() && pool.releaseGeneration() != pending,
-            "completion did not invalidate the prior allocation decision");
-    const auto complete = pool.releaseGeneration();
-    require(pool.releaseReady() && pool.releaseGeneration() == complete,
-            "unchanged completion would keep retrying a hard capacity denial");
-    require(pool.snapshot().pagesActive == 0 && pool.snapshot().pagesResident == 0,
-            "rollback retained page ownership or residency");
-}
-
 }  // namespace
 
 int main() {
     try {
-        testReleaseProgressIncludesAllocationRollback();
         testGrowthPacksResidentExtents();
         testFailedGrowthRollsBackAtomically();
-        testFailedGrowthRollbackIsPaced();
+        testFailedGrowthKeepsItsExtentsForTheRetry();
         testThrowingBackingKeepsAccounting();
         testPressureReusesResidentPagesAndDeniesGrowth();
-        testReleasesArePacedBehindTheBacking();
+        testPassReleasesEveryEmptyExtent();
         testFullestExtentFillsFirstSoColdExtentsDrain();
         testShorterTrailingExtentIsNotPreferredForBeingSmall();
         testPrefixAndActiveReferencesShareResidency();

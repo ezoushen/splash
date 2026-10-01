@@ -204,16 +204,14 @@ public:
   // callers wait instead of evicting more. A full disk quota replaces the
   // oldest redundant copy of either kind, then the oldest copy that is the
   // only one.
-  // Active requests and pinned restores are never selected. Physical release
-  // is paced by the backing: while an earlier release is still being torn
-  // down, the pass evicts only until an extent is empty and stops there; the
-  // caller retries, releasing that extent, once releaseDeferred() clears.
-  // keepResumePoint stops short of the newest state publication. A shrink
-  // that no request is waiting for gains the one cell that publication holds
-  // and costs the next request a replay of its whole prompt, because a
-  // hybrid model cannot resume from cached KV without the recurrent state.
-  // Empty backing, older publications and state-free KV are still reclaimed.
-  // keepRunway leaves one empty extent resident, for the next request.
+  // Active requests and pinned restores are never selected. A pass releases
+  // every extent it empties. keepResumePoint stops short of the newest state
+  // publication. A shrink that no request is waiting for gains the one cell
+  // that publication holds and costs the next request a replay of its whole
+  // prompt, because a hybrid model cannot resume from cached KV without the
+  // recurrent state. Empty backing, older publications and state-free KV are
+  // still reclaimed. keepRunway leaves one empty extent resident, for the
+  // next request.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
                                       bool keepResumePoint = false,
                                       bool keepRunway = false);
@@ -233,14 +231,9 @@ public:
   // Recycles exactly one unpinned state, preferring checkpoints, for a
   // required state publication; the disk tier keeps it when it admits it.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
-  // Empty resident backing exists but the previous release is still in
-  // flight; more reclaim work becomes possible without evicting anything.
-  [[nodiscard]] bool releaseDeferred() const noexcept;
-  // Includes the last unmap, even when no empty extent remains to reclaim.
-  [[nodiscard]] bool releasePending() const noexcept;
   [[nodiscard]] uint64_t releaseGeneration() const noexcept;
-  // Startup cleanup only: unmap unused backing without evicting cache data,
-  // keeping one runway extent. Waits for each paced release.
+  // Startup cleanup only: releases unused backing without evicting cache
+  // data, keeping one runway extent.
   void releaseUnusedKvBacking();
   [[nodiscard]] CacheSnapshot snapshot() const;
 

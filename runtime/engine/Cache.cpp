@@ -1,6 +1,7 @@
 #include "engine/Cache.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -349,20 +350,24 @@ Cache::Eviction Cache::evictOneKvBlock() {
 
 uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
                              bool keepResumePoint, bool keepRunway) {
-  // Empty backing that is waiting behind an in-flight release will satisfy
-  // part of the target by itself; evicting more cache now would only
-  // discard reusable prefixes without returning memory any sooner. Pages
-  // whose copies are being written count the same way.
-  if (releaseDeferred())
-    return 0;
+  // Pages whose copies are being written count toward the target. A pass
+  // that releases extents reports how long it held the serving thread,
+  // evictions between its releases included.
+  const auto start = std::chrono::steady_clock::now();
+  const uint64_t passStart = pool_.releaseGeneration();
   uint64_t released = reclaimEmptyExtents(keepRunway);
   auto needsMore = [&] { return !reclaimMet(released, targetBytes, evictAll); };
-  while (needsMore() && !releaseDeferred()) {
+  while (needsMore()) {
     const CacheReclaimResult result = reclaimOne(
         CacheReclaimMode::ReleaseBacking, keepResumePoint, keepRunway);
     if (!result.madeProgress)
       break;
     released += result.reclaimedBytes;
+  }
+  if (pool_.releaseGeneration() != passStart) {
+    const std::chrono::duration<double, std::milli> held =
+        std::chrono::steady_clock::now() - start;
+    pool_.recordReleasePass(held.count());
   }
   return released;
 }
@@ -370,8 +375,6 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
                                      bool keepResumePoint, bool keepRunway) {
   if (mode == CacheReclaimMode::ReleaseBacking) {
-    if (releaseDeferred())
-      return {};
     if (const uint64_t bytes = reclaimEmptyExtents(keepRunway))
       return {true, bytes};
   }
@@ -523,21 +526,12 @@ bool Cache::reclaimMet(uint64_t releasedBytes, uint64_t targetBytes,
   return !evictAll && releasedBytes + pendingBytes() >= targetBytes;
 }
 
-bool Cache::releaseDeferred() const noexcept {
-  return pool_.reclaimableExtentCount() > 0 && !pool_.releaseReady();
-}
-
-bool Cache::releasePending() const noexcept {
-  return !pool_.releaseReady();
-}
-
 uint64_t Cache::releaseGeneration() const noexcept {
   return pool_.releaseGeneration();
 }
 
 void Cache::releaseUnusedKvBacking() {
-  while (pool_.reclaimEmptyExtents(true))
-    pool_.awaitRelease();
+  static_cast<void>(pool_.reclaimEmptyExtents(true));
 }
 
 // Disk tier: restores and demotions in flight, the quota they draw on, and

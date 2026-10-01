@@ -43,7 +43,7 @@ public:
   [[nodiscard]] NativeRuntime::ByteSink outputSink();
   // Runs between commands after a control notification. Returning true asks
   // for another run at the next command-free point, bounded by a short poll
-  // timeout, so paced work (one KV extent release at a time) can continue
+  // timeout, so a reclaim that transfers in flight held back continues
   // without a new notification.
   using ControlHandler = std::function<bool()>;
   [[nodiscard]] std::function<void()> controlNotifier();

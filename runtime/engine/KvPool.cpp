@@ -59,9 +59,6 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
 
   std::vector<uint32_t> selected;
   selected.reserve(count);
-  std::vector<uint32_t> newlyResidentExtents;
-  newlyResidentExtents.reserve((count + backing_.extentPageCount(0) - 1) /
-                               backing_.extentPageCount(0));
   auto returnSelected = [&] {
     for (auto p = selected.rbegin(); p != selected.rend(); ++p)
       insertFree(*p, FreeClass::Resident);
@@ -84,28 +81,17 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
       throw;
     }
     if (!mapped) {
+      // The extents this acquisition allocated stay resident and
+      // reclaimable: the budget admitted them, and the retry that follows a
+      // reclaim takes their pages first instead of allocating them again.
+      // A reclaim pass returns them if they stay unused.
       returnSelected();
-      // Paced like reclaim: an extent the backing cannot release yet stays
-      // resident and reclaimable rather than waiting on the serving path.
-      const auto release = std::chrono::steady_clock::now();
-      bool released = false;
-      for (uint32_t resident : newlyResidentExtents) {
-        if (!extents_[resident].usedPages && releaseReady() &&
-            releaseBacking(extents_[resident].firstPage)) {
-          setExtentResident(resident, false);
-          released = true;
-        }
-      }
-      if (released)
-        extentReleaseMaxMilliseconds_ =
-            std::max(extentReleaseMaxMilliseconds_, millisecondsSince(release));
       return {{}, KvPageAcquireFailure::PhysicalCapacity, mapped.failure};
     }
     ++extentAllocations_;
     extentAllocateMaxMilliseconds_ =
         std::max(extentAllocateMaxMilliseconds_, millisecondsSince(growth));
     setExtentResident(extent, true);
-    newlyResidentExtents.push_back(extent);
   }
 
   for (uint32_t page : selected) {
@@ -176,19 +162,15 @@ uint64_t KvPool::residentBackingBytes() const noexcept {
   return uint64_t{residentPages_} * bytesPerPage();
 }
 
-uint32_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t maxExtents) {
+uint32_t KvPool::reclaimEmptyExtents(bool keepRunway) {
   const auto start = std::chrono::steady_clock::now();
   uint32_t reclaimed = 0;
   bool kept = false;
   uint32_t extent = reclaimableExtents_.head;
-  while (extent != noIndex && reclaimed < maxExtents) {
+  while (extent != noIndex) {
     const uint32_t next = extents_[extent].nextReclaimable;
     if (keepRunway && !kept) {
       kept = true;
-    } else if (!releaseReady()) {
-      // Keep the serving transport responsive while the previous release
-      // drains; retry at the next command-free point.
-      break;
     } else if (releaseBacking(extents_[extent].firstPage)) {
       setExtentResident(extent, false);
       ++reclaimed;
@@ -196,9 +178,13 @@ uint32_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t maxExtents) {
     extent = next;
   }
   if (reclaimed)
-    extentReleaseMaxMilliseconds_ =
-        std::max(extentReleaseMaxMilliseconds_, millisecondsSince(start));
+    recordReleasePass(millisecondsSince(start));
   return reclaimed;
+}
+
+void KvPool::recordReleasePass(double milliseconds) noexcept {
+  extentReleaseMaxMilliseconds_ =
+      std::max(extentReleaseMaxMilliseconds_, milliseconds);
 }
 
 uint32_t KvPool::reclaimableExtentCount() const noexcept {
@@ -210,27 +196,11 @@ bool KvPool::releaseBacking(uint32_t page) {
     return false;
   ++extentReleases_;
   ++releaseGeneration_;
-  releaseOutstanding_ = true;
   return true;
-}
-
-bool KvPool::releaseReady() const noexcept {
-  const bool ready = backing_.releaseReady();
-  if (ready && releaseOutstanding_) {
-    // Completion may be observed after an allocator has already denied growth.
-    ++releaseGeneration_;
-    releaseOutstanding_ = false;
-  }
-  return ready;
 }
 
 uint64_t KvPool::releaseGeneration() const noexcept {
   return releaseGeneration_;
-}
-
-void KvPool::awaitRelease() {
-  backing_.awaitRelease();
-  static_cast<void>(releaseReady());
 }
 
 KvPoolSnapshot KvPool::snapshot() const {

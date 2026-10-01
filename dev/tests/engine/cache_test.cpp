@@ -1,9 +1,11 @@
 #include "engine/Cache.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 using namespace splash;
@@ -41,15 +43,10 @@ public:
     for (uint32_t index = first; index < first + count; ++index) {
       resident_.at(index) = false;
     }
+    std::this_thread::sleep_for(releaseTime);
     ++unmappedExtents;
-    if (pacedReleases)
-      ready = false;
     return true;
   }
-  bool releaseReady() const noexcept override { return ready; }
-  void awaitRelease() override { ready = true; }
-  bool ready = true;
-  bool pacedReleases = false;
   uint32_t extentFirstPage(uint32_t page) const override {
     return page - page % 4;
   }
@@ -64,6 +61,8 @@ public:
   }
   uint32_t mappedExtents = 0;
   uint32_t unmappedExtents = 0;
+  // How long releasing one extent takes.
+  std::chrono::milliseconds releaseTime{0};
 private:
   std::vector<bool> resident_;
   uint32_t maximumResidentPages_;
@@ -281,64 +280,75 @@ void testReplacementPreservesBackingEvenWhenExtentBecomesEmpty() {
           "zero-target physical shrink did not release the empty extent");
 }
 
-} // namespace
-
-// Physical release is paced by the backing. While an earlier release is
-// still in flight and more empty extents wait, a reclaim pass neither queues
-// another unmap nor evicts reusable cache; it resumes once the backing is
-// ready again.
-void testReclaimDefersBehindInFlightRelease() {
-  Backing backing(16);
+// One reclaim pass releases every empty extent first, however many there
+// are, then evicts the cache and releases the extents that empties.
+void testReclaimPassReleasesEveryEmptyExtent() {
+  constexpr uint32_t empty = 200;
+  Backing backing(4 * (empty + 1));
   KvPool pool(backing);
   engine::Cache resources(pool, cacheNamespace());
-  auto prompt = tokens(33);
-  resources.beginRequest(3);
-  require(resources.ensureTokens(3, 32).granted(), "cached page allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(3, prompt, 32));
-  resources.endRequest(3);
-  // Request 4 fills the runway extent and maps a second one; request 5 needs
-  // more pages than remain resident and maps a third. Both end empty.
-  for (const auto [request, tokenCount] : {std::pair{4, 128}, std::pair{5, 256}}) {
-    resources.beginRequest(request);
-    require(resources.ensureTokens(request, tokenCount).granted(),
-            "empty extent allocation failed");
-    resources.endRequest(request);
-  }
-  auto snapshot = resources.snapshot();
-  require(snapshot.kvCache.blocks == 1 && snapshot.pool.reclaimableExtents == 2 &&
-              backing.residentPages() == 12 && !resources.releaseDeferred(),
-          "paced-release setup geometry changed");
-
-  backing.pacedReleases = true;
-  require(resources.reclaimCache(1ULL << 30, false) == 4 * 4096 &&
-              backing.unmappedExtents == 1 && resources.releaseDeferred() &&
-              resources.snapshot().kvCache.blocks == 1 &&
-              resources.snapshot().pool.reclaimableExtents == 1,
-          "reclaim queued a second unmap or evicted cache behind an in-flight release");
-  require(resources.reclaimCache(1ULL << 30, false) == 0 &&
-              !resources.reclaimOne().madeProgress &&
-              backing.unmappedExtents == 1 &&
+  const auto prompt = tokens(33);
+  resources.beginRequest(1);
+  require(resources.ensureTokens(1, 32).granted(), "cached page allocation failed");
+  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 32));
+  resources.endRequest(1);
+  // Request 2 fills the cached block's extent and every other one, then
+  // ends: every extent but the cached block's is empty.
+  resources.beginRequest(2);
+  require(resources.ensureTokens(2, 4 * empty * 32 + 3 * 32).granted(),
+          "empty extent allocation failed");
+  resources.endRequest(2);
+  require(resources.snapshot().pool.reclaimableExtents == empty &&
               resources.snapshot().kvCache.blocks == 1,
-          "deferred reclaim made progress while the release was in flight");
-  backing.awaitRelease();
-  require(!resources.releaseDeferred(), "completed release still reported deferred");
-  // The next pass releases the last empty extent, then evicts the cached
-  // block whose extent cannot be released until that unmap completes.
-  require(resources.reclaimCache(1ULL << 30, false) == 4 * 4096 &&
-              backing.unmappedExtents == 2 &&
-              resources.snapshot().kvCache.blocks == 0 &&
-              resources.releaseDeferred(),
-          "reclaim did not resume after the release completed");
-  backing.awaitRelease();
-  require(resources.reclaimCache(0, false) == 4 * 4096 &&
-              backing.unmappedExtents == 3 && backing.residentPages() == 0 &&
-              !resources.releaseDeferred(),
-          "final paced pass did not return the last empty extent");
+          "release setup geometry changed");
+
+  require(resources.reclaimCache(uint64_t{empty} * 4 * 4096, false) ==
+                  uint64_t{empty} * 4 * 4096 &&
+              backing.unmappedExtents == empty &&
+              resources.snapshot().pool.reclaimableExtents == 0 &&
+              resources.snapshot().kvCache.blocks == 1,
+          "a pass did not release every empty extent before evicting");
+  require(resources.reclaimCache(1ULL << 40, false) == 4 * 4096 &&
+              backing.unmappedExtents == empty + 1 &&
+              backing.residentPages() == 0 &&
+              resources.snapshot().kvCache.blocks == 0,
+          "a pass did not evict the cache and release its extent");
 }
+
+// A pass that releases extents as its evictions empty them reports how long
+// it held the serving thread, not its longest single release.
+void testReleasePassTimeCoversTheWholePass() {
+  constexpr uint32_t extents = 6;
+  Backing backing(4 * extents);
+  backing.releaseTime = std::chrono::milliseconds(2);
+  KvPool pool(backing);
+  engine::Cache resources(pool, cacheNamespace());
+  for (uint32_t chain = 0; chain < extents; ++chain) {
+    const uint64_t id = chain + 1;
+    resources.beginRequest(id);
+    require(resources.ensureTokens(id, 128).granted(),
+            "cached chain allocation failed");
+    static_cast<void>(
+        resources.publishCommittedBlocks(id, tokens(129, 1000 * chain), 128));
+    resources.endRequest(id);
+  }
+  require(resources.snapshot().pool.reclaimableExtents == 0 &&
+              resources.snapshot().kvCache.blocks == 4 * extents,
+          "release time setup geometry changed");
+  static_cast<void>(
+      resources.reclaimCache(std::numeric_limits<uint64_t>::max(), true));
+  require(backing.unmappedExtents == extents &&
+              resources.snapshot().pool.extentReleaseMaxMilliseconds >=
+                  2.0 * extents,
+          "the release time is not the whole pass's");
+}
+
+} // namespace
 
 int main() {
   try {
-    testReclaimDefersBehindInFlightRelease();
+    testReclaimPassReleasesEveryEmptyExtent();
+    testReleasePassTimeCoversTheWholePass();
     testCanonicalPagesAndSparseState();
     testKvDeeperThanStateAndDependencyEviction();
     testActiveTipProtectsTheContentChain();

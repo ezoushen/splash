@@ -83,9 +83,6 @@ public:
   reclaimMemory(const MemoryReclaimDirective &directive) {
     return core_.reclaimMemory(directive);
   }
-  [[nodiscard]] bool reclaimDeferred() const noexcept {
-    return core_.reclaimDeferred();
-  }
 
 private:
   struct RequestTelemetry {
