@@ -146,7 +146,7 @@ private:
 
 // The sole physical-memory admission ledger. It does not allocate, evict, or
 // schedule work; it only gives a short-lived byte reservation to a caller that
-// is about to commit a placement heap. That keeps policy out of MetalBackend
+// is about to allocate Metal memory. That keeps policy out of MetalBackend
 // and makes every growth operation transactional.
 class MemoryGovernor final {
 public:

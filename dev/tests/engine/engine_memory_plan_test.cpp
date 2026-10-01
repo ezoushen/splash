@@ -29,7 +29,6 @@ DeviceCapabilities device(uint64_t workingSet = 12 * kGiB) {
   result.maxThreadgroupMemoryBytes = 32 * 1024;
   result.maxThreadgroupWidth = 1024;
   result.hasUnifiedMemory = true;
-  result.supportsPlacementSparse = true;
   return result;
 }
 
@@ -251,11 +250,10 @@ void testDeviceValidationNamesTheMacosFloor() {
   older.macosMinor = 3;
   require(older.validationError().value_or("") == "macos_26_4_required",
           "macOS 26.3 was not refused with the macOS reason");
-  // The operating system explains a missing placement-sparse query, so its
-  // reason takes precedence over the feature's own.
-  older.supportsPlacementSparse = false;
+  // The operating system is checked before the device.
+  older.appleGpuFamily = 8;
   require(older.validationError().value_or("") == "macos_26_4_required",
-          "an older macOS did not take precedence over the sparse reason");
+          "an older macOS did not take precedence over the device's reason");
   require(older.macosVersion() == "26.3.0",
           "the macOS version string is not major.minor.patch");
   DeviceCapabilities unknown = device();
@@ -274,30 +272,21 @@ void testDeviceValidationMessageNamesWhatTheMacHas() {
           "the reference device has a validation message");
   const std::string needs =
       "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 26.4 "
-      "or newer, with placement-sparse buffers; this Mac has ";
+      "or newer; this Mac has ";
   DeviceCapabilities m2 = device();
   m2.deviceName = "Apple M2 Max";
   m2.appleGpuFamily = 8;
   m2.macosPatch = 1;
   require(m2.validationMessage().value_or("") ==
-              needs + "Apple M2 Max (Apple GPU family 8) on macOS 26.4.1, "
-                      "with placement-sparse buffers "
+              needs + "Apple M2 Max (Apple GPU family 8) on macOS 26.4.1 "
                       "(apple_gpu_family_9_required)",
           "a family-8 GPU was not named against the family required");
   DeviceCapabilities older = device();
   older.macosMinor = 3;
-  older.supportsPlacementSparse = false;
   require(older.validationMessage().value_or("") ==
-              needs + "test (Apple GPU family 9) on macOS 26.3.0, where "
-                      "placement-sparse support cannot be queried "
+              needs + "test (Apple GPU family 9) on macOS 26.3.0 "
                       "(macos_26_4_required)",
           "an older macOS was not named against the macOS required");
-  DeviceCapabilities dense = device();
-  dense.supportsPlacementSparse = false;
-  require(dense.validationMessage().value_or("") ==
-              needs + "test (Apple GPU family 9) on macOS 26.4.0, without "
-                      "placement-sparse buffers (placement_sparse_required)",
-          "missing placement-sparse buffers were not named");
 }
 
 int main() {

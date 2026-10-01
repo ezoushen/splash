@@ -20,17 +20,6 @@ kernel void test_add_u32(device uint *values [[buffer(0)]],
     }
 }
 
-kernel void sparse_fill_copy_u32(device uint *sparseValues [[buffer(0)]],
-                                 device uint *readback [[buffer(1)]],
-                                 constant uint &count [[buffer(2)]],
-                                 constant uint &value [[buffer(3)]],
-                                 uint gid [[thread_position_in_grid]]) {
-    if (gid < count) {
-        sparseValues[gid] = value + gid;
-        readback[gid] = sparseValues[gid];
-    }
-}
-
 // Row r of the grid writes word x of the buffer at table[r], which no
 // dispatch binds; addressed_check_u32 reads it back the same way.
 kernel void addressed_write_u32(device const ulong *table [[buffer(0)]],

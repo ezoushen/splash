@@ -1,7 +1,5 @@
 #import "MetalBackend.hpp"
 #include "CommandWatchdog.hpp"
-#include "DeviceQueries.hpp"
-#include "MetalEvent.hpp"
 #include "Residency.hpp"
 
 #import <Foundation/Foundation.h>
@@ -10,14 +8,12 @@
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <limits>
 #include <mutex>
-#include <optional>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -118,7 +114,6 @@ void readDeviceCapabilities(id<MTLDevice> device,
     MTLSize maximumThreads = device.maxThreadsPerThreadgroup;
     capabilities.maxThreadgroupWidth = maximumThreads.width;
     capabilities.hasUnifiedMemory = device.hasUnifiedMemory;
-    capabilities.supportsPlacementSparse = queryPlacementSparseSupport(device);
 }
 
 NSUInteger checkedNSUInteger(uint64_t value, std::string_view field) {
@@ -141,18 +136,8 @@ bool multiplyOverflows(uint64_t left, uint64_t right) {
     return right && left > std::numeric_limits<uint64_t>::max() / right;
 }
 
-constexpr uint64_t kPlacementSparsePageBytes = MetalBackend::kPlacementSparsePageBytes;
-constexpr MTLSparsePageSize kPlacementSparsePageSize = MTLSparsePageSize64;
 // Entries of a kernel's buffer argument table on every Apple GPU family.
 constexpr uint32_t kBufferArgumentEntries = 31;
-
-MTLSparsePageSize metalSparsePageSize(uint64_t bytes) {
-    if (bytes != kPlacementSparsePageBytes) {
-        throw MetalBackendError(
-            "placement-sparse page size must be exactly 64 KiB");
-    }
-    return kPlacementSparsePageSize;
-}
 
 double steadySeconds() noexcept {
     return std::chrono::duration<double>(
@@ -203,17 +188,6 @@ NSString *checkedNSString(std::string_view value, std::string_view field) {
 struct AllocationAccounting {
     std::atomic<uint64_t> allocatedBytes{0};
     std::atomic<uint64_t> peakAllocatedBytes{0};
-    std::atomic<uint64_t> sparseVirtualBytes{0};
-    std::atomic<uint64_t> sparseResidentBytes{0};
-    std::atomic<uint64_t> peakSparseResidentBytes{0};
-    std::atomic<uint64_t> residentBytes{0};
-    std::atomic<uint64_t> peakResidentBytes{0};
-
-    void addResident(uint64_t bytes) noexcept {
-        raisePeak(peakResidentBytes,
-                  residentBytes.fetch_add(bytes, std::memory_order_relaxed) +
-                      bytes);
-    }
 };
 
 struct MetalAllocation {
@@ -223,8 +197,6 @@ struct MetalAllocation {
     __strong id<MTLBuffer> buffer = nil;
     std::shared_ptr<AllocationAccounting> accounting;
     uint64_t bytes = 0;
-    uint64_t sparseVirtualBytes = 0;
-    bool placementSparse = false;
     BufferStorage storage = BufferStorage::Shared;
     // Non-empty while a member of the residency set: kept resident or
     // addressed. The set retains the buffer, and with it the backing, so the
@@ -236,12 +208,6 @@ struct MetalAllocation {
         if (accounting && bytes) {
             accounting->allocatedBytes.fetch_sub(
                 bytes, std::memory_order_relaxed);
-            accounting->residentBytes.fetch_sub(
-                bytes, std::memory_order_relaxed);
-        }
-        if (accounting && sparseVirtualBytes) {
-            accounting->sparseVirtualBytes.fetch_sub(
-                sparseVirtualBytes, std::memory_order_relaxed);
         }
     }
 };
@@ -250,21 +216,6 @@ struct MetalBuffer::Impl {
     std::shared_ptr<MetalAllocation> allocation;
     uint64_t offsetBytes = 0;
     uint64_t lengthBytes = 0;
-};
-
-struct SparseHeap::Impl {
-    __strong id<MTLHeap> heap = nil;
-    std::shared_ptr<AllocationAccounting> accounting;
-    uint64_t bytes = 0;
-
-    ~Impl() {
-        if (accounting && bytes) {
-            accounting->sparseResidentBytes.fetch_sub(
-                bytes, std::memory_order_relaxed);
-            accounting->residentBytes.fetch_sub(
-                bytes, std::memory_order_relaxed);
-        }
-    }
 };
 
 struct BackendAsyncState {
@@ -281,11 +232,7 @@ struct BackendAsyncState {
     __weak id<MTLCommandBuffer> activeCommand = nil;
     std::function<void(id<MTLCommandBuffer>)> activeCompletion;
     CommandWatchdog commandWatchdog;
-    std::stop_source stopping;
-    std::atomic<uint64_t> mapWaitEvent{0};
-    std::atomic<double> mapWaitStarted{0.0};
-    std::atomic<double> lastMapWaitSeconds{0.0};
-    std::atomic<double> maxMapWaitSeconds{0.0};
+    bool stopping = false;
 
     uint64_t sampleDeviceMemory() const noexcept {
         if (!device) return 0;
@@ -312,7 +259,7 @@ struct BackendAsyncState {
     uint64_t beginSubmission(size_t dispatchCount) {
         ensureHealthy();
         std::lock_guard lock(gateMutex);
-        if (stopping.stop_requested())
+        if (stopping)
             throw MetalBackendError("Metal backend is stopping");
         if (activeSequence) {
             throw MetalBackendError(
@@ -329,7 +276,7 @@ struct BackendAsyncState {
     bool commitSubmission(uint64_t sequence, id<MTLCommandBuffer> command,
                           std::function<void(id<MTLCommandBuffer>)> completion) {
         std::lock_guard lock(gateMutex);
-        if (stopping.stop_requested()) return false;
+        if (stopping) return false;
         activeCommand = command;
         activeCompletion = std::move(completion);
         commandWatchdog.start(sequence, steadySeconds());
@@ -397,7 +344,6 @@ struct CommandTicket::State {
     uint64_t sequence = 0;
     CommandTiming timing;
     std::chrono::steady_clock::time_point wallStart;
-    uint64_t sparseEventValue = 0;
     std::string error;
     bool completed = false;
     bool released = false;
@@ -416,8 +362,7 @@ struct CommandTicket::State {
         std::string error;
         if (command.status != MTLCommandBufferStatusCompleted) {
             std::ostringstream message;
-            message << "Metal command " << sequence
-                    << " failed (sparse event " << sparseEventValue << ')';
+            message << "Metal command " << sequence << " failed";
             if (command.error) {
                 message << ": " << errorDescription(command.error);
             }
@@ -489,8 +434,6 @@ struct MetalBackend::Impl {
     __strong id<MTLCommandQueue> queue = nil;
     // Allocations hold it weakly: they may outlive the backend.
     std::shared_ptr<Residency> residency;
-    __strong id<MTL4CommandQueue> sparseQueue = nil;
-    __strong id<MTLSharedEvent> sparseEvent = nil;
     __strong id<MTLLibrary> library = nil;
     // Looked up for every dispatch on the encode path, which the GPU waits
     // for; a hit allocates nothing.
@@ -499,77 +442,11 @@ struct MetalBackend::Impl {
         pipelines;
 
     DeviceCapabilities capabilities;
-    NSUInteger sparseTimeoutMilliseconds = 0;
     std::shared_ptr<AllocationAccounting> accounting =
         std::make_shared<AllocationAccounting>();
     std::shared_ptr<BackendAsyncState> asyncState =
         std::make_shared<BackendAsyncState>();
     mutable std::mutex commandMutex;
-    uint64_t nextSparseEventValue = 0;
-    uint64_t pendingSparseEventValue = 0;
-
-    // The one outstanding asynchronous unmap; guarded by commandMutex. Its
-    // heap stays alive, and counted resident, until the queue signals.
-    struct PendingSparseUnmap {
-        uint64_t eventValue = 0;
-        SparseHeap heap;
-        std::chrono::steady_clock::time_point issued;
-    };
-    std::optional<PendingSparseUnmap> pendingUnmap;
-    std::atomic<uint64_t> pendingUnmapCount{0};
-    std::atomic<uint64_t> completedUnmaps{0};
-    std::atomic<double> lastUnmapSeconds{0.0};
-    std::atomic<double> maxUnmapSeconds{0.0};
-    std::atomic<double> pendingUnmapIssuedSeconds{0.0};
-
-    ~Impl() {
-        // Teardown must not wait for a stalled mapping queue. Keep its backing
-        // alive until the driver acknowledges the pending unmap instead.
-        if (pendingUnmap && sparseEvent.signaledValue < pendingUnmap->eventValue) {
-            auto retainedHeap = std::make_shared<SparseHeap>(std::move(pendingUnmap->heap));
-            id<MTL4CommandQueue> retainedQueue = sparseQueue;
-            id<MTLSharedEvent> retainedEvent = sparseEvent;
-            [sparseEvent notifyListener:[MTLSharedEventListener sharedListener]
-                atValue:pendingUnmap->eventValue block:^(id<MTLSharedEvent>, uint64_t) {
-                    (void)retainedHeap;
-                    (void)retainedQueue;
-                    (void)retainedEvent;
-                }];
-        }
-    }
-
-    // Requires commandMutex. Releases the heap of a completed unmap.
-    bool reapSparseUnmapsLocked() noexcept {
-        if (!pendingUnmap) return false;
-        if (sparseEvent.signaledValue < pendingUnmap->eventValue) return false;
-        const double seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - pendingUnmap->issued).count();
-        lastUnmapSeconds.store(seconds, std::memory_order_relaxed);
-        raisePeak(maxUnmapSeconds, seconds);
-        completedUnmaps.fetch_add(1, std::memory_order_relaxed);
-        pendingUnmap.reset();
-        pendingUnmapCount.store(0, std::memory_order_release);
-        sampleDeviceMemory();
-        return true;
-    }
-
-    // Requires commandMutex. Blocks until the outstanding unmap completes.
-    void awaitSparseUnmapLocked() {
-        if (!pendingUnmap) return;
-        if (![sparseEvent waitUntilSignaledValue:pendingUnmap->eventValue
-                                       timeoutMS:sparseTimeoutMilliseconds]) {
-            std::ostringstream details;
-            details << "sparse unmapping timed out: event="
-                    << pendingUnmap->eventValue
-                    << " signaled=" << sparseEvent.signaledValue
-                    << " pending_map=" << pendingSparseEventValue
-                    << " waited_ms=" << sparseTimeoutMilliseconds;
-            std::string message = details.str();
-            markUnhealthy(message);
-            throw MetalBackendError(message);
-        }
-        static_cast<void>(reapSparseUnmapsLocked());
-    }
 
     uint64_t sampleDeviceMemory() const noexcept {
         return asyncState->sampleDeviceMemory();
@@ -602,7 +479,6 @@ struct MetalBackend::Impl {
                   accounting->allocatedBytes.fetch_add(
                       allocation->bytes, std::memory_order_relaxed) +
                       allocation->bytes);
-        accounting->addResident(allocation->bytes);
         sampleDeviceMemory();
         return wrap(std::move(allocation));
     }
@@ -693,22 +569,6 @@ uint64_t MetalBuffer::gpuAddress() const noexcept {
     return impl_->allocation->buffer.gpuAddress + impl_->offsetBytes;
 }
 
-SparseHeap::SparseHeap() = default;
-SparseHeap::~SparseHeap() = default;
-SparseHeap::SparseHeap(SparseHeap &&) noexcept = default;
-SparseHeap &SparseHeap::operator=(SparseHeap &&) noexcept = default;
-
-SparseHeap::SparseHeap(std::shared_ptr<Impl> impl)
-    : impl_(std::move(impl)) {}
-
-SparseHeap::operator bool() const noexcept {
-    return impl_ && impl_->heap;
-}
-
-uint64_t SparseHeap::sizeBytes() const noexcept {
-    return impl_ ? impl_->bytes : 0;
-}
-
 CommandTicket::CommandTicket() = default;
 
 CommandTicket::CommandTicket(std::shared_ptr<State> state)
@@ -757,19 +617,14 @@ CommandTiming CommandTicket::wait() {
 }
 
 MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSeconds,
-                           uint32_t sparseTimeoutMilliseconds,
                            double residencyKeepAliveSeconds)
     : impl_(std::make_unique<Impl>()) {
     impl_->asyncState->commandWatchdog = CommandWatchdog(commandTimeoutSeconds);
-    if (!sparseTimeoutMilliseconds) {
-        throw MetalBackendError("sparse mapping timeout must be positive");
-    }
     if (!std::isfinite(residencyKeepAliveSeconds) ||
         residencyKeepAliveSeconds <= 0.0) {
         throw MetalBackendError(
             "residency keep-alive must be finite and positive");
     }
-    impl_->sparseTimeoutMilliseconds = sparseTimeoutMilliseconds;
     @autoreleasepool {
         if (metallibPath.empty()) {
             throw MetalBackendError("metallib path must not be empty");
@@ -826,86 +681,6 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
         impl_->sampleDeviceMemory();
 
         readDeviceCapabilities(impl_->device, impl_->capabilities);
-
-        // Exercise the private-buffer/placement-heap ABI the device reports;
-        // a failure fails the backend.
-        if (@available(macOS 26.4, *)) {
-            if (impl_->capabilities.supportsPlacementSparse) {
-                impl_->sparseQueue = [impl_->device newMTL4CommandQueue];
-                impl_->sparseEvent = [impl_->device newSharedEvent];
-                if (!impl_->sparseQueue || !impl_->sparseEvent) {
-                    throw MetalAllocationError(
-                        "placement-sparse probe could not allocate its queue or event");
-                }
-
-                id<MTLBuffer> canaryBuffer = [impl_->device
-                    newBufferWithLength:kPlacementSparsePageBytes
-                    options:MTLResourceStorageModePrivate
-                    placementSparsePageSize:kPlacementSparsePageSize];
-                MTLHeapDescriptor *descriptor = [MTLHeapDescriptor new];
-                if (!descriptor) {
-                    throw MetalAllocationError(
-                        "placement-sparse probe could not allocate its heap descriptor");
-                }
-                descriptor.type = MTLHeapTypePlacement;
-                descriptor.storageMode = MTLStorageModePrivate;
-                descriptor.size = kPlacementSparsePageBytes;
-                descriptor.maxCompatiblePlacementSparsePageSize =
-                    kPlacementSparsePageSize;
-                id<MTLHeap> canaryHeap =
-                    [impl_->device newHeapWithDescriptor:descriptor];
-                if (!canaryBuffer || !canaryHeap) {
-                    throw MetalAllocationError(
-                        "placement-sparse probe could not allocate its buffer or heap");
-                }
-                MTLSharedEventListener *listener =
-                    [MTLSharedEventListener sharedListener];
-                if (!listener) {
-                    throw MetalAllocationError(
-                        "placement-sparse probe could not allocate its completion listener");
-                }
-                MTL4UpdateSparseBufferMappingOperation operation{};
-                operation.mode = MTLSparseTextureMappingModeMap;
-                operation.bufferRange = NSMakeRange(0, 1);
-                operation.heapOffset = 0;
-                [impl_->sparseQueue updateBufferMappings:canaryBuffer
-                                                   heap:canaryHeap
-                                             operations:&operation
-                                                  count:1];
-                [impl_->sparseQueue signalEvent:impl_->sparseEvent value:1];
-                BOOL mapped = [impl_->sparseEvent
-                    waitUntilSignaledValue:1 timeoutMS:5000];
-
-                operation.mode = MTLSparseTextureMappingModeUnmap;
-                [impl_->sparseQueue updateBufferMappings:canaryBuffer
-                                                   heap:nil
-                                             operations:&operation
-                                                  count:1];
-                [impl_->sparseQueue signalEvent:impl_->sparseEvent value:2];
-                BOOL unmapped = [impl_->sparseEvent
-                    waitUntilSignaledValue:2 timeoutMS:5000];
-                if (!unmapped) {
-                    // Only an unfinished probe needs asynchronous ownership.
-                    id<MTL4CommandQueue> probeQueue = impl_->sparseQueue;
-                    id<MTLSharedEvent> probeEvent = impl_->sparseEvent;
-                    [impl_->sparseEvent notifyListener:listener atValue:2
-                        block:^(id<MTLSharedEvent>, uint64_t) {
-                            (void)canaryBuffer;
-                            (void)canaryHeap;
-                            (void)probeQueue;
-                            (void)probeEvent;
-                        }];
-                }
-                if (!mapped || !unmapped) {
-                    throw MetalBackendError(
-                        std::string("placement-sparse probe timed out after 5000 ms waiting for ") +
-                        (!mapped ? "mapping" : "unmapping") +
-                        " (last signaled event=" +
-                        std::to_string(impl_->sparseEvent.signaledValue) + ')');
-                }
-                impl_->nextSparseEventValue = 2;
-            }
-        }
     }
     impl_->sampleDeviceMemory();
 }
@@ -915,7 +690,7 @@ MetalBackend::~MetalBackend() { stop(); }
 void MetalBackend::stop() noexcept {
     if (!impl_) return;
     std::lock_guard lock(impl_->asyncState->gateMutex);
-    impl_->asyncState->stopping.request_stop();
+    impl_->asyncState->stopping = true;
 }
 MetalBackend::MetalBackend(MetalBackend &&) noexcept = default;
 MetalBackend &MetalBackend::operator=(MetalBackend &&other) noexcept {
@@ -991,282 +766,6 @@ MetalBuffer MetalBackend::allocateAddressed(uint64_t bytes,
     impl_->residency->join(buffer);
     result.impl_->allocation->residency = impl_->residency;
     return result;
-}
-
-MetalBuffer MetalBackend::allocatePlacementSparseBuffer(
-    uint64_t virtualBytes, uint64_t sparsePageBytes, std::string_view label) {
-    checkOperation();
-    const MTLSparsePageSize pageSize = metalSparsePageSize(sparsePageBytes);
-    if (!impl_->capabilities.supportsPlacementSparse) {
-        throw MetalBackendError("placement-sparse Metal is unavailable");
-    }
-    if (!virtualBytes || virtualBytes % sparsePageBytes) {
-        throw MetalBackendError(
-            "placement-sparse buffer size must be tile-aligned");
-    }
-    if (virtualBytes > impl_->capabilities.maxBufferLengthBytes) {
-        throw MetalBackendError(
-            "placement-sparse buffer exceeds maxBufferLength");
-    }
-
-    id<MTLBuffer> buffer = [impl_->device
-        newBufferWithLength:checkedNSUInteger(virtualBytes, "sparse buffer size")
-        options:MTLResourceStorageModePrivate
-        placementSparsePageSize:pageSize];
-    if (!buffer) {
-        throw MetalAllocationError(
-            "placement-sparse buffer creation failed");
-    }
-    if (!label.empty()) buffer.label = checkedNSString(label, "buffer label");
-
-    auto allocation = std::make_shared<MetalAllocation>();
-    allocation->buffer = buffer;
-    allocation->accounting = impl_->accounting;
-    allocation->sparseVirtualBytes = virtualBytes;
-    allocation->placementSparse = true;
-    allocation->storage = BufferStorage::Private;
-    impl_->accounting->sparseVirtualBytes.fetch_add(
-        virtualBytes, std::memory_order_relaxed);
-    impl_->sampleDeviceMemory();
-    return impl_->wrap(std::move(allocation));
-}
-
-SparseHeap MetalBackend::allocatePlacementHeap(
-    uint64_t physicalBytes, uint64_t sparsePageBytes, std::string_view label) {
-    impl_->ensureHealthy();
-    const MTLSparsePageSize pageSize = metalSparsePageSize(sparsePageBytes);
-    if (!impl_->capabilities.supportsPlacementSparse) {
-        throw MetalBackendError("placement-sparse Metal is unavailable");
-    }
-    if (!physicalBytes || physicalBytes % sparsePageBytes) {
-        throw MetalBackendError(
-            "placement heap size must be tile-aligned");
-    }
-
-    MTLHeapDescriptor *descriptor = [MTLHeapDescriptor new];
-    descriptor.type = MTLHeapTypePlacement;
-    descriptor.storageMode = MTLStorageModePrivate;
-    descriptor.size = checkedNSUInteger(physicalBytes, "placement heap size");
-    descriptor.maxCompatiblePlacementSparsePageSize = pageSize;
-    id<MTLHeap> heap = [impl_->device newHeapWithDescriptor:descriptor];
-    if (!heap) {
-        throw MetalAllocationError("placement heap allocation failed");
-    }
-    if (!label.empty()) heap.label = checkedNSString(label, "heap label");
-
-    auto result = std::make_shared<SparseHeap::Impl>();
-    result->heap = heap;
-    const uint64_t heapBytes = static_cast<uint64_t>(heap.size);
-    if (heapBytes < physicalBytes || heapBytes % sparsePageBytes) {
-        throw MetalBackendError("placement heap has unexpected size");
-    }
-    result->accounting = impl_->accounting;
-    result->bytes = heapBytes;
-    raisePeak(impl_->accounting->peakSparseResidentBytes,
-              impl_->accounting->sparseResidentBytes.fetch_add(
-                  result->bytes, std::memory_order_relaxed) + result->bytes);
-    impl_->accounting->addResident(result->bytes);
-    impl_->sampleDeviceMemory();
-    return SparseHeap(std::move(result));
-}
-
-void MetalBackend::mapSparse(
-    const SparseHeap &heap, std::span<const SparseMapping> mappings) {
-    if (!heap.impl_ || !heap.impl_->heap ||
-        heap.impl_->accounting.get() != impl_->accounting.get()) {
-        throw MetalBackendError("placement heap belongs to another backend");
-    }
-    if (mappings.empty()) {
-        throw MetalBackendError("sparse mapping list must not be empty");
-    }
-
-    std::lock_guard commandLock(impl_->commandMutex);
-    impl_->ensureHealthy();
-    if (impl_->asyncState->hasActiveSubmission()) {
-        throw MetalBackendError(
-            "cannot map sparse memory while a command is in flight");
-    }
-    static_cast<void>(impl_->reapSparseUnmapsLocked());
-    const uint64_t tileBytes = kPlacementSparsePageBytes;
-    for (const SparseMapping &mapping : mappings) {
-        // Tiles are counted from the start of the buffer, not of a view.
-        if (!mapping.buffer.impl_ ||
-            !mapping.buffer.impl_->allocation ||
-            mapping.buffer.impl_->allocation->accounting.get() !=
-                impl_->accounting.get() ||
-            !mapping.buffer.impl_->allocation->placementSparse ||
-            mapping.buffer.impl_->offsetBytes) {
-            throw MetalBackendError("invalid placement-sparse buffer");
-        }
-        if (!mapping.sizeBytes ||
-            mapping.bufferOffsetBytes % tileBytes ||
-            mapping.sizeBytes % tileBytes ||
-            mapping.heapOffsetBytes % tileBytes ||
-            mapping.bufferOffsetBytes > mapping.buffer.sizeBytes() ||
-            mapping.sizeBytes >
-                mapping.buffer.sizeBytes() - mapping.bufferOffsetBytes ||
-            mapping.heapOffsetBytes > heap.impl_->bytes ||
-            mapping.sizeBytes > heap.impl_->bytes - mapping.heapOffsetBytes) {
-            throw MetalBackendError("sparse mapping range is invalid");
-        }
-    }
-    if (impl_->nextSparseEventValue ==
-        std::numeric_limits<uint64_t>::max()) {
-        throw MetalBackendError("sparse event sequence exhausted");
-    }
-
-    // A range released moments ago may be mapped again to a new heap. Make
-    // the map depend on the in-flight unmap explicitly rather than relying
-    // on queue order alone; compute submission follows both completions.
-    if (impl_->pendingUnmap) {
-        [impl_->sparseQueue waitForEvent:impl_->sparseEvent
-                                 value:impl_->pendingUnmap->eventValue];
-    }
-    for (const SparseMapping &mapping : mappings) {
-        MTL4UpdateSparseBufferMappingOperation operation{};
-        operation.mode = MTLSparseTextureMappingModeMap;
-        operation.bufferRange = NSMakeRange(
-            checkedNSUInteger(mapping.bufferOffsetBytes / tileBytes,
-                              "sparse buffer tile offset"),
-            checkedNSUInteger(mapping.sizeBytes / tileBytes,
-                              "sparse mapping tile count"));
-        operation.heapOffset = checkedNSUInteger(
-            mapping.heapOffsetBytes / tileBytes, "sparse heap tile offset");
-        [impl_->sparseQueue
-            updateBufferMappings:mapping.buffer.impl_->allocation->buffer
-                             heap:heap.impl_->heap
-                       operations:&operation
-                            count:1];
-    }
-    const uint64_t eventValue = ++impl_->nextSparseEventValue;
-    // A failed dependency wait must not release backing still being mapped.
-    auto retainedHeap = heap.impl_;
-    std::vector<SparseMapping> retainedMappings(mappings.begin(), mappings.end());
-    id<MTL4CommandQueue> retainedQueue = impl_->sparseQueue;
-    id<MTLSharedEvent> retainedEvent = impl_->sparseEvent;
-    [impl_->sparseEvent notifyListener:[MTLSharedEventListener sharedListener]
-        atValue:eventValue block:^(id<MTLSharedEvent>, uint64_t) {
-            (void)retainedHeap;
-            (void)retainedMappings;
-            (void)retainedQueue;
-            (void)retainedEvent;
-        }];
-    [impl_->sparseQueue signalEvent:impl_->sparseEvent value:eventValue];
-    impl_->pendingSparseEventValue = eventValue;
-}
-
-void MetalBackend::unmapSparse(
-    std::span<const SparseMapping> mappings, SparseHeap &&heap) {
-    if (mappings.empty()) {
-        throw MetalBackendError("sparse unmapping list must not be empty");
-    }
-    if (!heap.impl_ || !heap.impl_->heap ||
-        heap.impl_->accounting.get() != impl_->accounting.get()) {
-        throw MetalBackendError(
-            "sparse unmapping requires the mapped placement heap");
-    }
-
-    std::lock_guard commandLock(impl_->commandMutex);
-    impl_->ensureHealthy();
-    if (impl_->asyncState->hasActiveSubmission()) {
-        throw MetalBackendError(
-            "cannot unmap sparse memory while a command is in flight");
-    }
-    const uint64_t tileBytes = kPlacementSparsePageBytes;
-    for (const SparseMapping &mapping : mappings) {
-        if (!mapping.buffer.impl_ ||
-            !mapping.buffer.impl_->allocation ||
-            mapping.buffer.impl_->allocation->accounting.get() !=
-                impl_->accounting.get() ||
-            !mapping.buffer.impl_->allocation->placementSparse ||
-            mapping.buffer.impl_->offsetBytes ||
-            !mapping.sizeBytes ||
-            mapping.bufferOffsetBytes % tileBytes ||
-            mapping.sizeBytes % tileBytes ||
-            mapping.bufferOffsetBytes > mapping.buffer.sizeBytes() ||
-            mapping.sizeBytes >
-                mapping.buffer.sizeBytes() - mapping.bufferOffsetBytes) {
-            throw MetalBackendError("sparse unmapping range is invalid");
-        }
-    }
-    if (impl_->nextSparseEventValue ==
-        std::numeric_limits<uint64_t>::max()) {
-        throw MetalBackendError("sparse event sequence exhausted");
-    }
-
-    // One outstanding unmap at a time keeps the kernel's per-tile teardown
-    // paced; the caller normally checks sparseUnmapPending() first.
-    static_cast<void>(impl_->reapSparseUnmapsLocked());
-    impl_->awaitSparseUnmapLocked();
-
-    // Allocation rollback may unmap before compute has consumed the map
-    // event. Order that dependent update explicitly on the Metal 4 queue.
-    if (impl_->pendingSparseEventValue) {
-        [impl_->sparseQueue waitForEvent:impl_->sparseEvent
-                                 value:impl_->pendingSparseEventValue];
-    }
-    for (const SparseMapping &mapping : mappings) {
-        MTL4UpdateSparseBufferMappingOperation operation{};
-        operation.mode = MTLSparseTextureMappingModeUnmap;
-        operation.bufferRange = NSMakeRange(
-            checkedNSUInteger(mapping.bufferOffsetBytes / tileBytes,
-                              "sparse buffer tile offset"),
-            checkedNSUInteger(mapping.sizeBytes / tileBytes,
-                              "sparse unmapping tile count"));
-        [impl_->sparseQueue
-            updateBufferMappings:mapping.buffer.impl_->allocation->buffer
-                             heap:nil
-                       operations:&operation
-                            count:1];
-    }
-    const uint64_t eventValue = ++impl_->nextSparseEventValue;
-    [impl_->sparseQueue signalEvent:impl_->sparseEvent value:eventValue];
-    const auto issued = std::chrono::steady_clock::now();
-    impl_->pendingUnmap.emplace();
-    impl_->pendingUnmap->eventValue = eventValue;
-    impl_->pendingUnmap->heap = std::move(heap);
-    impl_->pendingUnmap->issued = issued;
-    impl_->pendingUnmapIssuedSeconds.store(
-        std::chrono::duration<double>(issued.time_since_epoch()).count(),
-        std::memory_order_relaxed);
-    impl_->pendingUnmapCount.store(1, std::memory_order_release);
-    impl_->sampleDeviceMemory();
-}
-
-bool MetalBackend::sparseUnmapPending() noexcept {
-    // Reap opportunistically; a command being encoded on another thread
-    // must not stall the caller, which is often the reclaim pacing loop.
-    if (std::unique_lock commandLock(impl_->commandMutex, std::try_to_lock);
-        commandLock.owns_lock()) {
-        static_cast<void>(impl_->reapSparseUnmapsLocked());
-    }
-    if (impl_->pendingUnmapCount.load(std::memory_order_acquire) == 0)
-        return false;
-    // An unmap outstanding for longer than the drain's bounded wait is the
-    // same fault the drain would report, observed here without blocking the
-    // serving loop: the backend marks itself unhealthy and the supervisor
-    // replaces the engine.
-    const double issued =
-        impl_->pendingUnmapIssuedSeconds.load(std::memory_order_relaxed);
-    const double now = std::chrono::duration<double>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (issued > 0.0 &&
-        (now - issued) * 1000.0 > double(impl_->sparseTimeoutMilliseconds)) {
-        try {
-            impl_->markUnhealthy(
-                "sparse unmapping exceeded " +
-                std::to_string(impl_->sparseTimeoutMilliseconds) +
-                " ms without completing");
-        } catch (...) {
-        }
-    }
-    return true;
-}
-
-void MetalBackend::drainSparseUnmaps() {
-    std::lock_guard commandLock(impl_->commandMutex);
-    impl_->ensureHealthy();
-    impl_->awaitSparseUnmapLocked();
 }
 
 MetalBuffer MetalBackend::wrapSharedMemory(
@@ -1464,7 +963,6 @@ CommandTicket MetalBackend::submitCommandAsync(
 
     std::lock_guard commandLock(impl_->commandMutex);
     impl_->ensureHealthy();
-    static_cast<void>(impl_->reapSparseUnmapsLocked());
     for (PreparedDispatch &item : prepared) {
         item.pipeline = impl_->pipeline(item.source->pipelineName);
         if (item.threadCount >
@@ -1499,13 +997,7 @@ CommandTicket MetalBackend::submitCommandAsync(
     if (!command) {
         failBeforeCommit("unable to create Metal command buffer");
     }
-    const uint64_t sparseEventValue = impl_->pendingSparseEventValue;
     ticketState->wallStart = wallStart;
-    ticketState->sparseEventValue = sparseEventValue;
-    if (sparseEventValue) {
-        // Keep the queue dependency explicit; the CPU resolves it before commit.
-        [command encodeWaitForEvent:impl_->sparseEvent value:sparseEventValue];
-    }
     // Encoders can remain autoreleased after their command has completed.
     // The serving loop is long-lived, so bound their temporary ownership to
     // encoding; the command retains everything needed for GPU execution.
@@ -1543,56 +1035,20 @@ CommandTicket MetalBackend::submitCommandAsync(
 
     // Driver callbacks only complete the ticket. Device-wide memory telemetry
     // is sampled on the host before submission and when consuming the result.
-    std::shared_ptr<BackendAsyncState> observer = impl_->asyncState;
     [command addCompletedHandler:^(id<MTLCommandBuffer> completedCommand) {
         ticketState->finishCommand(completedCommand);
     }];
     impl_->sampleDeviceMemory();
     impl_->residency->use();
-    id<MTLSharedEvent> event = impl_->sparseEvent;
-    const bool pendingMap =
-        sparseEventValue && event.signaledValue < sparseEventValue;
-    const double mapWaitStart = steadySeconds();
-    if (pendingMap) {
-        observer->mapWaitStarted.store(mapWaitStart, std::memory_order_relaxed);
-        observer->mapWaitEvent.store(sparseEventValue, std::memory_order_release);
+    std::shared_ptr<BackendAsyncState> backend = impl_->asyncState;
+    if (!backend->healthy.load(std::memory_order_acquire)) {
+        ticketState->finish({}, "Metal backend became unhealthy before command submission");
+    } else if (!backend->commitSubmission(ticketState->sequence, command,
+                   [weakTicket = std::weak_ptr(ticketState)](id<MTLCommandBuffer> completed) {
+                       if (auto ticket = weakTicket.lock()) ticket->finishCommand(completed);
+                   })) {
+        ticketState->finish({}, "Metal backend stopped before command submission");
     }
-    const NSUInteger timeout = impl_->sparseTimeoutMilliseconds;
-    afterMetalEvent(event, sparseEventValue, timeout,
-        [command, event, observer, ticketState, sparseEventValue,
-         pendingMap, mapWaitStart, wallStart, timeout](bool signaled) {
-            if (pendingMap) {
-                const double waited = steadySeconds() - mapWaitStart;
-                observer->lastMapWaitSeconds.store(waited, std::memory_order_relaxed);
-                raisePeak(observer->maxMapWaitSeconds, waited);
-                observer->mapWaitEvent.store(0, std::memory_order_release);
-            }
-            if (observer->stopping.stop_requested()) {
-                ticketState->finish({}, "Metal backend stopped before command submission");
-                return;
-            }
-            if (!signaled || !observer->healthy.load(std::memory_order_acquire)) {
-                std::ostringstream message;
-                message << "sparse mapping dependency failed before Metal command "
-                        << ticketState->sequence << ": event " << sparseEventValue
-                        << ", signaled " << event.signaledValue;
-                if (!signaled)
-                    message << ", wait exceeded " << timeout << " ms";
-                CommandTiming timing;
-                timing.wallSeconds = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - wallStart).count();
-                ticketState->finish(timing, message.str());
-                return;
-            }
-            if (!observer->commitSubmission(ticketState->sequence, command,
-                    [weakTicket = std::weak_ptr(ticketState)](id<MTLCommandBuffer> completed) {
-                        if (auto ticket = weakTicket.lock()) ticket->finishCommand(completed);
-                    })) {
-                ticketState->finish({}, "Metal backend stopped before command submission");
-                return;
-            }
-        }, observer->stopping.get_token());
-    impl_->pendingSparseEventValue = 0;
     return CommandTicket(std::move(ticketState));
 }
 
@@ -1601,52 +1057,17 @@ MetalMemoryStats MetalBackend::memoryStats() const noexcept {
     // command on some Apple GPUs. Every allocation and command lifecycle
     // boundary already samples it, so status must use the cached atomic value
     // rather than turning a control-plane query into a GPU barrier.
-    uint64_t deviceCurrent =
-        impl_->asyncState->deviceCurrentAllocatedBytes.load(
-            std::memory_order_relaxed);
-    const uint64_t pendingUnmaps =
-        impl_->pendingUnmapCount.load(std::memory_order_acquire);
     return {
         impl_->accounting->allocatedBytes.load(std::memory_order_relaxed),
         impl_->accounting->peakAllocatedBytes.load(std::memory_order_relaxed),
-        deviceCurrent,
+        impl_->asyncState->deviceCurrentAllocatedBytes.load(
+            std::memory_order_relaxed),
         impl_->asyncState->devicePeakAllocatedBytes.load(
             std::memory_order_relaxed),
-        impl_->accounting->sparseVirtualBytes.load(
-            std::memory_order_relaxed),
-        impl_->accounting->sparseResidentBytes.load(
-            std::memory_order_relaxed),
-        impl_->accounting->peakSparseResidentBytes.load(
-            std::memory_order_relaxed),
-        impl_->accounting->peakResidentBytes.load(std::memory_order_relaxed),
-        kPlacementSparsePageBytes,
-        pendingUnmaps,
-        impl_->completedUnmaps.load(std::memory_order_relaxed),
-        impl_->lastUnmapSeconds.load(std::memory_order_relaxed),
-        impl_->maxUnmapSeconds.load(std::memory_order_relaxed),
-        pendingUnmaps
-            ? std::max(0.0, steadySeconds() -
-                                impl_->pendingUnmapIssuedSeconds.load(
-                                    std::memory_order_relaxed))
-            : 0.0,
-        impl_->asyncState->mapWaitEvent.load(std::memory_order_acquire),
-        impl_->asyncState->mapWaitEvent.load(std::memory_order_acquire)
-            ? std::max(0.0, steadySeconds() -
-                impl_->asyncState->mapWaitStarted.load(std::memory_order_relaxed))
-            : 0.0,
-        impl_->asyncState->lastMapWaitSeconds.load(std::memory_order_relaxed),
-        impl_->asyncState->maxMapWaitSeconds.load(std::memory_order_relaxed),
     };
 }
 
 MetalMemoryStats MetalBackend::refreshMemoryStats() const noexcept {
-    {
-        // A completed unmap releases its heap here without ever waiting
-        // behind an active encode or mapping call.
-        std::unique_lock lock(impl_->commandMutex, std::try_to_lock);
-        if (lock.owns_lock())
-            static_cast<void>(impl_->reapSparseUnmapsLocked());
-    }
     impl_->sampleDeviceMemory();
     return memoryStats();
 }
@@ -1667,15 +1088,10 @@ size_t MetalBackend::pipelineCount() const noexcept {
 
 void MetalBackend::checkHealth() {
     impl_->asyncState->checkCommandHealth();
-    if (impl_->pendingUnmapCount.load(std::memory_order_acquire)) {
-        static_cast<void>(sparseUnmapPending());
-        impl_->ensureHealthy();
-    }
 }
 
 bool MetalBackend::needsHealthCheck() const noexcept {
-    return impl_->asyncState->hasActiveSubmission() ||
-           impl_->pendingUnmapCount.load(std::memory_order_acquire) != 0;
+    return impl_->asyncState->hasActiveSubmission();
 }
 
 bool MetalBackend::healthy() const noexcept {

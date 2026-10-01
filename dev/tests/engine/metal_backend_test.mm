@@ -1,6 +1,4 @@
 #include "../../../runtime/metal/MetalBackend.hpp"
-#include "../../../runtime/metal/DeviceQueries.hpp"
-#include "../../../runtime/ops/PagedKv.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -9,7 +7,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -21,9 +18,7 @@
 #include <filesystem>
 #include <future>
 #include <iostream>
-#include <limits>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,7 +34,6 @@ using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
 using splash::metal::MetalBuffer;
-using splash::metal::SparseMapping;
 
 [[noreturn]] void fail(const std::string &message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -48,20 +42,6 @@ using splash::metal::SparseMapping;
 
 void require(bool condition, const std::string &message) {
     if (!condition) fail(message);
-}
-
-void awaitSparseRelease(MetalBackend &backend, uint64_t residentBytes,
-                        std::optional<uint64_t> virtualBytes = std::nullopt) {
-    // The driver event and its resource-retention callback complete separately.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (true) {
-        const auto stats = backend.memoryStats();
-        if (stats.sparseResidentBytes == residentBytes &&
-            (!virtualBytes || stats.sparseVirtualBytes == *virtualBytes)) return;
-        require(std::chrono::steady_clock::now() < deadline,
-                "completed sparse mapping did not release retained resources");
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
 }
 
 struct TemporaryMetallib final {
@@ -416,7 +396,7 @@ void residencyEndsWithoutBlits(const std::string &metallibPath) {
     originalComputeEncoder = computes.original;
     unsigned lapseCommits = 0, lapseComputes = 0;
     {
-        MetalBackend backend(metallibPath, 120.0, 30000, kKeepAliveSeconds);
+        MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
         const uint64_t page = static_cast<uint64_t>(getpagesize());
         MetalBuffer lapsing = backend.allocateBuffer(page);
         backend.keepResident(lapsing);
@@ -444,7 +424,7 @@ void residencyEndsWithoutBlits(const std::string &metallibPath) {
 // out of the set.
 void keptBuffersStayResident(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 1.0;
-    MetalBackend backend(metallibPath, 120.0, 30000, kKeepAliveSeconds);
+    MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
     MetalBuffer dropped = backend.allocateBuffer(page);
     MetalBuffer used = backend.allocateBuffer(page);
@@ -487,7 +467,7 @@ void keptBuffersStayResident(const std::string &metallibPath) {
 void residencyRacesTheHeartbeat(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.05;
     constexpr int kRounds = 24;
-    auto backend = std::make_unique<MetalBackend>(metallibPath, 120.0, 30000,
+    auto backend = std::make_unique<MetalBackend>(metallibPath, 120.0,
                                                   kKeepAliveSeconds);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
     MetalBuffer used = backend->allocateBuffer(page);
@@ -572,7 +552,7 @@ void addressedBuffersThroughTables(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.2;
     constexpr uint32_t kBuffers = 6, kWords = 16384, kRounds = 60;
     constexpr uint64_t kBytes = uint64_t{kWords} * sizeof(uint32_t);
-    MetalBackend backend(metallibPath, 120.0, 30000, kKeepAliveSeconds);
+    MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
     MetalBuffer table = backend.allocateBuffer(kBuffers * sizeof(uint64_t));
     MetalBuffer mismatches = backend.allocateBuffer(sizeof(uint32_t));
     const uint64_t before = backend.memoryStats().allocatedBytes;
@@ -664,212 +644,6 @@ void addressedBuffersThroughTables(const std::string &metallibPath) {
               << " regrown=" << regrown << " lapsed_round=" << lapsedRound << '\n';
 }
 
-id<MTLSharedEvent> submissionGate = nil;
-id<MTLSharedEvent> delayedMappingEvent = nil;
-IMP originalSparseSignal = nullptr;
-void delayMappingSignal(id queue, SEL selector, id<MTLSharedEvent> event, uint64_t value) {
-    if (value == 3) {
-        delayedMappingEvent = event;
-        // Complete the real mapping on a separate event. The test publishes
-        // its dependency only after verifying that backing is ready.
-        event = submissionGate;
-        value = 1;
-    }
-    reinterpret_cast<void (*)(id, SEL, id<MTLSharedEvent>, uint64_t)>(
-        originalSparseSignal)(queue, selector, event, value);
-}
-
-void backendDeferredSubmission(const std::string &metallibPath) {
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
-    // A command buffer of the class the backend commits.
-    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
-    constexpr uint64_t tile = MetalBackend::kPlacementSparsePageBytes;
-    // Exercise the real submission/ticket path, not just the event helper.
-    for (const std::string mode : {"resume", "stop", "timeout", "teardown-unmap"}) {
-        // "timeout" gives up on the mapping after 500 ms instead of 30 s.
-        auto backend = std::make_unique<MetalBackend>(
-            metallibPath, 120.0, mode == "timeout" ? 500 : 30000);
-        auto sparse = backend->allocatePlacementSparseBuffer(tile, tile, "gated-map");
-        auto heap = backend->allocatePlacementHeap(tile, tile, "gated-heap");
-        SparseMapping mapping{sparse, 0, tile, 0};
-        auto readback = backend->allocateBuffer(4 * sizeof(uint32_t));
-        std::fill_n(static_cast<uint32_t *>(readback.contents()), 4, 0);
-        const uint32_t count = 4, seed = 73;
-        ComputeDispatch dispatch;
-        dispatch.pipelineName = "sparse_fill_copy_u32";
-        dispatch.buffers = {{0, sparse}, {1, readback}};
-        dispatch.bytes = {{2, &count, sizeof(count)}, {3, &seed, sizeof(seed)}};
-        dispatch.threadgroups = {1, 1, 1};
-        dispatch.threadsPerThreadgroup = {4, 1, 1};
-        submissionGate = [device newSharedEvent];
-        {
-            MethodReplacement replacement(queue, @selector(signalEvent:value:),
-                reinterpret_cast<IMP>(delayMappingSignal));
-            originalSparseSignal = replacement.original;
-            backend->mapSparse(heap, {&mapping, 1});
-        }
-        require(delayedMappingEvent && delayedMappingEvent.signaledValue < 3,
-                "mapping test gate was not installed");
-        if (mode == "teardown-unmap") {
-            backend->unmapSparse({&mapping, 1}, std::move(heap));
-            // The unmap (event 4) waits on the sparse queue for the withheld
-            // mapping event: teardown must return before it completes.
-            backend.reset();
-            require(delayedMappingEvent.signaledValue < 4,
-                    "backend teardown waited for the mapping queue");
-            require([submissionGate waitUntilSignaledValue:1 timeoutMS:5000],
-                    "test mapping did not complete");
-            delayedMappingEvent.signaledValue = 3;
-            require([delayedMappingEvent waitUntilSignaledValue:4 timeoutMS:5000],
-                    "unmap ownership did not survive backend teardown");
-            continue;
-        }
-        std::atomic<unsigned> callbacks{0};
-        std::promise<void> completion;
-        auto notified = completion.get_future();
-        commits = 0;
-        MethodReplacement counting(command, @selector(commit),
-                                   reinterpret_cast<IMP>(countCommit));
-        originalCountedCommit = counting.original;
-        auto ticket = backend->submitAsync(dispatch, [&](uint64_t) {
-            if (++callbacks == 1) completion.set_value();
-        });
-        auto requireNotifiedOnce = [&] {
-            require(notified.wait_for(std::chrono::seconds(5)) == std::future_status::ready &&
-                        callbacks == 1, "deferred ticket did not notify exactly once");
-        };
-        require(!ticket.ready() && backend->memoryStats().sparseMapWaitEvent == 3,
-                "backend did not defer submission behind mapping");
-        requireBackendError([&] { (void)backend->submitAsync(dispatch); },
-                            "deferred command did not hold the submission gate");
-        if (mode == "resume") {
-            // The command waits on the host and reaches the GPU only once its
-            // mapping completes, so no GPU queue timeout can run out on it.
-            require(!ticket.ready() && callbacks == 0 && commits == 0,
-                    "backend committed a command before its mapping");
-            require([submissionGate waitUntilSignaledValue:1 timeoutMS:5000],
-                    "test mapping did not complete");
-            delayedMappingEvent.signaledValue = 3;
-            (void)ticket.wait();
-            requireNotifiedOnce();
-            require(backend->healthy() && commits == 1,
-                    "resumed ticket poisoned the backend");
-            auto *words = static_cast<uint32_t *>(readback.contents());
-            for (uint32_t i = 0; i < count; ++i)
-                require(words[i] == seed + i, "deferred command produced wrong output");
-            backend->unmapSparse({&mapping, 1}, std::move(heap));
-            backend->drainSparseUnmaps();
-            awaitSparseRelease(*backend, 0);
-        } else {
-            if (mode == "stop") backend->stop();
-            requireNotifiedOnce();
-            require(ticket.ready(), "stopped/timed-out mapping did not finish its ticket");
-            try {
-                (void)ticket.wait();
-                fail("stopped/timed-out mapping completed successfully");
-            } catch (const MetalBackendError &error) {
-                const std::string message = error.what();
-                require(message.find(mode == "stop" ? "stopped before" : "wait exceeded") !=
-                            std::string::npos, "deferred failure lost its cause: " + message);
-            }
-            require(!backend->healthy(), "failed ticket did not poison the backend");
-            requireBackendError([&] { (void)backend->submitAsync(dispatch); },
-                                "stopped backend accepted new work");
-            backend.reset();
-            require([submissionGate waitUntilSignaledValue:1 timeoutMS:5000],
-                    "test mapping did not complete");
-            delayedMappingEvent.signaledValue = 3;
-            require([delayedMappingEvent waitUntilSignaledValue:3 timeoutMS:5000],
-                    "map ownership did not survive backend teardown");
-            require(commits == 0 && static_cast<uint32_t *>(readback.contents())[0] == 0,
-                    "cancelled deferred command ran on the GPU");
-        }
-        std::cout << "PASS backend deferred submission " << mode << '\n';
-    }
-    submissionGate = nil;
-    delayedMappingEvent = nil;
-}
-
-BOOL noPlacementSupport(id, SEL) { return NO; }
-BOOL failPlacementQuery(id, SEL) {
-    id<SplashPlacementSparseDevice> backing = (id<SplashPlacementSparseDevice>)[NSObject new];
-    return backing.supportsPlacementSparse;
-}
-id<MTLHeap> refuseProbeHeap(id, SEL, MTLHeapDescriptor *) { return nil; }
-uint64_t failedProbeWaitValue = 0;
-IMP originalProbeWait = nullptr;
-BOOL failProbeWait(id event, SEL selector, uint64_t value, uint64_t timeout) {
-    if (value == failedProbeWaitValue)
-        return NO;
-    return reinterpret_cast<BOOL (*)(id, SEL, uint64_t, uint64_t)>(
-        originalProbeWait)(event, selector, value, timeout);
-}
-
-void placementProbeFailures(const std::string &metallibPath) {
-    // Faults apply only to this serial test process and are restored per case.
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    id<MTLSharedEvent> event = [device newSharedEvent];
-    require(device && event, "probe fault fixtures are unavailable");
-    {
-        MethodReplacement replacement(device, @selector(supportsPlacementSparse),
-                                      reinterpret_cast<IMP>(noPlacementSupport));
-        MetalBackend backend(metallibPath);
-        require(!backend.capabilities().supportsPlacementSparse,
-                "unsupported device was not preserved as a capability result");
-        require(splash::metal::probeDeviceCapabilities().validationError().value_or("") ==
-                    "placement_sparse_required",
-                "the device check accepted a device without placement-sparse buffers");
-    }
-    {
-        MethodReplacement replacement(device, @selector(supportsPlacementSparse),
-                                      reinterpret_cast<IMP>(failPlacementQuery));
-        try {
-            MetalBackend backend(metallibPath);
-            fail("probe query failure was reported as unsupported");
-        } catch (const MetalBackendError &error) {
-            const std::string message = error.what();
-            require(message.find("supportsPlacementSparse query failed") !=
-                        std::string::npos &&
-                    message.find("unrecognized selector") != std::string::npos,
-                    "probe query failure lost its cause");
-        }
-    }
-    {
-        MethodReplacement replacement(device, @selector(newHeapWithDescriptor:),
-                                      reinterpret_cast<IMP>(refuseProbeHeap));
-        try {
-            MetalBackend backend(metallibPath);
-            fail("probe allocation failure was reported as unsupported");
-        } catch (const MetalAllocationError &error) {
-            require(error.failure() == splash::metal::AllocationFailure::DriverRejected &&
-                        std::string(error.what()).find("probe could not allocate") !=
-                            std::string::npos,
-                    "probe allocation failure lost its cause");
-        }
-    }
-    for (uint64_t failedValue : {1ULL, 2ULL}) {
-        failedProbeWaitValue = failedValue;
-        MethodReplacement replacement(event,
-            @selector(waitUntilSignaledValue:timeoutMS:),
-            reinterpret_cast<IMP>(failProbeWait));
-        originalProbeWait = replacement.original;
-        try {
-            MetalBackend backend(metallibPath);
-            fail("probe timeout was reported as unsupported");
-        } catch (const splash::metal::MetalAllocationError &) {
-            fail("probe timeout was misclassified as an allocation failure");
-        } catch (const MetalBackendError &error) {
-            const std::string message = error.what();
-            require(message.find("timed out after 5000 ms") != std::string::npos &&
-                        message.find(failedValue == 1 ? "for mapping" : "for unmapping") !=
-                            std::string::npos,
-                    "probe timeout lost its phase or deadline");
-        }
-    }
-    std::cout << "placement_probe_failures=PASS\n";
-}
-
 void sharedMemoryCompletionLifetime(MetalBackend &backend) {
     struct Gate {
         std::mutex mutex;
@@ -928,309 +702,7 @@ void sharedMemoryCompletionLifetime(MetalBackend &backend) {
             "external memory leaked after Metal released its buffer");
 }
 
-void sparseExtentChurn(MetalBackend &backend) {
-    // Match the production per-layer data/scale mapping sizes. Rotate three
-    // virtual extents, retaining one as a witness while its replacement is
-    // mapped and used: at most two 130-MiB heaps plus one extent of readback.
-    constexpr splash::kv::Layout layout{16, 4, 256};
-    constexpr uint32_t kExtentPages = 128;
-    constexpr uint32_t kSegments = layout.attentionLayers * 4;
-    constexpr uint32_t kExtentCount = 3;
-    constexpr uint32_t kRepetitions = 256;
-    constexpr uint32_t kRollbackPeriod = 4;
-    constexpr uint32_t kGuardWords = 64;
-    constexpr uint32_t kSampleWords = 64;
-    constexpr uint32_t kCanary = 0xd15ca11u;
-    constexpr uint64_t kGuardBytes = kGuardWords * sizeof(uint32_t);
-    constexpr uint64_t kExtentBytes = kExtentPages * layout.bytesPerModelPage();
-    constexpr uint64_t kWitnessBytes =
-        kSegments * 2 * kSampleWords * sizeof(uint32_t);
-    const auto before = backend.memoryStats();
-    const uint64_t submissionsBefore = backend.submissionCount();
-    {
-        std::array<MetalBuffer, kSegments> buffers;
-        std::array<uint64_t, kSegments> segmentBytes{};
-        std::array<uint64_t, kSegments> offsets{};
-        std::array<uint32_t, kSegments> counts{};
-        uint64_t offset = 0;
-        for (uint32_t segment = 0; segment < kSegments; ++segment) {
-            segmentBytes[segment] = kExtentPages *
-                (segment % 2 ? layout.scaleBytesPerLayerPage()
-                             : layout.dataBytesPerLayerPage());
-            offsets[segment] = offset;
-            counts[segment] = segmentBytes[segment] / sizeof(uint32_t);
-            offset += segmentBytes[segment];
-            buffers[segment] = backend.allocatePlacementSparseBuffer(
-                kExtentCount * segmentBytes[segment],
-                MetalBackend::kPlacementSparsePageBytes,
-                "sparse-churn-layer-buffer-" + std::to_string(segment));
-        }
-        require(offset == kExtentBytes, "sparse churn geometry disagrees");
-        require(backend.memoryStats().sparseVirtualBytes ==
-                    before.sparseVirtualBytes + kExtentCount * kExtentBytes,
-                "sparse churn virtual accounting disagrees");
-        std::array<std::vector<SparseMapping>, kExtentCount> mappings;
-        for (uint32_t extent = 0; extent < kExtentCount; ++extent) {
-            for (uint32_t segment = 0; segment < kSegments; ++segment) {
-                mappings[extent].push_back({buffers[segment],
-                    extent * segmentBytes[segment], segmentBytes[segment],
-                    offsets[segment]});
-            }
-        }
-        MetalBuffer readback = backend.allocateBuffer(
-            kExtentBytes + kWitnessBytes + 3 * kGuardBytes,
-            BufferStorage::Shared, "sparse-churn-readback");
-        auto *words = static_cast<uint32_t *>(readback.contents());
-        const uint64_t middleGuard = kGuardWords + kExtentBytes / sizeof(uint32_t);
-        const uint64_t witnessStart = middleGuard + kGuardWords;
-        const uint64_t finalGuard = witnessStart + kWitnessBytes / sizeof(uint32_t);
-        std::array<std::optional<splash::metal::SparseHeap>, kExtentCount> heaps;
-        int32_t witness = -1;
-        std::array<uint32_t, kSegments> seeds{};
-        std::array<uint32_t, kSegments> witnessSeeds{};
-        for (uint32_t repetition = 0; repetition < kRepetitions; ++repetition) {
-            const uint32_t extent = repetition % kExtentCount;
-            try {
-                auto mapExtent = [&] {
-                    require(!heaps[extent], "sparse churn reused a resident extent");
-                    heaps[extent].emplace(backend.allocatePlacementHeap(
-                        kExtentBytes, MetalBackend::kPlacementSparsePageBytes,
-                        "sparse-churn-extent-" + std::to_string(extent)));
-                    require(heaps[extent]->sizeBytes() == kExtentBytes,
-                            "sparse churn heap size changed");
-                    backend.mapSparse(*heaps[extent], mappings[extent]);
-                    require(backend.memoryStats().sparseResidentBytes ==
-                                before.sparseResidentBytes +
-                                    (witness < 0 ? 1 : 2) * kExtentBytes,
-                            "sparse churn resident accounting disagrees");
-                };
-                mapExtent();
-                if (repetition % kRollbackPeriod == 0) {
-                    // Allocation rollback may unmap while the asynchronous
-                    // map is pending, without an intervening compute ticket.
-                    backend.unmapSparse(mappings[extent], std::move(*heaps[extent]));
-                    heaps[extent].reset();
-                    backend.drainSparseUnmaps();
-                    awaitSparseRelease(backend, before.sparseResidentBytes +
-                        (witness < 0 ? 0 : 1) * kExtentBytes);
-                    require(backend.memoryStats().sparseResidentBytes ==
-                                before.sparseResidentBytes +
-                                    (witness < 0 ? 0 : 1) * kExtentBytes,
-                            "rolled-back churn heap remains resident");
-                    require(backend.submissionCount() ==
-                                submissionsBefore + 2 * repetition,
-                            "sparse rollback submitted a compute command");
-                    mapExtent();
-                }
-                for (uint64_t guard : {uint64_t{0}, middleGuard, finalGuard})
-                    std::fill_n(words + guard, kGuardWords, kCanary);
-
-                std::vector<ComputeDispatch> fill;
-                std::vector<ComputeDispatch> copy;
-                auto append = [&](std::vector<ComputeDispatch> &dispatches,
-                                  const char *pipeline, const MetalBuffer &source,
-                                  uint64_t destinationOffset, const uint32_t &count,
-                                  const uint32_t *seed = nullptr) {
-                    ComputeDispatch dispatch;
-                    dispatch.pipelineName = pipeline;
-                    dispatch.buffers = {{0, source}, {1, backend.view(readback,
-                        destinationOffset, uint64_t{count} * sizeof(uint32_t))}};
-                    dispatch.bytes = {{2, &count, sizeof(count)}};
-                    if (seed) dispatch.bytes.push_back({3, seed, sizeof(*seed)});
-                    dispatch.threadgroups = {(uint64_t{count} + 255) / 256, 1, 1};
-                    dispatch.threadsPerThreadgroup = {256, 1, 1};
-                    dispatches.push_back(std::move(dispatch));
-                };
-                for (uint32_t segment = 0; segment < kSegments; ++segment) {
-                    seeds[segment] = (repetition + 1) * 1048576u + segment * 8192u;
-                    const auto source = backend.view(buffers[segment],
-                        extent * segmentBytes[segment], segmentBytes[segment]);
-                    append(fill, "sparse_fill_copy_u32", source,
-                        kGuardBytes + offsets[segment], counts[segment], &seeds[segment]);
-                    // A separate command reads the sparse resource, rather
-                    // than relying on the fill kernel's own write-through copy.
-                    append(copy, "test_copy_u32", source,
-                        kGuardBytes + offsets[segment], counts[segment]);
-                    if (witness < 0) continue;
-                    for (uint32_t end = 0; end < 2; ++end) {
-                        const uint64_t sampleOffset = end
-                            ? segmentBytes[segment] - kSampleWords * sizeof(uint32_t) : 0;
-                        append(copy, "test_copy_u32", backend.view(buffers[segment],
-                            static_cast<uint64_t>(witness) * segmentBytes[segment] + sampleOffset,
-                            kSampleWords * sizeof(uint32_t)),
-                            witnessStart * sizeof(uint32_t) +
-                                (segment * 2 + end) * kSampleWords * sizeof(uint32_t),
-                            kSampleWords);
-                    }
-                }
-                auto fillTicket = backend.submitCommandAsync(fill);
-                if (!repetition) {
-                    requireBackendError([&] {
-                        backend.unmapSparse(mappings[extent], std::move(*heaps[extent]));
-                    }, "sparse unmap accepted an undrained compute ticket");
-                    require(heaps[extent] && *heaps[extent],
-                            "rejected unmap consumed the caller's heap");
-                }
-                (void)fillTicket.wait();
-                std::fill_n(words + kGuardWords, kExtentBytes / sizeof(uint32_t),
-                            std::numeric_limits<uint32_t>::max());
-                std::fill_n(words + witnessStart, kWitnessBytes / sizeof(uint32_t),
-                            std::numeric_limits<uint32_t>::max());
-                auto copyTicket = backend.submitCommandAsync(copy);
-                (void)copyTicket.wait();
-                for (uint32_t segment = 0; segment < kSegments; ++segment) {
-                    const uint64_t begin = kGuardWords + offsets[segment] / sizeof(uint32_t);
-                    for (uint32_t index = 0; index < counts[segment]; ++index) {
-                        if (words[begin + index] != seeds[segment] + index)
-                            throw std::runtime_error("sparse full-extent readback mismatch at segment " +
-                                std::to_string(segment) + " word " + std::to_string(index));
-                    }
-                    if (witness < 0) continue;
-                    for (uint32_t end = 0; end < 2; ++end) {
-                        const uint32_t sampleOffset = end ? counts[segment] - kSampleWords : 0;
-                        const uint64_t sample = witnessStart + (segment * 2 + end) * kSampleWords;
-                        for (uint32_t index = 0; index < kSampleWords; ++index) {
-                            if (words[sample + index] != witnessSeeds[segment] + sampleOffset + index)
-                                throw std::runtime_error("resident witness changed at segment " +
-                                    std::to_string(segment));
-                        }
-                    }
-                }
-                for (uint64_t guard : {uint64_t{0}, middleGuard, finalGuard}) {
-                    for (uint32_t index = 0; index < kGuardWords; ++index)
-                        require(words[guard + index] == kCanary, "sparse churn readback canary changed");
-                }
-                // Both real GPU tickets are drained before any mapping or
-                // heap is released, matching the engine's cancellation drain.
-                if (witness >= 0) {
-                    backend.unmapSparse(mappings[witness], std::move(*heaps[witness]));
-                    heaps[witness].reset();
-                    // The heap stays resident until the queue reports the
-                    // unmap complete; the next repetition's map is ordered
-                    // behind it on the same queue.
-                    backend.drainSparseUnmaps();
-                }
-                witness = extent;
-                witnessSeeds = seeds;
-                awaitSparseRelease(backend, before.sparseResidentBytes + kExtentBytes);
-                require(backend.memoryStats().sparseResidentBytes ==
-                            before.sparseResidentBytes + kExtentBytes,
-                        "released churn heap remains resident");
-            } catch (const std::exception &error) {
-                throw std::runtime_error("sparse churn repetition " +
-                    std::to_string(repetition) + " extent " +
-                    std::to_string(extent) + ": " + error.what());
-            }
-        }
-        backend.unmapSparse(mappings[witness], std::move(*heaps[witness]));
-        heaps[witness].reset();
-        backend.drainSparseUnmaps();
-        awaitSparseRelease(backend, before.sparseResidentBytes);
-        require(backend.memoryStats().sparseResidentBytes == before.sparseResidentBytes,
-                "final churn heap remains resident");
-    }
-    awaitSparseRelease(backend, before.sparseResidentBytes, before.sparseVirtualBytes);
-    const auto after = backend.memoryStats();
-    require(after.allocatedBytes == before.allocatedBytes &&
-                after.sparseVirtualBytes == before.sparseVirtualBytes &&
-                after.sparseResidentBytes == before.sparseResidentBytes,
-            "sparse churn leaked buffer or heap accounting");
-    require(backend.submissionCount() == submissionsBefore + 2 * kRepetitions,
-            "sparse churn command count changed");
-    require(backend.healthy(), "sparse churn poisoned the backend");
-    std::cout << "PASS sparse extent churn repetitions=" << kRepetitions
-              << " pending_map_rollbacks=" << (kRepetitions + kRollbackPeriod - 1) / kRollbackPeriod
-              << " layers=" << layout.attentionLayers
-              << " mappings_per_extent=" << kSegments
-              << " extent_bytes=" << kExtentBytes << '\n';
-}
-
-// Releases are paced: a second unmap waits for the first, heaps stay resident
-// until completion, and a remap of the same range orders behind the unmap.
-void sparsePacedRelease(MetalBackend &backend) {
-    constexpr uint64_t kTile = MetalBackend::kPlacementSparsePageBytes;
-    constexpr uint32_t kExtents = 3;
-    constexpr uint32_t kTilesPerExtent = 4;
-    constexpr uint64_t kExtentBytes = kTilesPerExtent * kTile;
-    const auto before = backend.memoryStats();
-    MetalBuffer buffer = backend.allocatePlacementSparseBuffer(
-        kExtents * kExtentBytes, kTile, "sparse-paced");
-    std::array<std::optional<splash::metal::SparseHeap>, kExtents> heaps;
-    std::array<SparseMapping, kExtents> mappings;
-    auto mapExtent = [&](uint32_t extent) {
-        heaps[extent].emplace(backend.allocatePlacementHeap(
-            kExtentBytes, kTile, "sparse-paced-heap"));
-        mappings[extent] = {buffer, extent * kExtentBytes, kExtentBytes, 0};
-        backend.mapSparse(*heaps[extent], {&mappings[extent], 1});
-    };
-    for (uint32_t extent = 0; extent < kExtents; ++extent) mapExtent(extent);
-    MetalBuffer readback = backend.allocateBuffer(
-        kExtentBytes, BufferStorage::Shared, "sparse-paced-readback");
-    const uint32_t count = kExtentBytes / sizeof(uint32_t);
-    auto fillAndCheck = [&](uint32_t extent, uint32_t seed) {
-        ComputeDispatch fill;
-        fill.pipelineName = "sparse_fill_copy_u32";
-        fill.buffers = {{0, backend.view(buffer, extent * kExtentBytes, kExtentBytes)},
-                        {1, readback}};
-        fill.bytes = {{2, &count, sizeof(count)}, {3, &seed, sizeof(seed)}};
-        fill.threadgroups = {(uint64_t{count} + 255) / 256, 1, 1};
-        fill.threadsPerThreadgroup = {256, 1, 1};
-        (void)backend.submit(fill);
-        auto *words = static_cast<uint32_t *>(readback.contents());
-        for (uint32_t index = 0; index < count; ++index)
-            require(words[index] == seed + index, "paced-release extent readback mismatch");
-    };
-    for (uint32_t extent = 0; extent < kExtents; ++extent) fillAndCheck(extent, 17 + extent);
-    require(backend.memoryStats().sparseResidentBytes ==
-                before.sparseResidentBytes + kExtents * kExtentBytes,
-            "paced-release setup accounting disagrees");
-
-    // Two back-to-back releases: the second waits for the first internally.
-    backend.unmapSparse({&mappings[2], 1}, std::move(*heaps[2]));
-    heaps[2].reset();
-    backend.unmapSparse({&mappings[1], 1}, std::move(*heaps[1]));
-    heaps[1].reset();
-    require(backend.memoryStats().pendingSparseUnmaps <= 1,
-            "two sparse unmaps were outstanding at once");
-    backend.drainSparseUnmaps();
-    awaitSparseRelease(backend, before.sparseResidentBytes + kExtentBytes);
-    auto stats = backend.memoryStats();
-    require(stats.sparseResidentBytes == before.sparseResidentBytes + kExtentBytes &&
-                stats.pendingSparseUnmaps == 0 &&
-                stats.completedSparseUnmaps >= before.completedSparseUnmaps + 2,
-            "paced releases did not free both heaps after draining");
-
-    // Remap a released range while its unmap may still be in flight: the
-    // queue orders the new map behind the unmap, and the data is fresh.
-    mapExtent(1);
-    fillAndCheck(1, 4001);
-    fillAndCheck(0, 4000);
-    backend.unmapSparse({&mappings[1], 1}, std::move(*heaps[1]));
-    heaps[1].reset();
-    mapExtent(1);
-    fillAndCheck(1, 5001);
-    for (uint32_t extent = 0; extent < 2; ++extent) {
-        backend.unmapSparse({&mappings[extent], 1}, std::move(*heaps[extent]));
-        heaps[extent].reset();
-    }
-    backend.drainSparseUnmaps();
-    awaitSparseRelease(backend, before.sparseResidentBytes);
-    require(backend.memoryStats().sparseResidentBytes == before.sparseResidentBytes,
-            "paced-release cleanup leaked a heap");
-    readback = {};
-    for (SparseMapping &mapping : mappings) mapping.buffer = {};
-    buffer = {};
-    awaitSparseRelease(backend, before.sparseResidentBytes, before.sparseVirtualBytes);
-    require(backend.memoryStats().sparseVirtualBytes == before.sparseVirtualBytes &&
-                backend.healthy(),
-            "paced-release cleanup leaked address space or poisoned the backend");
-    std::cout << "PASS sparse paced release extents=" << kExtents
-              << " tile_bytes=" << kTile << '\n';
-}
-
 void run(const std::string &metallibPath) {
-    placementProbeFailures(metallibPath);
-    backendDeferredSubmission(metallibPath);
     NSData *libraryData = [NSData dataWithContentsOfFile:
         [NSString stringWithUTF8String:metallibPath.c_str()]];
     TemporaryMetallib temporary;
@@ -1275,13 +747,11 @@ void run(const std::string &metallibPath) {
             "threadgroup memory capability is insufficient");
     require(capabilities.maxThreadgroupWidth >= 256,
             "threadgroup thread capability is insufficient");
-    require(capabilities.supportsPlacementSparse,
-            "placement-sparse capability is missing");
     const auto probed = splash::metal::probeDeviceCapabilities();
     require(probed.deviceName == capabilities.deviceName &&
                 probed.appleGpuFamily == capabilities.appleGpuFamily &&
                 probed.macosVersion() == capabilities.macosVersion() &&
-                probed.supportsPlacementSparse && !probed.validationMessage(),
+                !probed.validationMessage(),
             "the device check read the device differently from the backend");
     require(backend.healthy(), "new backend is unhealthy");
     require(backend.submissionCount() == 0, "new backend has submissions");
@@ -1305,8 +775,6 @@ void run(const std::string &metallibPath) {
             "actual live allocation bytes were not tracked");
     require(stats.peakAllocatedBytes == actualAllocationBytes,
             "peak allocation bytes were not tracked");
-    require(stats.peakResidentBytes == actualAllocationBytes,
-            "dense-only physical peak was not tracked");
     require(stats.deviceCurrentAllocatedBytes >= actualAllocationBytes,
             "device allocation counter is smaller than backend allocations");
     require(stats.devicePeakAllocatedBytes >=
@@ -1478,117 +946,7 @@ void run(const std::string &metallibPath) {
     require(backend.memoryStats().allocatedBytes == 0,
             "private allocation release was not tracked");
 
-    constexpr uint64_t kSparseTileBytes =
-        MetalBackend::kPlacementSparsePageBytes;
-    static_assert(kSparseTileBytes == 64 * 1024,
-                  "KV mapping alignment must match the 64 KiB sparse tile");
-    requireBackendError(
-        [&] { (void)backend.allocatePlacementSparseBuffer(16 * 1024, 16 * 1024,
-                                                          "sparse-16k"); },
-        "a 16 KiB sparse tile was accepted");
-    MetalBuffer sparse = backend.allocatePlacementSparseBuffer(
-        kSparseTileBytes, kSparseTileBytes, "sparse-test");
-    require(sparse && sparse.contents() == nullptr,
-            "placement-sparse allocation is not private");
-    stats = backend.memoryStats();
-    require(stats.sparseVirtualBytes == kSparseTileBytes,
-            "sparse virtual bytes were not tracked");
-    require(stats.sparseTileBytes == kSparseTileBytes &&
-                stats.pendingSparseUnmaps == 0 &&
-                stats.completedSparseUnmaps == 0,
-            "sparse tile and unmap telemetry were not reported");
-    require(stats.sparseResidentBytes == 0,
-            "sparse virtual allocation committed physical memory");
-
-    auto heap = backend.allocatePlacementHeap(
-        kSparseTileBytes, kSparseTileBytes, "sparse-test-heap");
-    require(heap && heap.sizeBytes() >= kSparseTileBytes,
-            "placement heap allocation failed");
-    stats = backend.memoryStats();
-    require(stats.sparseResidentBytes == heap.sizeBytes(),
-            "sparse resident bytes were not tracked");
-    require(stats.peakSparseResidentBytes == heap.sizeBytes(),
-            "sparse resident peak was not tracked");
-    require(stats.peakResidentBytes ==
-                std::max(stats.peakAllocatedBytes, heap.sizeBytes()),
-            "disjoint dense/sparse peaks were added together");
-
-    SparseMapping sparseMapping{sparse, 0, kSparseTileBytes, 0};
-    backend.mapSparse(heap, {&sparseMapping, 1});
-    MetalBuffer readback = backend.allocateBuffer(
-        sizeof(uint32_t) * kElementCount, BufferStorage::Shared,
-        "sparse-readback");
-    stats = backend.memoryStats();
-    require(stats.peakResidentBytes ==
-                stats.allocatedBytes + stats.sparseResidentBytes,
-            "simultaneous dense/sparse physical peak was not tracked");
-    constexpr uint32_t kSparseValue = 91;
-    ComputeDispatch sparseDispatch;
-    sparseDispatch.pipelineName = "sparse_fill_copy_u32";
-    sparseDispatch.buffers = {{0, sparse}, {1, readback}};
-    sparseDispatch.bytes = {
-        {2, &kElementCount, sizeof(kElementCount)},
-        {3, &kSparseValue, sizeof(kSparseValue)}};
-    sparseDispatch.threadgroups = {1, 1, 1};
-    sparseDispatch.threadsPerThreadgroup = {kElementCount, 1, 1};
-    (void)backend.submit(sparseDispatch);
-    auto *readbackValues = static_cast<uint32_t *>(readback.contents());
-    for (uint32_t index = 0; index < kElementCount; ++index) {
-        require(readbackValues[index] == kSparseValue + index,
-                "sparse mapping was not visible to the compute queue");
-    }
-
-    // Tiles are counted from the start of the buffer, so a view with an
-    // offset can be neither mapped nor unmapped: its tile 0 is not the
-    // buffer's.
-    MetalBuffer wide = backend.allocatePlacementSparseBuffer(
-        2 * kSparseTileBytes, kSparseTileBytes, "sparse-view-test");
-    SparseMapping viewMapping{
-        backend.view(wide, kSparseTileBytes, kSparseTileBytes), 0,
-        kSparseTileBytes, 0};
-    requireBackendError(
-        [&] { backend.mapSparse(heap, {&viewMapping, 1}); },
-        "a sparse view with an offset was mapped");
-    requireBackendError(
-        [&] { backend.unmapSparse({&viewMapping, 1}, std::move(heap)); },
-        "a sparse view with an offset was unmapped");
-    require(heap && backend.healthy(),
-            "a rejected view mapping took the heap or poisoned the backend");
-    viewMapping.buffer = {};
-    wide = {};
-
-    // Unmapping is asynchronous: the backend owns the heap until the sparse
-    // queue reports completion, and the caller's handle is left empty.
-    requireBackendError(
-        [&] { backend.unmapSparse({&sparseMapping, 1}, splash::metal::SparseHeap{}); },
-        "unmap without the mapped heap was accepted");
-    require(heap && backend.memoryStats().sparseResidentBytes == heap.sizeBytes(),
-            "rejected unmap changed heap ownership or accounting");
-    backend.unmapSparse({&sparseMapping, 1}, std::move(heap));
-    require(!heap, "asynchronous unmap left the caller a heap handle");
-    require(backend.memoryStats().pendingSparseUnmaps <= 1,
-            "more than one sparse unmap was outstanding");
-    backend.drainSparseUnmaps();
-    awaitSparseRelease(backend, 0);
-    require(!backend.sparseUnmapPending(), "drained unmap remains pending");
-    stats = backend.memoryStats();
-    require(stats.sparseResidentBytes == 0 && stats.pendingSparseUnmaps == 0 &&
-                stats.completedSparseUnmaps == 1 &&
-                stats.pendingSparseUnmapSeconds == 0.0 &&
-                std::isfinite(stats.lastSparseUnmapSeconds) &&
-                stats.lastSparseUnmapSeconds >= 0.0 &&
-                stats.maxSparseUnmapSeconds >= stats.lastSparseUnmapSeconds,
-            "completed unmap did not release its heap or record its timing");
-    sparseDispatch = {};
-    sparseMapping.buffer = {};
-    sparse = {};
-    awaitSparseRelease(backend, 0, 0);
-    require(backend.memoryStats().sparseVirtualBytes == 0,
-            "released sparse address space remains tracked");
-
     sharedMemoryCompletionLifetime(backend);
-    sparsePacedRelease(backend);
-    sparseExtentChurn(backend);
     require(capabilities.gpuCoreCount >= 1 && capabilities.gpuCoreCount <= 4096,
             "GPU core count was not read from the IORegistry");
     require(capabilities.meetsMinimumMacos(),

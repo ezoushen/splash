@@ -34,7 +34,7 @@ public:
       resident_.at(index) = true;
     }
     if (additional)
-      ++mappedExtents;
+      ++allocatedExtents;
     return true;
   }
   bool releaseBackingForPage(uint32_t page) override {
@@ -44,7 +44,7 @@ public:
       resident_.at(index) = false;
     }
     std::this_thread::sleep_for(releaseTime);
-    ++unmappedExtents;
+    ++releasedExtents;
     return true;
   }
   uint32_t extentFirstPage(uint32_t page) const override {
@@ -59,8 +59,8 @@ public:
       count += value;
     return count;
   }
-  uint32_t mappedExtents = 0;
-  uint32_t unmappedExtents = 0;
+  uint32_t allocatedExtents = 0;
+  uint32_t releasedExtents = 0;
   // How long releasing one extent takes.
   std::chrono::milliseconds releaseTime{0};
 private:
@@ -215,7 +215,7 @@ void testFragmentedColdKvPrecedesNewerState() {
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
               resources.snapshot().kvCache.blocks == 3 &&
               resources.snapshot().stateCache.entries == 1 &&
-              backing.unmappedExtents == 0,
+              backing.releasedExtents == 0,
           "physical-byte preference evicted newer state before cold KV");
 }
 
@@ -268,15 +268,15 @@ void testReplacementPreservesBackingEvenWhenExtentBecomesEmpty() {
   const auto reclaimed = resources.reclaimOne(CacheReclaimMode::ReuseBacking);
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
               resources.snapshot().kvCache.blocks == 0 &&
-              backing.residentPages() == 4 && backing.unmappedExtents == 0,
-          "replacement unmapped the newly reusable extent");
+              backing.residentPages() == 4 && backing.releasedExtents == 0,
+          "replacement released the newly reusable extent");
   resources.beginRequest(2);
   require(resources.ensureTokens(2, 128).granted() &&
-              backing.mappedExtents == 1 && backing.unmappedExtents == 0,
-          "replacement unnecessarily remapped reusable backing");
+              backing.allocatedExtents == 1 && backing.releasedExtents == 0,
+          "replacement allocated reusable backing again");
   resources.endRequest(2);
   require(resources.reclaimCache(0, false) == 4 * 4096 &&
-              backing.residentPages() == 0 && backing.unmappedExtents == 1,
+              backing.residentPages() == 0 && backing.releasedExtents == 1,
           "zero-target physical shrink did not release the empty extent");
 }
 
@@ -304,12 +304,12 @@ void testReclaimPassReleasesEveryEmptyExtent() {
 
   require(resources.reclaimCache(uint64_t{empty} * 4 * 4096, false) ==
                   uint64_t{empty} * 4 * 4096 &&
-              backing.unmappedExtents == empty &&
+              backing.releasedExtents == empty &&
               resources.snapshot().pool.reclaimableExtents == 0 &&
               resources.snapshot().kvCache.blocks == 1,
           "a pass did not release every empty extent before evicting");
   require(resources.reclaimCache(1ULL << 40, false) == 4 * 4096 &&
-              backing.unmappedExtents == empty + 1 &&
+              backing.releasedExtents == empty + 1 &&
               backing.residentPages() == 0 &&
               resources.snapshot().kvCache.blocks == 0,
           "a pass did not evict the cache and release its extent");
@@ -337,7 +337,7 @@ void testReleasePassTimeCoversTheWholePass() {
           "release time setup geometry changed");
   static_cast<void>(
       resources.reclaimCache(std::numeric_limits<uint64_t>::max(), true));
-  require(backing.unmappedExtents == extents &&
+  require(backing.releasedExtents == extents &&
               resources.snapshot().pool.extentReleaseMaxMilliseconds >=
                   2.0 * extents,
           "the release time is not the whole pass's");

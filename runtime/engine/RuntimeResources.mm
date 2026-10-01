@@ -578,12 +578,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh current residency after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();
-  if (memory.sparseResidentBytes >
-      std::numeric_limits<uint64_t>::max() - memory.allocatedBytes) {
-    throw std::overflow_error("backend memory accounting overflows");
-  }
-  report.backendAllocatedBytes =
-      memory.allocatedBytes + memory.sparseResidentBytes;
+  report.backendAllocatedBytes = memory.allocatedBytes;
   report.deviceCurrentAllocatedBytes = memory.deviceCurrentAllocatedBytes;
   report.devicePeakAllocatedBytes = memory.devicePeakAllocatedBytes;
   // A capacity-limited warmup can roll back a partial allocation before it
@@ -592,12 +587,12 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   const auto &budget = memoryPlan_.breakdown();
   const uint64_t reserves =
       budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes;
-  if (memory.peakResidentBytes >
+  if (memory.peakAllocatedBytes >
       std::numeric_limits<uint64_t>::max() - reserves) {
     throw std::overflow_error("warmup memory estimate overflows");
   }
   report.estimatedWarmupPeakBytes =
-      std::max(estimatedWarmupPeakBytes, memory.peakResidentBytes + reserves);
+      std::max(estimatedWarmupPeakBytes, memory.peakAllocatedBytes + reserves);
   return report;
 }
 

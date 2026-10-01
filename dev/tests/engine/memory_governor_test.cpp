@@ -18,7 +18,7 @@ MetalMemoryStats statistics;
 } // namespace
 
 struct MetalBackend::Impl {};
-MetalBackend::MetalBackend(std::string, double, uint32_t, double)
+MetalBackend::MetalBackend(std::string, double, double)
     : impl_(std::make_unique<Impl>()) {}
 MetalBackend::~MetalBackend() = default;
 MetalMemoryStats MetalBackend::memoryStats() const noexcept {
@@ -130,11 +130,10 @@ DeviceCapabilities mac(uint64_t physicalGiB, uint64_t numerator,
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  device.supportsPlacementSparse = true;
   return device;
 }
 
-// Grows one request's KV extent by extent, as PageStorage maps it, and
+// Grows one request's KV extent by extent, as PageStorage allocates it, and
 // returns the pages the governor granted.
 uint32_t grantKvPages(MemoryGovernor &governor,
                       const EngineMemoryBreakdown &budget) {
@@ -146,7 +145,7 @@ uint32_t grantKvPages(MemoryGovernor &governor,
     auto reservation = governor.tryReserve(bytes);
     if (!reservation)
       break;
-    metal::statistics.sparseResidentBytes += bytes;
+    metal::statistics.allocatedBytes += bytes;
     metal::statistics.deviceCurrentAllocatedBytes += bytes;
     reservation->commit();
     granted += pages;

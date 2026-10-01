@@ -161,13 +161,10 @@ MemoryGovernor::observedResidentBytes(bool refreshDevice) const noexcept {
       : backend_.memoryStats();
   // The backend's buffers are charged in full, the rest of the device's
   // footprint only where it exceeds the untracked reserve.
-  uint64_t accounted = memory.allocatedBytes;
-  for (const uint64_t bytes :
-       {memory.sparseResidentBytes, untrackedReserveBytes_}) {
-    accounted = bytes <= std::numeric_limits<uint64_t>::max() - accounted
-        ? accounted + bytes
-        : std::numeric_limits<uint64_t>::max();
-  }
+  const uint64_t limit = std::numeric_limits<uint64_t>::max();
+  const uint64_t accounted = untrackedReserveBytes_ <= limit - memory.allocatedBytes
+      ? memory.allocatedBytes + untrackedReserveBytes_
+      : limit;
   return std::max(accounted, memory.deviceCurrentAllocatedBytes);
 }
 
@@ -247,7 +244,7 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
     try {
       allocate();
     } catch (const metal::MetalAllocationError &error) {
-      // Host headroom is an estimate; the driver can still deny placement.
+      // Host headroom is an estimate; the driver can still deny the allocation.
       return error.failure();
     }
     reservation->commit();

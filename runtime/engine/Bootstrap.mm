@@ -114,7 +114,8 @@ RuntimeBootstrap::RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
       nativeLoop_(std::move(nativeLoop)), report_(std::move(report)) {}
 
 RuntimeBootstrap::~RuntimeBootstrap() {
-  // Cancel unsubmitted dependency waits before the loop destroys its tickets.
+  // Refuse new commands before the loop, the model and the resources they
+  // reach are destroyed.
   resources_->backend().stop();
 }
 

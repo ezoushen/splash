@@ -212,7 +212,6 @@ DeviceCapabilities device() {
   result.maxThreadgroupMemoryBytes = 32 * 1024;
   result.maxThreadgroupWidth = 1024;
   result.hasUnifiedMemory = true;
-  result.supportsPlacementSparse = true;
   return result;
 }
 

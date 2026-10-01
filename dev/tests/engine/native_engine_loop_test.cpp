@@ -689,7 +689,7 @@ void testCommandWatchdogAndPendingHealthWake() {
   KvPool pool(backing);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
-  executor.pendingHealth = true; // A sparse unmap can outlive all requests.
+  executor.pendingHealth = true; // A command can outlive all requests.
   engine::NativeRuntime loop({}, resources, executor,
       [](std::span<const uint8_t>) {}, [] { return std::string("{}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 0.0; }});

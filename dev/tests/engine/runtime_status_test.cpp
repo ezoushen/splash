@@ -36,7 +36,6 @@ EngineMemoryPlan plan() {
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  device.supportsPlacementSparse = true;
   return requireEngineMemoryPlan(
       device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
 }
@@ -129,22 +128,8 @@ void testCleanRuntimeStatus() {
   metal::MetalMemoryStats metal;
   metal.allocatedBytes = 4 * kGiB;
   metal.peakAllocatedBytes = metal.allocatedBytes;
-  metal.sparseVirtualBytes = memoryPlan.breakdown().kvVirtualBytes;
-  metal.sparseResidentBytes = memoryPlan.breakdown().kvExtentBytes;
-  metal.peakSparseResidentBytes = metal.sparseResidentBytes;
-  metal.peakResidentBytes = metal.allocatedBytes + metal.sparseResidentBytes;
   metal.deviceCurrentAllocatedBytes = metal.allocatedBytes;
   metal.devicePeakAllocatedBytes = metal.allocatedBytes;
-  metal.sparseTileBytes = 65536;
-  metal.pendingSparseUnmaps = 1;
-  metal.pendingSparseUnmapSeconds = 0.0125;
-  metal.completedSparseUnmaps = 7;
-  metal.lastSparseUnmapSeconds = 0.05;
-  metal.maxSparseUnmapSeconds = 0.3;
-  metal.sparseMapWaitEvent = 149;
-  metal.pendingSparseMapWaitSeconds = 0.5;
-  metal.lastSparseMapWaitSeconds = 0.25;
-  metal.maxSparseMapWaitSeconds = 0.75;
 
   MemoryGovernorSnapshot governor;
   governor.limitBytes = memoryPlan.breakdown().hardBudgetBytes;

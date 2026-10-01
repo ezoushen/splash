@@ -29,7 +29,6 @@ EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  device.supportsPlacementSparse = true;
   ModelMemoryProfile model =
       test::modelMemoryProfile(2 * kGiB, 1 * kGiB, visionBytes);
   model.footprint.kvStagingBytes = kvStagingBytes;
@@ -175,7 +174,6 @@ void testWarmupDeviationExcludesReserves() {
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  device.supportsPlacementSparse = true;
   for (const uint64_t weightsMiB : {16'589, 12'288, 9'216, 6'144}) {
     for (const uint64_t untrackedMiB : {100, 300}) {
       const auto memoryPlan = requireEngineMemoryPlan(

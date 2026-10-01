@@ -294,7 +294,7 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages) {
   }
   KvPageAcquisition acquired = pool_.acquirePages(count, false);
   if (!acquired.granted()) {
-    // The pool could not map backing for its free pages. Demoted pages carry
+    // The pool could not allocate backing for its free pages. Demoted pages carry
     // their backing back: wait once those on their way cover what the free
     // backed pages do not, and until then reclaim more.
     const uint32_t missing = count - std::min(count, pool_.freeResidentPageCount());

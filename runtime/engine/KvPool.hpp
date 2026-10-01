@@ -65,7 +65,7 @@ public:
   [[nodiscard]] uint32_t pageCount() const noexcept;
   [[nodiscard]] uint64_t bytesPerPage() const noexcept;
   [[nodiscard]] uint32_t freePageCount() const noexcept;
-  // Free pages whose backing is mapped; acquisition hands these out first.
+  // Free pages whose backing is allocated; acquisition hands these out first.
   [[nodiscard]] uint32_t freeResidentPageCount() const noexcept;
   [[nodiscard]] uint32_t activeReferences(uint32_t page) const;
   [[nodiscard]] bool pageFree(uint32_t page) const;

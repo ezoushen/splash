@@ -259,7 +259,7 @@ void testFullestExtentFillsFirstSoColdExtentsDrain() {
     require(again.granted() && again.pages.front() / 4 == 2,
             "allocation did not continue with the fullest extent");
 
-    // Its last page going cold empties the extent so it can be unmapped.
+    // Its last page going cold empties the extent so it can be released.
     release(pool, {3});
     require(pool.reclaimableExtentCount() == 1 &&
                 pool.reclaimEmptyExtents(false) == 1 &&

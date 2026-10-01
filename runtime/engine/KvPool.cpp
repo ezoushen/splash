@@ -72,21 +72,21 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
       throw std::logic_error("free KV lists disagree with accounting");
     const uint32_t page = freeUnbacked_.head;
     const uint32_t extent = pages_[page].extent;
-    metal::AllocationResult mapped = false;
+    metal::AllocationResult allocated = false;
     const auto growth = std::chrono::steady_clock::now();
     try {
-      mapped = backing_.ensureResident(page);
+      allocated = backing_.ensureResident(page);
     } catch (...) {
       returnSelected();
       throw;
     }
-    if (!mapped) {
+    if (!allocated) {
       // The extents this acquisition allocated stay resident and
       // reclaimable: the budget admitted them, and the retry that follows a
       // reclaim takes their pages first instead of allocating them again.
       // A reclaim pass returns them if they stay unused.
       returnSelected();
-      return {{}, KvPageAcquireFailure::PhysicalCapacity, mapped.failure};
+      return {{}, KvPageAcquireFailure::PhysicalCapacity, allocated.failure};
     }
     ++extentAllocations_;
     extentAllocateMaxMilliseconds_ =
