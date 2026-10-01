@@ -2462,7 +2462,7 @@ def main():
         # main owns this process. Keep stop signals idempotent through child
         # cleanup and interpreter teardown, including after this function
         # returns, except that a second Ctrl+C during cleanup stops the engine
-        # without waiting for its paced release of memory.
+        # without waiting for its graceful exit.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(
             signal.SIGINT,

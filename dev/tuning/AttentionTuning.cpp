@@ -1,5 +1,6 @@
 #include "tuning/AttentionTuning.hpp"
 
+#include "tuning/HostKvExtents.hpp"
 #include "tuning/LinearNumerics.hpp"
 
 #include <algorithm>
@@ -7,8 +8,10 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 namespace splash::ops::tuning {
 namespace {
@@ -21,7 +24,7 @@ constexpr uint32_t kPageRows = kv::kPageTokens;
 constexpr uint32_t kVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
 
 enum class Tensor : uint32_t {
-  Keys, KeyScales, Values, ValueScales, ChunkKeys, ChunkValues,
+  Extents, ChunkKeys, ChunkValues,
   Queries, Output, Reference, Partials, Statistics, Table0, Table1, Table2,
   Table3, Count
 };
@@ -39,7 +42,9 @@ struct FixturePlan final {
   uint32_t lanes = 0;
   uint32_t rows = 0;
   uint32_t stride = 0;
-  uint32_t physicalPages = 0;
+  // Pages the history may use and the extents that hold them.
+  uint32_t poolPages = 0;
+  HostKvExtents::Geometry pool;
   std::array<uint32_t, kMaximumLanes> histories{};
   std::array<uint32_t, kMaximumLanes> pages{};
   std::array<uint64_t, kTensorCount> sizes{};
@@ -98,17 +103,15 @@ template <typename Workload> FixturePlan fixturePlan(Workload workload) {
     plan.pages[lane] = uint32_t((tokens + kPageRows - 1) / kPageRows);
     pages += plan.pages[lane];
     plan.size(static_cast<Tensor>(tensorIndex(Tensor::Table0) + lane),
-              uint64_t{plan.pages[lane]} * sizeof(uint32_t));
+              uint64_t{plan.pages[lane]} * sizeof(SplashKvPage));
   }
-  // An odd physical pool permits an injective stride-two page permutation.
-  // Only one/two spare pages are needed, even for long exact histories.
-  plan.physicalPages = pages + 1 + (pages % 2);
-  const uint64_t dataBytes = plan.physicalPages * plan.layout().dataBytesPerLayerPage();
-  const uint64_t scaleBytes = plan.physicalPages * plan.layout().scaleBytesPerLayerPage();
-  plan.size(Tensor::Keys, dataBytes);
-  plan.size(Tensor::Values, dataBytes);
-  plan.size(Tensor::KeyScales, scaleBytes);
-  plan.size(Tensor::ValueScales, scaleBytes);
+  // An odd pool permits an injective stride-two page permutation. Only
+  // one/two spare pages are needed, even for long exact histories.
+  plan.poolPages = pages + 1 + (pages % 2);
+  plan.pool = HostKvExtents::aligned(plan.layout(), plan.poolPages);
+  plan.size(Tensor::Extents,
+            uint64_t{plan.pool.extents} *
+                HostKvExtents::extentStride(plan.layout(), plan.pool.extentPages));
   const uint64_t chunks = uint64_t{plan.lanes} * plan.shape.kvHeads *
                            plan.stride * kDimension * sizeof(uint16_t);
   const uint64_t queries = uint64_t{plan.lanes} * plan.shape.queryHeads *
@@ -137,25 +140,34 @@ struct Interrupted final {
   MeasurementStatus status;
 };
 
+// The fixture's extents are views of its one buffer, which its residency
+// keeps resident: the kernels reach them only through page entries.
 class Fixture final {
 public:
   Fixture(metal::MetalBackend &backend, FixturePlan plan)
       : plan_(std::move(plan)), base_(backend.allocateBuffer(
             plan_.bytes, metal::BufferStorage::Shared, "attention-tuning-fixture")) {
+    backend.keepResident(base_);
     uint64_t offset = 0;
     for (size_t i = 0; i < plan_.sizes.size(); ++i) {
       if (plan_.sizes[i]) buffers_[i] = backend.view(base_, offset, plan_.sizes[i]);
       offset += aligned(plan_.sizes[i]);
     }
-    layer_ = {get(Tensor::Keys), get(Tensor::KeyScales), get(Tensor::Values),
-               get(Tensor::ValueScales), plan_.shape.format};
+    const uint64_t stride =
+        HostKvExtents::extentStride(plan_.layout(), plan_.pool.extentPages);
+    std::vector<HostKvExtents::Extent> extents;
+    for (uint32_t extent = 0; extent < plan_.pool.extents; ++extent)
+      extents.push_back({data<std::byte>(Tensor::Extents) + extent * stride,
+                         get(Tensor::Extents).gpuAddress() + extent * stride});
+    pages_ = std::make_unique<HostKvExtents>(plan_.layout(), plan_.pool.extentPages,
+                                                   std::move(extents));
+    layer_ = pages_->layer(0);
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
       tables_[lane] = get(static_cast<Tensor>(tensorIndex(Tensor::Table0) + lane));
       stores_[lane] = {plan_.histories[lane], plan_.rows, plan_.stride,
-                        plan_.pages[lane], plan_.physicalPages, 0, 0, 0};
+                        plan_.pages[lane], {}, 0, 0};
       attention_[lane] = kv::q8VerifyAttentionParams(
-          plan_.histories[lane], kVerifyRows, plan_.stride, plan_.pages[lane],
-          plan_.physicalPages);
+          plan_.histories[lane], kVerifyRows, plan_.stride, plan_.pages[lane]);
     }
     for (uint32_t lane = plan_.lanes; lane < kMaximumLanes; ++lane) {
       tables_[lane] = tables_[0];
@@ -168,38 +180,46 @@ public:
   // sweep control callback; no GPU command has been submitted at this point.
   bool initialize(const MeasurementStop &stop) {
     std::memset(base_.contents(), 0, plan_.bytes);
-    auto *keys = data<int8_t>(Tensor::Keys);
-    auto *values = data<int8_t>(Tensor::Values);
-    auto *keyScales = data<float>(Tensor::KeyScales);
-    auto *valueScales = data<float>(Tensor::ValueScales);
     auto *chunkKeys = data<uint16_t>(Tensor::ChunkKeys);
     auto *chunkValues = data<uint16_t>(Tensor::ChunkValues);
     auto *queries = data<uint16_t>(Tensor::Queries);
     uint32_t firstPage = 0;
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
-      auto *table = static_cast<uint32_t *>(tables_[lane].contents());
+      pageIds_[lane].resize(plan_.pages[lane]);
       for (uint32_t page = 0; page < plan_.pages[lane]; ++page)
-        table[page] = (2 * (firstPage + page) + 1) % plan_.physicalPages;
+        pageIds_[lane][page] = (2 * (firstPage + page) + 1) % plan_.poolPages;
+      pages_->writeTable(pageIds_[lane], tables_[lane].contents());
       firstPage += plan_.pages[lane];
       for (uint32_t token = 0; token < plan_.histories[lane]; ++token) {
         if (token % 256 == 0 && stop && stop()) return false;
         for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {
-          const uint64_t scale = scaleIndex(lane, head, token);
           if (plan_.shape.format == kv::Format::Int8) {
-            keyScales[scale] = 0.006f;
-            valueScales[scale] = 0.007f;
+            *scale(lane, SPLASH_KV_KEY_SCALES, head, token) = 0.006f;
+            *scale(lane, SPLASH_KV_VALUE_SCALES, head, token) = 0.007f;
           }
-          for (uint32_t d = 0; d < kDimension; ++d) {
-            const int key = int((uint64_t{token} * 37 + head * 101 + d * 17 +
-                     uint64_t{token} * d * 3 + lane * 7) % 255) - 127;
-            const int value = int((uint64_t{token} * 53 + head * 79 + d * 29 +
-                     uint64_t{token} * d * 5 + lane * 19) % 255) - 127;
-            if (plan_.shape.format == kv::Format::Int8) {
-              keys[scale * kDimension + d] = key;
-              values[valueIndex(scale, d)] = value;
-            } else {
-              data<uint16_t>(Tensor::Keys)[scale * kDimension + d] = floatToBf16(key * 0.006f);
-              data<uint16_t>(Tensor::Values)[valueIndex(scale, d)] = floatToBf16(value * 0.007f);
+          const auto key = [&](uint32_t d) {
+            return int((uint64_t{token} * 37 + head * 101 + d * 17 +
+                        uint64_t{token} * d * 3 + lane * 7) % 255) - 127;
+          };
+          const auto value = [&](uint32_t d) {
+            return int((uint64_t{token} * 53 + head * 79 + d * 29 +
+                        uint64_t{token} * d * 5 + lane * 19) % 255) - 127;
+          };
+          // A key row is contiguous; a value column steps over the page's
+          // tokens.
+          if (plan_.shape.format == kv::Format::Int8) {
+            auto *keys = element<int8_t>(lane, SPLASH_KV_KEYS, head, token, 0);
+            auto *values = element<int8_t>(lane, SPLASH_KV_VALUES, head, token, 0);
+            for (uint32_t d = 0; d < kDimension; ++d) {
+              keys[d] = key(d);
+              values[d * kPageRows] = value(d);
+            }
+          } else {
+            auto *keys = element<uint16_t>(lane, SPLASH_KV_KEYS, head, token, 0);
+            auto *values = element<uint16_t>(lane, SPLASH_KV_VALUES, head, token, 0);
+            for (uint32_t d = 0; d < kDimension; ++d) {
+              keys[d] = floatToBf16(key(d) * 0.006f);
+              values[d * kPageRows] = floatToBf16(value(d) * 0.007f);
             }
           }
         }
@@ -264,25 +284,22 @@ public:
       std::memset(get(tensor).contents(), 0, get(tensor).sizeBytes());
     // Only current-row cache slots are mutated by the production store.
     // Restore those exact slots; immutable history, input and tables remain.
-    auto *keys = data<int8_t>(Tensor::Keys);
-    auto *values = data<int8_t>(Tensor::Values);
-    auto *keyScales = data<float>(Tensor::KeyScales);
-    auto *valueScales = data<float>(Tensor::ValueScales);
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane)
       for (uint32_t row = 0; row < plan_.rows; ++row)
         for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {
-          const uint64_t scale = scaleIndex(lane, head, plan_.histories[lane] + row);
+          const uint32_t token = plan_.histories[lane] + row;
           if (plan_.shape.format == kv::Format::Int8) {
-            keyScales[scale] = 0;
-            valueScales[scale] = 0;
-            std::memset(keys + scale * kDimension, 0, kDimension);
-            for (uint32_t d = 0; d < kDimension; ++d)
-              values[valueIndex(scale, d)] = 0;
+            *scale(lane, SPLASH_KV_KEY_SCALES, head, token) = 0;
+            *scale(lane, SPLASH_KV_VALUE_SCALES, head, token) = 0;
+            for (uint32_t d = 0; d < kDimension; ++d) {
+              *element<int8_t>(lane, SPLASH_KV_KEYS, head, token, d) = 0;
+              *element<int8_t>(lane, SPLASH_KV_VALUES, head, token, d) = 0;
+            }
           } else {
-            std::memset(data<uint16_t>(Tensor::Keys) + scale * kDimension,
-                        0, kDimension * sizeof(uint16_t));
-            for (uint32_t d = 0; d < kDimension; ++d)
-              data<uint16_t>(Tensor::Values)[valueIndex(scale, d)] = 0;
+            for (uint32_t d = 0; d < kDimension; ++d) {
+              *element<uint16_t>(lane, SPLASH_KV_KEYS, head, token, d) = 0;
+              *element<uint16_t>(lane, SPLASH_KV_VALUES, head, token, d) = 0;
+            }
           }
         }
   }
@@ -321,17 +338,25 @@ private:
   template <typename T> T *data(Tensor tensor) const {
     return static_cast<T *>(get(tensor).contents());
   }
-  uint64_t scaleIndex(uint32_t lane, uint32_t head, uint32_t token) const {
-    const auto *table = static_cast<const uint32_t *>(tables_[lane].contents());
-    return (uint64_t{table[token / kPageRows]} * plan_.shape.kvHeads + head) *
-               kPageRows + token % kPageRows;
+  // A lane's slot of a token in its page: keys token-major, values
+  // dimension-major, one scale per (head, token) (q8_paging.h).
+  template <typename T>
+  T *element(uint32_t lane, uint32_t tensor, uint32_t head, uint32_t token,
+             uint32_t dimension) const {
+    const uint64_t index = tensor == SPLASH_KV_KEYS
+        ? (uint64_t{head} * kPageRows + token % kPageRows) * kDimension + dimension
+        : (uint64_t{head} * kDimension + dimension) * kPageRows + token % kPageRows;
+    return pages_->slab<T>(0, tensor, pageIds_[lane][token / kPageRows]) + index;
   }
-  static uint64_t valueIndex(uint64_t scale, uint32_t dimension) {
-    return (scale / kPageRows * kDimension + dimension) * kPageRows + scale % kPageRows;
+  float *scale(uint32_t lane, uint32_t tensor, uint32_t head, uint32_t token) const {
+    return pages_->slab<float>(0, tensor, pageIds_[lane][token / kPageRows]) +
+           head * kPageRows + token % kPageRows;
   }
   FixturePlan plan_;
   metal::MetalBuffer base_;
   std::array<metal::MetalBuffer, kTensorCount> buffers_{};
+  std::unique_ptr<HostKvExtents> pages_;
+  std::array<std::vector<uint32_t>, kMaximumLanes> pageIds_;
   kv::LayerStorage layer_;
   std::array<metal::MetalBuffer, kMaximumLanes> tables_{};
   std::array<kv::Q8ChunkedPrefillParams, kMaximumLanes> stores_{};

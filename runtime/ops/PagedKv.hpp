@@ -1,8 +1,10 @@
 #pragma once
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/KvExtent.h"
 #include "metal/MetalBackend.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -37,8 +39,8 @@ enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
   return "invalid";
 }
 
-// Physical backing for the engine's page pool. Implementations provide Metal
-// storage or deterministic test storage.
+// Physical backing for the engine's page pool, in extents of whole pages.
+// Implementations provide Metal storage or deterministic test storage.
 class Backing {
 public:
   virtual ~Backing() = default;
@@ -57,11 +59,10 @@ public:
   virtual void awaitRelease() {}
 };
 
+// One attention layer of the pool as kernels address it: where its region
+// sits in every extent, and the format of its pages.
 struct LayerStorage final {
-  metal::MetalBuffer keyData;
-  metal::MetalBuffer keyScales;
-  metal::MetalBuffer valueData;
-  metal::MetalBuffer valueScales;
+  SplashKvLayer kv{};
   Format format = Format::Int8;
 };
 
@@ -73,7 +74,10 @@ inline constexpr uint32_t kMaximumPhysicalTokens =
     SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS;
 inline constexpr int32_t kQuantizedMinimum = -127;
 inline constexpr int32_t kQuantizedMaximum = 127;
-inline constexpr uint64_t kSparseMappingAlignmentBytes = 64 * 1024;
+// Every tensor region of an extent starts on this boundary. The attention
+// kernels were tuned on it, and regions aligned to less cost Apple10's 35B
+// verify kernel a fixed ~25 µs per dispatch.
+inline constexpr uint64_t kExtentRegionAlignmentBytes = 64 * 1024;
 inline constexpr uint64_t kAllocationExtentTargetBytes =
     SPLASH_ALLOCATION_EXTENT_TARGET_BYTES;
 
@@ -100,11 +104,12 @@ namespace detail {
   return left && right ? left / gcd(left, right) * right : 0;
 }
 
-[[nodiscard]] constexpr uint64_t pagesForAlignedMapping(
+// Pages whose bytes of one tensor fill whole region alignment units.
+[[nodiscard]] constexpr uint64_t pagesForAlignedRegion(
     uint64_t bytesPerPage) noexcept {
   return bytesPerPage
-             ? kSparseMappingAlignmentBytes /
-                   gcd(kSparseMappingAlignmentBytes, bytesPerPage)
+             ? kExtentRegionAlignmentBytes /
+                   gcd(kExtentRegionAlignmentBytes, bytesPerPage)
              : 0;
 }
 
@@ -144,30 +149,65 @@ struct Layout final {
     return uint64_t{attentionLayers} * bytesPerLayerPage();
   }
 
-  // Metal sparse mappings must begin and end on 64-KiB tile boundaries. The
-  // INT8 scale buffers are the tightest constraint: 4 heads require 128
-  // pages and 2 heads require 256. BF16 needs only 1 or 2 pages. This is physical
-  // allocation geometry; prefix matching remains Page32 in both cases.
-  [[nodiscard]] constexpr uint32_t sparseMappingBatchPages() const noexcept {
+  // An extent holds a whole number of these pages, so that every tensor
+  // region starts 64 KiB-aligned. The INT8 scales are the tightest
+  // constraint: 4 heads require 128 pages and 2 heads require 256. BF16
+  // needs only 1 or 2 pages. This is physical allocation geometry; prefix
+  // matching remains Page32 in both cases.
+  [[nodiscard]] constexpr uint32_t extentAlignmentPages() const noexcept {
     if (format == Format::BFloat16)
       return static_cast<uint32_t>(
-          detail::pagesForAlignedMapping(dataBytesPerLayerPage()));
+          detail::pagesForAlignedRegion(dataBytesPerLayerPage()));
     return static_cast<uint32_t>(detail::lcm(
-        detail::pagesForAlignedMapping(dataBytesPerLayerPage()),
-        detail::pagesForAlignedMapping(scaleBytesPerLayerPage())));
+        detail::pagesForAlignedRegion(dataBytesPerLayerPage()),
+        detail::pagesForAlignedRegion(scaleBytesPerLayerPage())));
   }
 
-  [[nodiscard]] constexpr uint64_t sparseMappingBatchBytes() const noexcept {
-    return uint64_t{sparseMappingBatchPages()} * bytesPerModelPage();
-  }
-
-  [[nodiscard]] constexpr uint32_t backingExtentPages() const noexcept {
-    const uint64_t unit = sparseMappingBatchBytes();
+  // Extents hold whole alignment units, between half and one and a half
+  // times the allocation target; a unit larger than that is an extent on its
+  // own. These are the smallest and the largest sizes.
+  [[nodiscard]] constexpr uint32_t minimumExtentPages() const noexcept {
+    const uint64_t unit = uint64_t{extentAlignmentPages()} * bytesPerModelPage();
     if (!unit)
       return 0;
-    return static_cast<uint32_t>(
-        ((kAllocationExtentTargetBytes + unit - 1) / unit) *
-        sparseMappingBatchPages());
+    const uint64_t units =
+        std::max<uint64_t>(1, (kAllocationExtentTargetBytes / 2 + unit - 1) / unit);
+    return static_cast<uint32_t>(units * extentAlignmentPages());
+  }
+  [[nodiscard]] constexpr uint32_t maximumExtentPages() const noexcept {
+    const uint64_t unit = uint64_t{extentAlignmentPages()} * bytesPerModelPage();
+    if (!unit)
+      return 0;
+    const uint64_t units = kAllocationExtentTargetBytes * 3 / 2 / unit;
+    return std::max(static_cast<uint32_t>(units * extentAlignmentPages()),
+                    minimumExtentPages());
+  }
+
+  // The extent size of a pool that holds `pages` pages: all of a pool's
+  // extents hold the same number of pages, because kernels find a layer's
+  // region from that number. Of the sizes above that fit the pool, the one
+  // that leaves the fewest pages over, and the one nearest the target on a
+  // tie. Zero when the pool holds fewer pages than the smallest size.
+  [[nodiscard]] constexpr uint32_t extentPagesFor(uint64_t pages) const noexcept {
+    const uint32_t step = extentAlignmentPages();
+    const uint64_t smallest = minimumExtentPages();
+    if (!smallest || pages < smallest)
+      return 0;
+    const uint64_t largest = std::min<uint64_t>(maximumExtentPages(), pages);
+    uint64_t best = 0, bestLeft = 0, bestDistance = 0;
+    for (uint64_t extent = smallest; extent <= largest; extent += step) {
+      const uint64_t bytes = extent * bytesPerModelPage();
+      const uint64_t distance = bytes > kAllocationExtentTargetBytes
+                                    ? bytes - kAllocationExtentTargetBytes
+                                    : kAllocationExtentTargetBytes - bytes;
+      if (!best || pages % extent < bestLeft ||
+          (pages % extent == bestLeft && distance < bestDistance)) {
+        best = extent;
+        bestLeft = pages % extent;
+        bestDistance = distance;
+      }
+    }
+    return static_cast<uint32_t>(best);
   }
 
   [[nodiscard]] constexpr StorageByteCounts

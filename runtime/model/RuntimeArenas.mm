@@ -278,7 +278,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::TopPartialValues, selectorWorkspace.partialValuesBytes);
   put(DecodeTensor::ProposalProbs, selectorWorkspace.proposalProbabilitiesBytes);
   put(DecodeTensor::ProposedTokens, bytesFor<uint32_t>(kDraftProposalTokens));
-  put(DecodeTensor::PageTable, bytesFor<uint32_t>(kMaximumPageTableEntries));
+  put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
   put(DecodeTensor::VerifyPackedBase,
       uint64_t{geometry.target.stateLayout.layers} *
           gdnPackedStride(geometry));

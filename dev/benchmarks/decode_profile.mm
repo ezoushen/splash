@@ -225,15 +225,16 @@ int main(int argc, char **argv) {
           (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
               kv::kPageTokens +
           2;
+      // Whole extents of the largest size the pool rule picks, as a large
+      // pool's would be.
+      const kv::Layout kvLayout = model.targetKvLayout(format);
+      const uint32_t extentPages = kvLayout.maximumExtentPages();
       const uint32_t pageCount =
-          (pagesPerLane * 4 + model.targetKvLayout(format).sparseMappingBatchPages() -
-           1) /
-          model.targetKvLayout(format).sparseMappingBatchPages() *
-          model.targetKvLayout(format).sparseMappingBatchPages();
+          (pagesPerLane * 4 + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(
           backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
-      kv::PageStorage pages(backend, governor.allocationAdmission(),
-                              model.targetKvLayout(format), pageCount);
+      kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout,
+                            pageCount, extentPages);
       for (uint32_t page = 0; page < pageCount; ++page) {
         if (!pages.ensureResident(page))
           throw std::runtime_error("could not back the KV pages");

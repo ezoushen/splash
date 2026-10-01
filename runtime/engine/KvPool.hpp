@@ -20,6 +20,12 @@ struct KvPoolSnapshot {
   uint32_t reclaimableExtents = 0;
   uint64_t residentBackingBytes = 0;
   uint64_t reclaimableBackingBytes = 0;
+  // Extents allocated and released through the pool, the longest growth and
+  // the longest release pass: what memory costs the serving loop.
+  uint64_t extentAllocations = 0;
+  uint64_t extentReleases = 0;
+  double extentAllocateMaxMilliseconds = 0.0;
+  double extentReleaseMaxMilliseconds = 0.0;
 };
 
 enum class KvPageAcquireFailure : uint8_t {
@@ -123,6 +129,10 @@ private:
   bool releaseBacking(uint32_t page);
 
   KvBacking &backing_;
+  uint64_t extentAllocations_ = 0;
+  uint64_t extentReleases_ = 0;
+  double extentAllocateMaxMilliseconds_ = 0.0;
+  double extentReleaseMaxMilliseconds_ = 0.0;
   mutable uint64_t releaseGeneration_ = 0;
   mutable bool releaseOutstanding_ = false;
   std::vector<PageRecord> pages_;

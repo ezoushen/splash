@@ -6,10 +6,8 @@
 // Prefill split: KV heads vary first, then query tiles, then history splits.
 template <uint KVHeads, uint QueryHeadsPerKVHead, bool ScaleInSoftmax, typename CacheElement>
 inline void splash_prefill_attention_split_phase(
-    device bfloat *queries, device CacheElement *cache_keys,
-    device const float *key_scales_buffer, device CacheElement *cache_values,
-    device const float *value_scales_buffer, device float *partials,
-    device float *statistics, device const uint *page_table,
+    device bfloat *queries, device float *partials,
+    device float *statistics, device const SplashKvPage *page_table,
     constant SplashQ8PrefillAttentionParams &params,
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
@@ -29,10 +27,9 @@ inline void splash_prefill_attention_split_phase(
                       QueryHeadsPerKVHead * D;
   ulong slot = (ulong(tile) * KVHeads + kv_head) * params.split_count + split;
   splash_paged_attention_tile<KVHeads, QueryHeadsPerKVHead,
-                                    SPLASH_PREFILL_ATTENTION_TILE_ROWS,
-                                    ScaleInSoftmax>(
-      queries + tile_offset, cache_keys, key_scales_buffer, cache_values,
-      value_scales_buffer, page_table, kv_head,
+                              SPLASH_PREFILL_ATTENTION_TILE_ROWS, ScaleInSoftmax,
+                              CacheElement>(
+      queries + tile_offset, page_table, params.kv, kv_head,
       params.committed_tokens + tile_start, active_rows, params.split_count, split,
       partials, statistics, slot, scores, probabilities, row_max, row_sum,
       previous_scale, rescale, thread_index);
@@ -67,17 +64,13 @@ inline void splash_q8_prefill_attention_reduce_phase(
       thread_index);
 }
 
-#define Q8_PREFILL_SPLIT(Name, Heads, Group, ScaleInSoftmax)                   \
+#define Q8_PREFILL_SPLIT(Name, Heads, Group, ScaleInSoftmax, CacheElement)     \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
-      device int8_t *cache_keys [[buffer(1)]],                                 \
-      device const float *key_scales_buffer [[buffer(2)]],                     \
-      device int8_t *cache_values [[buffer(3)]],                               \
-      device const float *value_scales_buffer [[buffer(4)]],                   \
-      device float *partials [[buffer(5)]],                                    \
-      device float *statistics [[buffer(6)]],                                  \
-      device const uint *page_table [[buffer(7)]],                             \
-      constant SplashQ8PrefillAttentionParams &params [[buffer(8)]],           \
+      device float *partials [[buffer(1)]],                                    \
+      device float *statistics [[buffer(2)]],                                  \
+      device const SplashKvPage *page_table [[buffer(3)]],                     \
+      constant SplashQ8PrefillAttentionParams &params [[buffer(4)]],           \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     constexpr uint M = Group * SPLASH_PREFILL_ATTENTION_TILE_ROWS;             \
@@ -88,18 +81,22 @@ inline void splash_q8_prefill_attention_reduce_phase(
     threadgroup float row_sum[M];                                              \
     threadgroup float previous_scale[M];                                       \
     threadgroup atomic_uint rescale;                                           \
-    splash_prefill_attention_split_phase<Heads, Group, ScaleInSoftmax>(        \
-        queries, cache_keys, key_scales_buffer, cache_values, value_scales_buffer, partials,\
-        statistics, page_table, params, scores, probabilities, row_max, row_sum,\
-        previous_scale, &rescale, group, thread_index);                        \
+    splash_prefill_attention_split_phase<Heads, Group, ScaleInSoftmax,         \
+                                         CacheElement>(                        \
+        queries, partials, statistics, page_table, params, scores,             \
+        probabilities, row_max, row_sum, previous_scale, &rescale, group,      \
+        thread_index);                                                         \
   }
 
-Q8_PREFILL_SPLIT(prefill_attention_q8_split, 4, 6, true)
+Q8_PREFILL_SPLIT(prefill_attention_q8_split, 4, 6, true, int8_t)
 Q8_PREFILL_SPLIT(prefill_attention_q8_split_cooperative_scale,
-                4, 6, false)
-Q8_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8, 2, 8, true)
+                4, 6, false, int8_t)
+Q8_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8, 2, 8, true, int8_t)
 Q8_PREFILL_SPLIT(prefill_attention_q8_split_cooperative_scale_kv2_g8,
-                2, 8, false)
+                2, 8, false, int8_t)
+// BF16 shares the page loop and reduction, without quantization scales.
+Q8_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, true, bfloat)
+Q8_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, true, bfloat)
 #undef Q8_PREFILL_SPLIT
 
 kernel void prefill_attention_q8_reduce(
@@ -125,33 +122,3 @@ kernel void prefill_attention_q8_reduce_kv2_g8(
                                                    output, params, group,
                                                    thread_index);
 }
-
-// BF16 shares the page loop and reduction, without quantization scales.
-#define BF16_PREFILL_SPLIT(Name, Heads, Group)                                 \
-  kernel void Name(                                                            \
-      device bfloat *queries [[buffer(0)]],                                    \
-      device bfloat *cache_keys [[buffer(1)]],                                 \
-      device bfloat *cache_values [[buffer(2)]],                               \
-      device float *partials [[buffer(3)]],                                    \
-      device float *statistics [[buffer(4)]],                                  \
-      device const uint *page_table [[buffer(5)]],                             \
-      constant SplashQ8PrefillAttentionParams &params [[buffer(6)]],           \
-      uint3 group [[threadgroup_position_in_grid]],                            \
-      uint thread_index [[thread_index_in_threadgroup]]) {                     \
-    constexpr uint M = Group * SPLASH_PREFILL_ATTENTION_TILE_ROWS;             \
-    constexpr uint N = SplashQ8PageTokens;                                     \
-    alignas(16) threadgroup float scores[M * N];                               \
-    alignas(16) threadgroup bfloat probabilities[M * N];                       \
-    threadgroup float row_max[M];                                              \
-    threadgroup float row_sum[M];                                              \
-    threadgroup float previous_scale[M];                                       \
-    threadgroup atomic_uint rescale;                                           \
-    splash_prefill_attention_split_phase<Heads, Group, true>(                  \
-        queries, cache_keys, nullptr, cache_values, nullptr, partials,         \
-        statistics, page_table, params, scores, probabilities, row_max, row_sum,\
-        previous_scale, &rescale, group, thread_index);                        \
-  }
-
-BF16_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6)
-BF16_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8)
-#undef BF16_PREFILL_SPLIT

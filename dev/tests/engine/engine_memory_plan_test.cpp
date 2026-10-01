@@ -1,6 +1,7 @@
 #include "engine/MemoryPlan.hpp"
 #include "TestModel.hpp"
 
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -36,11 +37,15 @@ ModelMemoryProfile model() {
   return test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB);
 }
 
+// The pages the budget holds for one request's KV beside its state cell.
+uint64_t budgetPages(const EngineMemoryBreakdown &budget) {
+  return (budget.dynamicBudgetBytes - budget.activeStateCellBytes) / budget.kvPageBytes;
+}
+
 void testUnifiedElasticBudget() {
   EngineMemoryPlan plan = requireEngineMemoryPlan(device(), model());
   const auto &budget = plan.breakdown();
   require(budget.kvPageTokens == 32 && budget.maximumBatchWidth == 4 &&
-              budget.kvSparseMappingBatchPages == 128 &&
               budget.kvExtentPages == 128,
           "execution geometry did not reach memory planning");
   require(budget.fixedRuntimeBytes == model().fixedRuntimeBytes(),
@@ -54,10 +59,11 @@ void testUnifiedElasticBudget() {
                   budget.fixedRuntimeBytes + budget.minimumDynamicBytes,
           "minimum B1 plus one physical extent is incorrect");
   require(budget.kvVirtualPages % 128 == 0 && budget.kvVirtualPages >= 128 &&
+              budget.kvVirtualPages == budgetPages(budget) - budgetPages(budget) % 128 &&
               budget.kvVirtualBytes ==
                   uint64_t{budget.kvVirtualPages} * budget.kvPageBytes &&
               budget.kvVirtualTokens == uint64_t{budget.kvVirtualPages} * 32,
-          "KV virtual address space is inconsistent");
+          "the KV pool is not the budget's whole extents");
   require(plan.maximumContextTokens() ==
               std::min<uint64_t>(model().maximumContextTokens,
                                  budget.kvVirtualTokens -
@@ -77,8 +83,10 @@ void testBf16BudgetAndStatus() {
   const auto &budget = bf16.breakdown();
   require(budget.kvPageBytes == profile.targetKvLayout.bytesPerModelPage() &&
               budget.kvPageBytes > int8.breakdown().kvPageBytes &&
-              budget.kvSparseMappingBatchPages == 1 && budget.kvExtentPages == 64,
-          "BF16 planning did not use its payload size and sparse alignment");
+              budget.kvExtentPages ==
+                  profile.targetKvLayout.extentPagesFor(budgetPages(budget)) &&
+              budget.kvVirtualPages % budget.kvExtentPages == 0,
+          "BF16 planning did not use its payload size and its pool's extent size");
   require(budget.kvVirtualBytes <= budget.dynamicBudgetBytes &&
               budget.kvVirtualPages < int8.breakdown().kvVirtualPages,
           "BF16 virtual capacity exceeded the shared budget");
@@ -194,14 +202,44 @@ void testModelProvidedKvGeometry() {
   EngineMemoryPlan plan = requireEngineMemoryPlan(device(), compact);
   const auto &budget = plan.breakdown();
   require(budget.kvPageTokens == 32 && budget.kvPageBytes == 332'800 &&
-              budget.kvSparseMappingBatchPages == 256 &&
-              budget.kvExtentPages == 512,
+              budget.kvExtentPages ==
+                  compact.targetKvLayout.extentPagesFor(budgetPages(budget)) &&
+              budget.kvExtentPages % 256 == 0,
           "memory plan ignored model-provided Q8 geometry");
   require(plan.toStatusJson().find("\"attention_layers\":10") !=
               std::string::npos &&
               plan.toStatusJson().find("\"kv_heads\":2") !=
                   std::string::npos,
           "model-provided Q8 geometry is missing from status");
+}
+
+// The pool's extents leave the fewest of the budget's pages unused, the size
+// nearest the 128 MiB target on a tie, and a budget below the smallest
+// extent holds no pool.
+void testExtentSizeFollowsThePool() {
+  ModelMemoryProfile compact = model();
+  compact.targetKvLayout = {10, 2, 256};
+  const auto &reference = requireEngineMemoryPlan(device(), compact).breakdown();
+  const auto planFor = [&](uint64_t pages) {
+    return evaluateEngineMemoryPlan(
+        device(), compact,
+        reference.fixedRuntimeBytes + reference.activeStateCellBytes +
+            pages * reference.kvPageBytes);
+  };
+  for (const auto [pages, extent] :
+       std::array<std::array<uint64_t, 2>, 4>{{{10'240, 512}, {10'496, 256},
+                                              {10'751, 256}, {511, 256}}}) {
+    const auto result = planFor(pages);
+    require(result.plan && result.plan->breakdown().kvExtentPages == extent &&
+                result.plan->breakdown().kvVirtualPages == pages - pages % extent &&
+                result.plan->breakdown().kvExtentBytes == extent * 332'800,
+            "the extent size does not leave the fewest pool pages over");
+  }
+  const auto tooSmall = planFor(255);
+  require(!tooSmall.plan && tooSmall.status.code == BudgetErrorCode::KvPoolDoesNotFit &&
+              tooSmall.status.breakdown.minimumDynamicBytes ==
+                  reference.activeStateCellBytes + 256 * 332'800,
+          "a budget below the smallest extent was accepted");
 }
 
 } // namespace
@@ -271,6 +309,7 @@ int main() {
     testHardBudgetBoundaries();
     testContextTokensWithin();
     testModelProvidedKvGeometry();
+    testExtentSizeFollowsThePool();
     testDeviceValidationNamesTheMacosFloor();
     testDeviceValidationMessageNamesWhatTheMacHas();
     std::cout << "elastic memory plan tests passed\n";

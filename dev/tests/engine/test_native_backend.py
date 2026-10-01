@@ -119,7 +119,7 @@ class FakeRuntime:
         self.status_event = wire.StatusJsonEvent(
             1,
             wire.STATUS_SCHEMA_VERSION,
-            b'{"schema_version":5,"ready":true,"memory_pressure":"normal",'
+            b'{"schema_version":6,"ready":true,"memory_pressure":"normal",'
             b'"metal":{"healthy":true}}',
         )
         self.pending_limit = 8
@@ -713,7 +713,7 @@ class NativeBackendContractTests(unittest.TestCase):
         runtime.status_event = wire.StatusJsonEvent(
             1,
             wire.STATUS_SCHEMA_VERSION,
-            b'{"schema_version":5,"ready":true,"memory_pressure":"critical",'
+            b'{"schema_version":6,"ready":true,"memory_pressure":"critical",'
             b'"metal":{"healthy":true}}',
         )
         self.assertFalse(transport.is_ready())
@@ -721,7 +721,7 @@ class NativeBackendContractTests(unittest.TestCase):
         runtime.status_event = wire.StatusJsonEvent(
             1,
             wire.STATUS_SCHEMA_VERSION,
-            b'{"schema_version":5,"ready":"false",'
+            b'{"schema_version":6,"ready":"false",'
             b'"memory_pressure":"normal","metal":{"healthy":true}}',
         )
         self.assertFalse(transport.is_ready())
@@ -729,14 +729,14 @@ class NativeBackendContractTests(unittest.TestCase):
         runtime.status_event = wire.StatusJsonEvent(
             1,
             wire.STATUS_SCHEMA_VERSION,
-            b'{"schema_version":5,"ready":true,"metal":{"healthy":true}}',
+            b'{"schema_version":6,"ready":true,"metal":{"healthy":true}}',
         )
         self.assertFalse(transport.is_ready())
 
         runtime.status_event = wire.StatusJsonEvent(
             1,
             wire.STATUS_SCHEMA_VERSION,
-            b'{"schema_version":5,"ready":true,"memory_pressure":"normal",'
+            b'{"schema_version":6,"ready":true,"memory_pressure":"normal",'
             b'"metal":{"healthy":true}}',
         )
         self.assertTrue(transport.is_ready())

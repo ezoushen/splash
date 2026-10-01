@@ -2,6 +2,7 @@
 #include "engine/MemoryGovernor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -17,18 +18,51 @@ void require(bool condition, const char *message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+template <typename Exception, typename Function>
+void requireThrows(Function &&function, const char *message) {
+    try {
+        function();
+    } catch (const Exception &) {
+        return;
+    }
+    throw std::runtime_error(message);
+}
+
+// A pool's extents hold whole alignment units, so that every tensor region of
+// an extent starts 64 KiB-aligned: the 512-byte-per-page scale regions need
+// 128 pages for four KV heads and 256 for two, BF16 one or two. The size is
+// chosen per pool between half and one and a half times the 128 MiB target,
+// leaving the fewest of its pages over, the one nearest the target on a tie.
+constexpr kv::Layout kvLayout{16, 4, 256};
+constexpr kv::Layout compactLayout{10, 2, 256};
+constexpr kv::Layout bf16Layout{16, 4, 256, kv::Format::BFloat16};
+constexpr kv::Layout compactBf16Layout{10, 2, 256, kv::Format::BFloat16};
+static_assert(kv::kExtentRegionAlignmentBytes == 64 * 1024);
+static_assert(kvLayout.bytesPerModelPage() == 1'064'960);
+static_assert(kvLayout.extentAlignmentPages() == 128);
+static_assert(kvLayout.minimumExtentPages() == 128 && kvLayout.maximumExtentPages() == 128);
+static_assert(kvLayout.extentPagesFor(127) == 0 && kvLayout.extentPagesFor(128) == 128 &&
+              kvLayout.extentPagesFor(1000) == 128);
+static_assert(compactLayout.bytesPerModelPage() == 332'800);
+static_assert(compactLayout.extentAlignmentPages() == 256);
+static_assert(compactLayout.minimumExtentPages() == 256 &&
+              compactLayout.maximumExtentPages() == 512);
+static_assert(compactLayout.extentPagesFor(255) == 0 && compactLayout.extentPagesFor(511) == 256);
+// Both sizes leave nothing over: 512 pages (162.5 MiB) is nearer the target
+// than 256 (81.25 MiB). With 256 pages over, only 256 leaves nothing.
+static_assert(compactLayout.extentPagesFor(10'240) == 512);
+static_assert(compactLayout.extentPagesFor(10'496) == 256);
+static_assert(bf16Layout.extentAlignmentPages() == 1 && bf16Layout.minimumExtentPages() == 32 &&
+              bf16Layout.maximumExtentPages() == 96);
+// 448 pages divide by 32, 56 and 64 (128 MiB, the target); 97 leaves one
+// page over 32, 48 and 96 extents, of which 48 (96 MiB) is nearest.
+static_assert(bf16Layout.extentPagesFor(31) == 0 && bf16Layout.extentPagesFor(448) == 64 &&
+              bf16Layout.extentPagesFor(97) == 48);
+static_assert(compactBf16Layout.extentAlignmentPages() == 2 &&
+              compactBf16Layout.minimumExtentPages() == 104 &&
+              compactBf16Layout.maximumExtentPages() == 306);
+
 void run(const std::string &metallib) {
-    constexpr kv::Layout kvLayout{16, 4, 256};
-    constexpr kv::Layout compactLayout{10, 2, 256};
-    // 64 KiB sparse tiles: the 512-byte-per-page scale buffers force
-    // 128-page mapping batches for four KV heads and 256 for two.
-    static_assert(kv::kSparseMappingAlignmentBytes == 64 * 1024);
-    static_assert(kvLayout.bytesPerModelPage() == 1'064'960);
-    static_assert(kvLayout.sparseMappingBatchPages() == 128);
-    static_assert(kvLayout.backingExtentPages() == 128);
-    static_assert(compactLayout.bytesPerModelPage() == 332'800);
-    static_assert(compactLayout.sparseMappingBatchPages() == 256);
-    static_assert(compactLayout.backingExtentPages() == 512);
     metal::MetalBackend backend(metallib);
     auto baseline = backend.memoryStats();
     uint64_t observed = std::max(
@@ -226,7 +260,7 @@ void run(const std::string &metallib) {
         128ULL * 1024 * 1024,
         [&elasticHostAvailable] { return elasticHostAvailable; });
     kv::PageStorage hostGatedStorage(
-        backend, hostGated.allocationAdmission(), kvLayout, 256);
+        backend, hostGated.allocationAdmission(), kvLayout, 256, 128);
     if (hostGatedStorage.residentPages() != 128) {
         throw std::runtime_error(
             "elastic Q8 storage started with " +
@@ -244,72 +278,106 @@ void run(const std::string &metallib) {
 
     MemoryGovernor governor(
         backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
-    kv::PageStorage storage(backend, governor.allocationAdmission(),
-                              kvLayout,
-                              kvLayout.sparseMappingBatchPages());
-    require(storage.declaredBytes() ==
-                kvLayout.sparseMappingBatchPages() *
-                    kvLayout.bytesPerModelPage(),
-            "declared Q8 pool bytes are wrong");
-    require(storage.actualAllocatedBytes() == storage.declaredBytes(),
-            "granularity-aligned Q8 pool has hidden Metal rounding");
-    require(storage.residentPages() == kvLayout.sparseMappingBatchPages() &&
-                storage.isResident(0),
+    requireThrows<std::invalid_argument>(
+        [&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 192, 128); },
+        "a pool of a part of an extent was accepted");
+    requireThrows<std::invalid_argument>(
+        [&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 256, 64); },
+        "an extent of a part of an alignment unit was accepted");
+
+    metal::MetalBuffer table = backend.allocateBuffer(4 * sizeof(SplashKvPage));
+    metal::MetalBuffer word = backend.allocateBuffer(sizeof(uint32_t));
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    kv::PageStorage storage(backend, governor.allocationAdmission(), kvLayout, 384, 128);
+    const uint64_t extentBytes = 128 * kvLayout.bytesPerModelPage();
+    require(storage.declaredBytes() == 3 * extentBytes && storage.extentBytes() == extentBytes &&
+                storage.actualAllocatedBytes() == extentBytes &&
+                backend.memoryStats().allocatedBytes == before + extentBytes,
+            "the runway extent was not allocated at exactly its size");
+    require(storage.residentPages() == 128 && storage.isResident(127) && !storage.isResident(128),
             "initial Q8 runway residency is incorrect");
-    const auto residentBefore = backend.memoryStats().sparseResidentBytes;
-    require(storage.releaseReady(), "idle storage reported a pending release");
-    require(storage.releaseBackingForPage(0) &&
-                storage.actualAllocatedBytes() == 0 &&
-                storage.residentPages() == 0 && !storage.isResident(3),
-            "empty Q8 extent did not return its physical heap");
-    // The heap is released asynchronously; the backing reports readiness
-    // only after the sparse queue has completed the unmap.
-    storage.awaitRelease();
-    require(storage.releaseReady() &&
-                backend.memoryStats().sparseResidentBytes + storage.declaredBytes() ==
-                    residentBefore,
-            "completed Q8 release did not free its heap");
-    require(storage.ensureResident(3) && storage.isResident(0) &&
-                storage.actualAllocatedBytes() == storage.declaredBytes(),
-            "Q8 extent could not be remapped on demand");
-    // Remap immediately behind a release without waiting: the queue orders
-    // the new mapping after the unmap of the same range.
-    require(storage.releaseBackingForPage(0) && storage.ensureResident(0) &&
-                storage.actualAllocatedBytes() == storage.declaredBytes(),
-            "Q8 extent could not be remapped behind an in-flight release");
-    storage.awaitRelease();
-    require(storage.releaseReady(), "drained Q8 storage still reports a pending release");
+    const auto layer = storage.layer(15);
+    require(layer.format == kv::Format::Int8 && layer.kv.extent_pages == 128 &&
+                layer.kv.offset == 15 * 128 * kvLayout.bytesPerLayerPage(),
+            "a layer's region does not follow the layers before it");
+
+    const SplashKvPage runwayPage = storage.entry(5);
+    require(runwayPage && (runwayPage & SPLASH_KV_PAGE_INDEX_MASK) == 5,
+            "a page entry does not carry the page's index in its extent");
+    requireThrows<std::logic_error>([&] { (void)storage.entry(200); },
+                                    "an unbacked page received an entry");
+    requireThrows<std::logic_error>(
+        [&] { storage.writeEntries(std::array<uint32_t, 1>{200}, table); },
+        "a table was written with an unbacked page");
+    requireThrows<std::logic_error>(
+        [&] { storage.writeEntries(std::array<uint32_t, 5>{0, 1, 2, 3, 4}, table); },
+        "a table too small for its entries was written");
+
+    const uint64_t generation = storage.generation();
+    require(storage.ensureResident(200) && storage.generation() == generation + 1 &&
+                storage.residentPages() == 256 &&
+                storage.actualAllocatedBytes() == 2 * extentBytes &&
+                backend.memoryStats().allocatedBytes == before + 2 * extentBytes,
+            "growth did not add exactly one extent");
+    storage.writeEntries(std::array<uint32_t, 4>{200, 5, 255, 128}, table);
+    const auto *entries = static_cast<const SplashKvPage *>(table.contents());
+    // Pages 200, 255 and 128 share the second extent, at indices 72, 127, 0.
+    require(entries[0] == storage.entry(200) && (entries[0] & SPLASH_KV_PAGE_INDEX_MASK) == 72 &&
+                entries[1] == runwayPage && entries[2] == entries[0] + 55 &&
+                entries[3] == entries[0] - 72 && (runwayPage & ~uint64_t{SPLASH_KV_PAGE_INDEX_MASK}) !=
+                                                     (entries[3] & ~uint64_t{SPLASH_KV_PAGE_INDEX_MASK}),
+            "a page table does not hold the entries of its pages");
+
+    // A command reaches extents through its tables without retaining them:
+    // none is released while one is in flight.
+    {
+        const metal::ComputeDispatch kick{"residency_kick", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
+        auto ticket = backend.submitAsync(kick);
+        requireThrows<std::logic_error>(
+            [&] { (void)storage.releaseBackingForPage(200); },
+            "an extent was released while a command was in flight");
+        require(storage.isResident(200) && storage.entry(200) == entries[0] &&
+                    storage.generation() == generation + 1,
+                "a refused release changed the extent");
+        (void)ticket.wait();
+    }
+    require(storage.releaseBackingForPage(200) && !storage.isResident(200) &&
+                storage.generation() == generation + 2 && storage.residentPages() == 128 &&
+                backend.memoryStats().allocatedBytes == before + extentBytes,
+            "a released extent did not return its memory at once");
+    require(!storage.releaseBackingForPage(200), "an unbacked extent was released twice");
+    require(storage.ensureResident(255) && storage.generation() == generation + 3 &&
+                (storage.entry(255) & SPLASH_KV_PAGE_INDEX_MASK) == 127,
+            "a released extent could not be allocated again");
 
     kv::PageStorage compactStorage(
-        backend, governor.allocationAdmission(), compactLayout,
-        compactLayout.sparseMappingBatchPages());
-    require(static_cast<bool>(compactStorage.layer(9).keyData) &&
-                compactStorage.declaredBytes() ==
-                    uint64_t{compactLayout.sparseMappingBatchPages()} *
-                        compactLayout.bytesPerModelPage() &&
-                compactStorage.residentPages() ==
-                    compactLayout.sparseMappingBatchPages(),
+        backend, governor.allocationAdmission(), compactLayout, 1024, 512);
+    require(compactStorage.layer(9).kv.extent_pages == 512 &&
+                compactStorage.layer(9).kv.offset ==
+                    9 * 512 * compactLayout.bytesPerLayerPage() &&
+                compactStorage.residentPages() == 512 &&
+                compactStorage.actualAllocatedBytes() ==
+                    512 * compactLayout.bytesPerModelPage(),
             "model-provided compact Q8 geometry was not honored");
 
-    for (auto layout : {kvLayout, compactLayout}) {
-        layout.format = kv::Format::BFloat16;
-        const uint32_t extent = layout.backingExtentPages();
+    for (const auto layout : {bf16Layout, compactBf16Layout}) {
+        const uint32_t extent = layout.minimumExtentPages();
         kv::PageStorage bf16(backend, governor.allocationAdmission(), layout,
-                             2 * extent);
-        const auto &layer = bf16.layer(layout.attentionLayers - 1);
-        require(layer.format == kv::Format::BFloat16 && layer.keyData && layer.valueData &&
-                    !layer.keyScales && !layer.valueScales,
-                "BF16 allocated quantization scales or omitted data");
+                             2 * extent, extent);
+        const auto bf16Layer = bf16.layer(layout.attentionLayers - 1);
+        require(bf16Layer.format == kv::Format::BFloat16 &&
+                    bf16Layer.kv.offset == (layout.attentionLayers - 1) * extent * 2 *
+                                               layout.dataBytesPerLayerPage(),
+                "BF16 regions hold quantization scales or misplace a layer");
         require(bf16.residentPages() == extent && !bf16.isResident(extent) &&
                     bf16.actualAllocatedBytes() == extent * layout.bytesPerModelPage(),
                 "BF16 initial residency escaped its admitted extent");
         require(bf16.ensureResident(extent) && bf16.residentPages() == 2 * extent &&
                     bf16.actualAllocatedBytes() == bf16.declaredBytes(),
-                "BF16 growth did not account for both mapped extents");
+                "BF16 growth did not account for both extents");
         require(bf16.releaseBackingForPage(extent), "BF16 extent release failed");
-        bf16.awaitRelease();
         require(!bf16.isResident(extent) && bf16.ensureResident(extent),
-                "BF16 extent could not be remapped after release");
+                "BF16 extent could not be allocated again after release");
     }
     std::cout << "KV page storage tests passed\n";
 }

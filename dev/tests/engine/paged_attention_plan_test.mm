@@ -1,4 +1,5 @@
 #include "ops/PagedAttention.hpp"
+#include "tuning/HostKvExtents.hpp"
 #include "tuning/LinearNumerics.hpp"
 
 #include "NormReference.hpp"
@@ -17,6 +18,7 @@
 namespace {
 
 using namespace splash;
+using ops::tuning::HostKvExtents;
 using ops::tuning::bf16ToFloat;
 using ops::tuning::floatToBf16;
 using ops::tuning::ulpBf16;
@@ -201,13 +203,17 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
         {ops::VerifySplitCount::ThirtyTwo, invalidPlacement});
   });
   rejects([&] { (void)ops::PagedAttention::verifyPlan(1, queryHeads + 1, layout, zeroHistory); });
-  kv::Q8VerifyAttentionParams params{0, 8, 32, 1, 1, 0, 0, 0};
+  kv::Q8VerifyAttentionParams params{0, 8, 32, 1, {}, 0, 0};
   require(kv::q8VerifyAttentionValidationError(params) == "split_count_invalid",
           "zero split count is not a supported configuration");
-  params = {0, 8, 32, 1, 1, 32, 16, 0};
+  params = {0, 8, 32, 1, {}, 32, 16};
   require(kv::q8VerifyAttentionValidationError(params) == "slot_splits_invalid",
           "a slot stride below the split count is not a valid partition");
 }
+
+// The attention layer under test is the second of a pool's two, so its region
+// starts past the first one's in every extent.
+constexpr uint32_t kLayer = 1;
 
 struct Case final {
   uint32_t queryHeads;
@@ -215,11 +221,14 @@ struct Case final {
   uint32_t lanes;
   uint32_t rows;
   uint32_t stride;
+  HostKvExtents pool;
   kv::LayerStorage layer;
   metal::MetalBuffer keys;
   metal::MetalBuffer values;
   metal::MetalBuffer queries;
   std::array<metal::MetalBuffer, 4> tables;
+  // Each lane's page ids, which its table holds as entries.
+  std::array<std::vector<uint32_t>, 4> pages;
   std::array<kv::Q8ChunkedPrefillParams, 4> stores{};
   std::array<kv::Q8VerifyAttentionParams, 4> attention{};
 
@@ -233,30 +242,32 @@ struct Case final {
            dimension;
   }
 
-  uint64_t scaleIndex(uint32_t lane, uint32_t head, uint32_t token) const {
-    const auto *table = static_cast<const uint32_t *>(tables[lane].contents());
-    return (uint64_t{table[token / 32]} * layout.kvHeads + head) * 32 +
-           token % 32;
+  // A head's slot of a token in its page: keys token-major, values
+  // dimension-major, one scale per (head, token) (q8_paging.h).
+  uint32_t page(uint32_t lane, uint32_t token) const { return pages[lane][token / 32]; }
+  static uint32_t slot(uint32_t head, uint32_t token) { return head * 32 + token % 32; }
+  static uint64_t valueIndex(uint32_t head, uint32_t token, uint32_t dimension) {
+    return (uint64_t{head} * 256 + dimension) * 32 + token % 32;
   }
 
   float key(uint32_t lane, uint32_t head, uint32_t token,
              uint32_t dimension) const {
-    const uint64_t index = scaleIndex(lane, head, token);
+    const uint32_t id = page(lane, token);
+    const uint64_t index = uint64_t{slot(head, token)} * 256 + dimension;
     if (layout.format == kv::Format::BFloat16)
-      return bf16ToFloat(static_cast<const uint16_t *>(layer.keyData.contents())[index * 256 + dimension]);
-    return static_cast<const int8_t *>(layer.keyData.contents())[index * 256 +
-                                                                 dimension] *
-           static_cast<const float *>(layer.keyScales.contents())[index];
+      return bf16ToFloat(pool.slab<uint16_t>(kLayer, SPLASH_KV_KEYS, id)[index]);
+    return pool.slab<int8_t>(kLayer, SPLASH_KV_KEYS, id)[index] *
+           pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[slot(head, token)];
   }
 
   float value(uint32_t lane, uint32_t head, uint32_t token,
                uint32_t dimension) const {
-    const uint64_t index = scaleIndex(lane, head, token);
-    const uint64_t dataIndex = (index / 32 * 256 + dimension) * 32 + index % 32;
+    const uint32_t id = page(lane, token);
+    const uint64_t index = valueIndex(head, token, dimension);
     if (layout.format == kv::Format::BFloat16)
-      return bf16ToFloat(static_cast<const uint16_t *>(layer.valueData.contents())[dataIndex]);
-    return static_cast<const int8_t *>(layer.valueData.contents())[dataIndex] *
-           static_cast<const float *>(layer.valueScales.contents())[index];
+      return bf16ToFloat(pool.slab<uint16_t>(kLayer, SPLASH_KV_VALUES, id)[index]);
+    return pool.slab<int8_t>(kLayer, SPLASH_KV_VALUES, id)[index] *
+           pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[slot(head, token)];
   }
 };
 
@@ -267,11 +278,12 @@ metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {
   return buffer;
 }
 
+// The lanes' pages are mixed over three or more extents of the pool, boundary
+// pages first; oneExtent puts the same pages in one extent, which must give
+// the same bits.
 Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
                kv::Layout layout, uint32_t lanes, uint32_t rows,
-               uint32_t history, bool verify) {
-  Case data{queryHeads, layout, lanes, rows, (rows + 31) / 32 * 32,
-            {}, {}, {}, {}, {}, {}, {}};
+               uint32_t history, bool verify, bool oneExtent = false) {
   std::array<uint32_t, 4> historyLengths{};
   std::array<uint32_t, 4> pageCounts{};
   uint32_t allPages = 0;
@@ -282,47 +294,57 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
     pageCounts[lane] = (historyLengths[lane] + rows + 31) / 32;
     allPages += pageCounts[lane];
   }
-  const uint32_t physicalPages = 2 * allPages + 1;
-  const uint64_t dataBytes = physicalPages * layout.dataBytesPerLayerPage();
-  const uint64_t scaleBytes = physicalPages * layout.scaleBytesPerLayerPage();
-  data.layer = {allocate(backend, dataBytes), allocate(backend, scaleBytes),
-                allocate(backend, dataBytes), allocate(backend, scaleBytes), layout.format};
+  const auto spread = HostKvExtents::spread(allPages + 2);
+  const std::vector<uint32_t> ids =
+      HostKvExtents::mixedPages(spread, allPages, history + rows + lanes);
+  kv::Layout poolLayout = layout;
+  poolLayout.attentionLayers = kLayer + 1;
+  Case data{queryHeads, layout, lanes, rows, (rows + 31) / 32 * 32,
+            oneExtent ? HostKvExtents(backend, poolLayout,
+                                            spread.extentPages * spread.extents, 1)
+                      : HostKvExtents(backend, poolLayout, spread.extentPages,
+                                            spread.extents),
+            {}, {}, {}, {}, {}, {}, {}, {}};
+  data.layer = data.pool.layer(kLayer);
   data.keys = allocate(backend, uint64_t{lanes} * layout.kvHeads * data.stride * 256 * 2);
   data.values = allocate(backend, data.keys.sizeBytes());
   data.queries = allocate(backend, uint64_t{lanes} * queryHeads * data.stride * 256 * 2);
   uint32_t firstPage = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    data.tables[lane] = allocate(backend, uint64_t{pageCounts[lane]} * 4);
-    auto *table = static_cast<uint32_t *>(data.tables[lane].contents());
-    for (uint32_t page = 0; page < pageCounts[lane]; ++page)
-      table[page] = 2 * (firstPage + page) + 1;
+    data.pages[lane].assign(ids.begin() + firstPage,
+                            ids.begin() + firstPage + pageCounts[lane]);
     firstPage += pageCounts[lane];
+    data.tables[lane] = allocate(backend, uint64_t{pageCounts[lane]} * sizeof(SplashKvPage));
+    data.pool.writeTable(data.pages[lane], data.tables[lane].contents());
     data.stores[lane] = {historyLengths[lane], rows, data.stride,
-                         pageCounts[lane], physicalPages, 0, 0, 0};
+                         pageCounts[lane], {}, 0, 0};
     data.attention[lane] = {historyLengths[lane], rows, data.stride,
-                            pageCounts[lane], physicalPages, 32, 32, 0};
+                            pageCounts[lane], {}, 32, 32};
     if (verify)
       data.attention[lane].active_rows = std::array{8U, 1U, 3U, 7U}[lane];
     for (uint32_t token = 0; token < historyLengths[lane]; ++token) {
+      const uint32_t id = data.page(lane, token);
       for (uint32_t head = 0; head < layout.kvHeads; ++head) {
-        const uint64_t scaleIndex = data.scaleIndex(lane, head, token);
+        const uint32_t slot = Case::slot(head, token);
         if (layout.format == kv::Format::Int8) {
-          static_cast<float *>(data.layer.keyScales.contents())[scaleIndex] = 0.006f;
-          static_cast<float *>(data.layer.valueScales.contents())[scaleIndex] = 0.007f;
+          data.pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[slot] = 0.006f;
+          data.pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[slot] = 0.007f;
         }
         for (uint32_t dimension = 0; dimension < 256; ++dimension) {
           const int key = int((token * 37 + head * 101 + dimension * 17 +
                                token * dimension * 3 + lane * 7) % 255) - 127;
           const int value = int((token * 53 + head * 79 + dimension * 29 +
                                  token * dimension * 5 + lane * 19) % 255) - 127;
-          const uint64_t valueIndex =
-              (scaleIndex / 32 * 256 + dimension) * 32 + scaleIndex % 32;
+          const uint64_t keyIndex = uint64_t{slot} * 256 + dimension;
+          const uint64_t valueIndex = Case::valueIndex(head, token, dimension);
           if (layout.format == kv::Format::Int8) {
-            static_cast<int8_t *>(data.layer.keyData.contents())[scaleIndex * 256 + dimension] = key;
-            static_cast<int8_t *>(data.layer.valueData.contents())[valueIndex] = value;
+            data.pool.slab<int8_t>(kLayer, SPLASH_KV_KEYS, id)[keyIndex] = key;
+            data.pool.slab<int8_t>(kLayer, SPLASH_KV_VALUES, id)[valueIndex] = value;
           } else {
-            static_cast<uint16_t *>(data.layer.keyData.contents())[scaleIndex * 256 + dimension] = floatToBf16(key * 0.006f);
-            static_cast<uint16_t *>(data.layer.valueData.contents())[valueIndex] = floatToBf16(value * 0.007f);
+            data.pool.slab<uint16_t>(kLayer, SPLASH_KV_KEYS, id)[keyIndex] =
+                floatToBf16(key * 0.006f);
+            data.pool.slab<uint16_t>(kLayer, SPLASH_KV_VALUES, id)[valueIndex] =
+                floatToBf16(value * 0.007f);
           }
         }
       }
@@ -347,6 +369,7 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
   }
   for (uint32_t lane = lanes; lane < 4; ++lane) {
     data.tables[lane] = data.tables[0];
+    data.pages[lane] = data.pages[0];
     data.stores[lane] = data.stores[0];
     data.attention[lane] = data.attention[0];
   }
@@ -436,27 +459,33 @@ void checkEquivalent(const Case &data, const std::vector<uint16_t> &baseline,
         std::to_string(maximumError) + " cosine=" + std::to_string(cosine));
 }
 
-// Construct expected pages from the source bits, independently of GPU stores.
-std::array<std::vector<uint16_t>, 2> expectedBf16Store(const Case &data) {
-  std::array<std::vector<uint16_t>, 2> result;
+// Construct expected extents from the source bits, independently of GPU
+// stores: every byte of every extent but the stored rows' slots stays.
+std::vector<std::vector<std::byte>> expectedBf16Store(const Case &data) {
+  std::vector<std::vector<std::byte>> result;
+  for (uint32_t extent = 0; extent < data.pool.extentCount(); ++extent) {
+    const auto bytes = data.pool.bytes(extent);
+    result.emplace_back(bytes.begin(), bytes.end());
+  }
   for (unsigned tensor = 0; tensor < 2; ++tensor) {
-    const auto cache = tensor ? data.layer.valueData : data.layer.keyData;
-    const auto *before = static_cast<const uint16_t *>(cache.contents());
-    result[tensor].assign(before, before + cache.sizeBytes() / 2);
     const auto *source = static_cast<const uint16_t *>(
         (tensor ? data.values : data.keys).contents());
     for (uint32_t lane = 0; lane < data.lanes; ++lane) {
-      const auto *table = static_cast<const uint32_t *>(data.tables[lane].contents());
       for (uint32_t row = 0; row < data.stores[lane].chunk_tokens; ++row) {
         const uint32_t token = data.stores[lane].committed_tokens + row;
+        const uint32_t id = data.page(lane, token);
+        const auto *page = data.pool.slab<uint16_t>(
+            kLayer, tensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS, id);
+        const uint32_t extent = id / data.pool.extentPages();
         for (uint32_t head = 0; head < data.layout.kvHeads; ++head)
           for (uint32_t d = 0; d < 256; ++d) {
-            const uint64_t pageHead = uint64_t{table[token / 32]} * data.layout.kvHeads + head;
-            const uint64_t destination = tensor ? (pageHead * 256 + d) * 32 + token % 32
-                                                : (pageHead * 32 + token % 32) * 256 + d;
+            const uint64_t element = tensor ? Case::valueIndex(head, token, d)
+                                            : uint64_t{Case::slot(head, token)} * 256 + d;
+            const auto offset = reinterpret_cast<const std::byte *>(page + element) -
+                                data.pool.bytes(extent).data();
             const uint64_t base = (uint64_t{lane} * data.layout.kvHeads + head) * data.stride * 256;
             const uint64_t input = base + (tensor ? d * data.stride + row : row * 256 + d);
-            result[tensor][destination] = source[input];
+            std::memcpy(result[extent].data() + offset, source + input, sizeof(uint16_t));
           }
       }
     }
@@ -464,11 +493,11 @@ std::array<std::vector<uint16_t>, 2> expectedBf16Store(const Case &data) {
   return result;
 }
 
-void checkBf16Store(const Case &data, const std::array<std::vector<uint16_t>, 2> &expected) {
-  for (unsigned tensor = 0; tensor < 2; ++tensor) {
-    const auto cache = tensor ? data.layer.valueData : data.layer.keyData;
-    require(std::memcmp(cache.contents(), expected[tensor].data(), cache.sizeBytes()) == 0,
-            "BF16 store changed source bits, history, or an unused page slot");
+void checkBf16Store(const Case &data, const std::vector<std::vector<std::byte>> &expected) {
+  for (uint32_t extent = 0; extent < data.pool.extentCount(); ++extent) {
+    const auto bytes = data.pool.bytes(extent);
+    require(std::equal(bytes.begin(), bytes.end(), expected[extent].begin()),
+            "BF16 store changed source bits, history, another layer or an unused page slot");
   }
 }
 
@@ -584,9 +613,9 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
       require(params.committed_tokens == plan.historyTokens && params.rows == data.rows &&
                   params.chunk_stride == data.stride &&
                   params.page_table_entries == data.stores[0].page_table_entries &&
-                  params.physical_page_count == data.stores[0].physical_page_count &&
-                  params.split_count == plan.splits &&
-                  params.reserved0 == 0 && params.reserved1 == 0,
+                  params.kv.extent_pages == data.layer.kv.extent_pages &&
+                  params.kv.offset == data.layer.kv.offset &&
+                  params.split_count == plan.splits && params.reserved0 == 0,
               "recorded prefill ABI does not describe the actual split plan");
     };
     checkDispatch(graph.dispatches()[1], plan.splitGroups, plan.splitPipeline);
@@ -603,7 +632,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
   }
   const auto expected = data.layout.format == kv::Format::BFloat16
                             ? expectedBf16Store(data)
-                            : std::array<std::vector<uint16_t>, 2>{};
+                            : std::vector<std::vector<std::byte>>{};
   (void)backend.submitCommand(graph.dispatches());
   if (data.layout.format == kv::Format::BFloat16) checkBf16Store(data, expected);
   for (size_t i = 0; i < sizes.size(); ++i) {
@@ -637,6 +666,9 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
   require(!defaultOutput.empty(), "default prefill configuration was not tested");
   checkEquivalent(data, defaultOutput,
                   run(backend, data, ops::PrefillAttentionConfig{}, false));
+  auto oneExtent = makeCase(backend, heads, layout, 1, rows, history, false, true);
+  require(run(backend, oneExtent, ops::PrefillAttentionConfig{}, false) == defaultOutput,
+          "prefill attention over extents differs from one extent of the same pages");
   if (rows == 1057) {
     // Reuse the identical packed BF16 inputs and KV history across unaligned
     // host chunks, checking each path against its independent causal oracle.
@@ -688,6 +720,9 @@ void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout
       baseline = output;
     checkEquivalent(data, baseline, output);
   }
+  auto oneExtent = makeCase(backend, heads, layout, lanes, 8, history, true, true);
+  require(run(backend, oneExtent, ops::PagedAttention::verifyCandidates()[0], false) == baseline,
+          "verify attention over extents differs from one extent of the same pages");
   std::cout << "paged verify candidates: format=" << kv::formatName(layout.format) << " q=" << heads << " history=" << history
             << " lanes=" << lanes << " PASS\n";
 }

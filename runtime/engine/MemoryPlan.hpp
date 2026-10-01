@@ -123,14 +123,13 @@ struct EngineMemoryBreakdown {
 
   uint32_t kvPageTokens = 0;
   uint64_t kvPageBytes = 0;
-  // Number of logical Page32 blocks mapped in one Metal sparse-buffer
-  // operation. This is allocation alignment, never the cache block size.
-  uint32_t kvSparseMappingBatchPages = 0;
+  // The pool grows and shrinks in extents of kvExtentPages pages, a size
+  // chosen for this pool (kv::Layout::extentPagesFor). This is allocation
+  // geometry, never the cache block size.
   uint32_t kvExtentPages = 0;
   uint64_t kvExtentBytes = 0;
-  // Derived from the device's maximum Metal buffer length. Request context
-  // and four-lane execution are independent policy limits.
-  uint32_t maximumKvPages = 0;
+  // The pool: the whole extents one request's KV can use within the budget.
+  // Request context and four-lane execution are independent policy limits.
   uint32_t kvVirtualPages = 0;
   uint64_t kvVirtualBytes = 0;
   uint64_t kvVirtualTokens = 0;

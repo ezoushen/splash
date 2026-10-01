@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include "ops/PagedAttention.hpp"
+#include "tuning/HostKvExtents.hpp"
 #include "Q8PageFormatReference.hpp"
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <vector>
 
 using namespace splash::kv;
+using splash::ops::tuning::HostKvExtents;
 
 namespace {
 
@@ -118,20 +120,51 @@ float queryPattern(uint32_t row, uint32_t head, uint32_t dimension) {
   return float(centered) / 2036.0f;
 }
 
+// The attention layer under test is the second of a pool's two, so its region
+// starts past the first one's in every extent.
+constexpr uint32_t kLayer = 1;
+
+// A pool of extents for the oracle's geometry, one layer ahead of the tested
+// one, and the dispatches' residency for them: kernels reach the extents only
+// through page entries.
+struct Pool {
+  std::vector<id<MTLBuffer>> extents;
+  std::unique_ptr<HostKvExtents> pages;
+
+  Pool(id<MTLDevice> device, HostKvExtents::Geometry geometry) {
+    Layout layout{kLayer + 1, kKvHeads, kHeadDimension};
+    std::vector<HostKvExtents::Extent> views;
+    for (uint32_t extent = 0; extent < geometry.extents; ++extent) {
+      extents.push_back(makeBuffer(
+          device, HostKvExtents::extentBytes(layout, geometry.extentPages)));
+      views.push_back({static_cast<std::byte *>(extents.back().contents),
+                       extents.back().gpuAddress});
+    }
+    pages = std::make_unique<HostKvExtents>(layout, geometry.extentPages,
+                                            std::move(views));
+  }
+  void use(id<MTLComputeCommandEncoder> encoder, MTLResourceUsage usage) const {
+    for (id<MTLBuffer> extent : extents)
+      [encoder useResource:extent usage:usage];
+  }
+};
+
 struct Case {
   Q8ChunkedPrefillParams params;
+  // Page ids, and their entries for the kernels.
   std::vector<uint32_t> pageTable;
   id<MTLBuffer> pageTableBuffer;
-  id<MTLBuffer> q8Keys;
-  id<MTLBuffer> keyScales;
-  id<MTLBuffer> q8Values;
-  id<MTLBuffer> valueScales;
+  std::unique_ptr<Pool> pool;
   id<MTLBuffer> chunkKeys;
   id<MTLBuffer> chunkValues;
   id<MTLBuffer> queries;
   id<MTLBuffer> output;
   id<MTLBuffer> partials;
   id<MTLBuffer> statistics;
+
+  template <typename T> T *slab(uint32_t tensor, uint32_t logicalPage) const {
+    return pool->pages->slab<T>(kLayer, tensor, pageTable[logicalPage]);
+  }
 };
 
 uint64_t keyChunkIndex(uint32_t stride, uint32_t head, uint32_t token,
@@ -144,29 +177,23 @@ uint64_t valueChunkIndex(uint32_t stride, uint32_t head, uint32_t token,
   return (uint64_t{head} * kHeadDimension + dimension) * stride + token;
 }
 
+// The case's pages are mixed over three or more extents of its pool, with
+// pages to spare that no table leases.
 Case makeCase(id<MTLDevice> device, uint32_t committed, uint32_t chunk,
               uint32_t stride) {
   Case result;
   uint32_t pages = (committed + chunk + kPageTokens - 1) / kPageTokens;
-  uint32_t physicalPages = pages * 2 + 1;
-  result.params = {committed, chunk, stride, pages, physicalPages, 0, 0, 0};
+  const auto geometry = HostKvExtents::spread(2 * pages + 1);
+  result.pool = std::make_unique<Pool>(device, geometry);
+  result.pageTable = HostKvExtents::mixedPages(geometry, pages, committed + chunk);
+  result.params = {committed, chunk, stride, pages,
+                   result.pool->pages->layer(kLayer).kv, 0, 0};
   require(chunkedPrefillValid(result.params), "invalid generated params");
-  result.pageTable.resize(pages);
-  for (uint32_t logical = 0; logical < pages; ++logical)
-    result.pageTable[logical] = logical * 2 + 1;
-  require(chunkedPrefillPageTableInRange(result.params, result.pageTable),
+  require(chunkedPrefillPageTableInRange(result.params, result.pageTable,
+                                         result.pool->pages->pageCount()),
           "invalid generated page table");
-  result.pageTableBuffer = makeBuffer(device, pages * sizeof(uint32_t));
-  std::memcpy(result.pageTableBuffer.contents, result.pageTable.data(),
-              pages * sizeof(uint32_t));
-  result.q8Keys =
-      makeBuffer(device, uint64_t{physicalPages} * kKeyDataBytesPerLayerPage);
-  result.keyScales = makeBuffer(
-      device, uint64_t{physicalPages} * kKeyScaleBytesPerLayerPage);
-  result.q8Values = makeBuffer(
-      device, uint64_t{physicalPages} * kValueDataBytesPerLayerPage);
-  result.valueScales = makeBuffer(
-      device, uint64_t{physicalPages} * kValueScaleBytesPerLayerPage);
+  result.pageTableBuffer = makeBuffer(device, pages * sizeof(SplashKvPage));
+  result.pool->pages->writeTable(result.pageTable, result.pageTableBuffer.contents);
   uint64_t chunkElements = uint64_t{kKvHeads} * stride * kHeadDimension;
   result.chunkKeys = makeBuffer(device, chunkElements * sizeof(BFloat16Bits));
   result.chunkValues =
@@ -183,10 +210,6 @@ Case makeCase(id<MTLDevice> device, uint32_t committed, uint32_t chunk,
 }
 
 void fillHistory(Case &data) {
-  auto *keys = static_cast<int8_t *>(data.q8Keys.contents);
-  auto *keyScales = static_cast<float *>(data.keyScales.contents);
-  auto *values = static_cast<int8_t *>(data.q8Values.contents);
-  auto *valueScales = static_cast<float *>(data.valueScales.contents);
   std::vector<float> pageKeys;
   std::vector<float> pageValues;
   auto quantized = std::make_unique<Q8LayerPage>();
@@ -212,17 +235,14 @@ void fillHistory(Case &data) {
       }
     }
     quantizeLayerPage(pageKeys, pageValues, valid, *quantized);
-    uint32_t physical = data.pageTable[logicalPage];
     std::copy(quantized->keys.begin(), quantized->keys.end(),
-              keys + uint64_t{physical} * kElementsPerLayerPage);
+              data.slab<int8_t>(SPLASH_KV_KEYS, logicalPage));
     std::copy(quantized->keyScales.begin(), quantized->keyScales.end(),
-              keyScales +
-                  uint64_t{physical} * kScalesPerTensorLayerPage);
+              data.slab<float>(SPLASH_KV_KEY_SCALES, logicalPage));
     std::copy(quantized->values.begin(), quantized->values.end(),
-              values + uint64_t{physical} * kElementsPerLayerPage);
+              data.slab<int8_t>(SPLASH_KV_VALUES, logicalPage));
     std::copy(quantized->valueScales.begin(), quantized->valueScales.end(),
-              valueScales +
-                  uint64_t{physical} * kScalesPerTensorLayerPage);
+              data.slab<float>(SPLASH_KV_VALUE_SCALES, logicalPage));
   }
 }
 
@@ -260,12 +280,9 @@ void encodeStore(id<MTLComputeCommandEncoder> encoder,
   [encoder setComputePipelineState:pipeline];
   [encoder setBuffer:data.chunkKeys offset:0 atIndex:0];
   [encoder setBuffer:data.chunkValues offset:0 atIndex:1];
-  [encoder setBuffer:data.q8Keys offset:0 atIndex:2];
-  [encoder setBuffer:data.keyScales offset:0 atIndex:3];
-  [encoder setBuffer:data.q8Values offset:0 atIndex:4];
-  [encoder setBuffer:data.valueScales offset:0 atIndex:5];
-  [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:6];
-  [encoder setBytes:&data.params length:sizeof(data.params) atIndex:7];
+  [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:2];
+  [encoder setBytes:&data.params length:sizeof(data.params) atIndex:3];
+  data.pool->use(encoder, MTLResourceUsageWrite);
   [encoder dispatchThreadgroups:MTLSizeMake(
                                      2 * kKvHeads * data.params.chunk_tokens,
                                      1, 1)
@@ -285,17 +302,14 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
   const Q8PrefillAttentionParams params = overrideParams ? *overrideParams :
       Q8PrefillAttentionParams{data.params.committed_tokens, data.params.chunk_tokens,
                               data.params.chunk_stride, data.params.page_table_entries,
-                              data.params.physical_page_count, plan.splits, 0, 0};
+                              data.params.kv, plan.splits, 0};
   [encoder setComputePipelineState:pipelines.split];
   [encoder setBuffer:data.queries offset:0 atIndex:0];
-  [encoder setBuffer:data.q8Keys offset:0 atIndex:1];
-  [encoder setBuffer:data.keyScales offset:0 atIndex:2];
-  [encoder setBuffer:data.q8Values offset:0 atIndex:3];
-  [encoder setBuffer:data.valueScales offset:0 atIndex:4];
-  [encoder setBuffer:data.partials offset:0 atIndex:5];
-  [encoder setBuffer:data.statistics offset:0 atIndex:6];
-  [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:7];
-  [encoder setBytes:&params length:sizeof(params) atIndex:8];
+  [encoder setBuffer:data.partials offset:0 atIndex:1];
+  [encoder setBuffer:data.statistics offset:0 atIndex:2];
+  [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:3];
+  [encoder setBytes:&params length:sizeof(params) atIndex:4];
+  data.pool->use(encoder, MTLResourceUsageRead);
   [encoder dispatchThreadgroups:MTLSizeMake(plan.splitGroups.x, plan.splitGroups.y,
                                            plan.splitGroups.z)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -311,27 +325,23 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
 
 float loadKey(const Case &data, uint32_t token, uint32_t head,
               uint32_t dimension) {
-  uint32_t physical = data.pageTable[token / kPageTokens];
+  uint32_t logicalPage = token / kPageTokens;
   uint32_t pageToken = token % kPageTokens;
-  float scale = static_cast<const float *>(data.keyScales.contents)[
-      uint64_t{physical} * kScalesPerTensorLayerPage +
-      keyScaleIndex(head, pageToken)];
-  return float(static_cast<const int8_t *>(data.q8Keys.contents)[
-             uint64_t{physical} * kElementsPerLayerPage +
-             keyDataIndex(head, pageToken, dimension)]) *
+  float scale = data.slab<const float>(SPLASH_KV_KEY_SCALES,
+                                       logicalPage)[keyScaleIndex(head, pageToken)];
+  return float(data.slab<const int8_t>(SPLASH_KV_KEYS, logicalPage)[keyDataIndex(
+             head, pageToken, dimension)]) *
          scale;
 }
 
 float loadValue(const Case &data, uint32_t token, uint32_t head,
                 uint32_t dimension) {
-  uint32_t physical = data.pageTable[token / kPageTokens];
+  uint32_t logicalPage = token / kPageTokens;
   uint32_t pageToken = token % kPageTokens;
-  float scale = static_cast<const float *>(data.valueScales.contents)[
-      uint64_t{physical} * kScalesPerTensorLayerPage +
-      valueScaleIndex(head, pageToken)];
-  return float(static_cast<const int8_t *>(data.q8Values.contents)[
-             uint64_t{physical} * kElementsPerLayerPage +
-             valueDataIndex(head, pageToken, dimension)]) *
+  float scale = data.slab<const float>(SPLASH_KV_VALUE_SCALES,
+                                       logicalPage)[valueScaleIndex(head, pageToken)];
+  return float(data.slab<const int8_t>(SPLASH_KV_VALUES, logicalPage)[valueDataIndex(
+             head, pageToken, dimension)]) *
          scale;
 }
 
@@ -499,23 +509,19 @@ void validateStoredRow(const Case &data, bool valueTensor,
   std::vector<int8_t> expected =
       expectedRow(data, valueTensor, chunkToken, variant, expectedScale);
   uint32_t logical = data.params.committed_tokens + chunkToken;
-  uint32_t physical = data.pageTable[logical / kPageTokens];
+  uint32_t logicalPage = logical / kPageTokens;
   uint32_t pageToken = logical % kPageTokens;
-  const auto *scales = static_cast<const float *>(
-      valueTensor ? data.valueScales.contents : data.keyScales.contents);
-  float observedScale = scales[
-      uint64_t{physical} * kScalesPerTensorLayerPage +
-      (valueTensor ? valueScaleIndex(0, pageToken)
-                   : keyScaleIndex(0, pageToken))];
+  const auto *scales = data.slab<const float>(
+      valueTensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES, logicalPage);
+  float observedScale = scales[valueTensor ? valueScaleIndex(0, pageToken)
+                                           : keyScaleIndex(0, pageToken)];
   require(std::abs(observedScale - expectedScale) <= 2e-7f,
           "stored Q8 row scale differs");
-  const auto *stored = static_cast<const int8_t *>(
-      valueTensor ? data.q8Values.contents : data.q8Keys.contents);
+  const auto *stored = data.slab<const int8_t>(
+      valueTensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS, logicalPage);
   for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-    uint64_t index = uint64_t{physical} * kElementsPerLayerPage +
-                     (valueTensor
-                          ? valueDataIndex(0, pageToken, dimension)
-                          : keyDataIndex(0, pageToken, dimension));
+    uint64_t index = valueTensor ? valueDataIndex(0, pageToken, dimension)
+                                 : keyDataIndex(0, pageToken, dimension);
     require(stored[index] == expected[dimension],
             "stored Q8 row payload differs");
   }
@@ -672,17 +678,22 @@ void testChunkAndSplitReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
         offset += chunk;
       }
       require(offset == rows, "chunk reference test changed total logical rows");
-      // All even physical pages are unleased: direct store must preserve them.
-      for (uint32_t page = 0; page < data.params.physical_page_count; page += 2) {
-        const auto checkZero = [&](id<MTLBuffer> buffer, uint64_t pageBytes) {
-          const auto *bytes = static_cast<const uint8_t *>(buffer.contents) + page * pageBytes;
-          require(std::all_of(bytes, bytes + pageBytes, [](uint8_t value) { return value == 0; }),
-                  "noncontiguous unleased Q8 page was overwritten");
-        };
-        checkZero(data.q8Keys, kKeyDataBytesPerLayerPage);
-        checkZero(data.q8Values, kValueDataBytesPerLayerPage);
-        checkZero(data.keyScales, kKeyScaleBytesPerLayerPage);
-        checkZero(data.valueScales, kValueScaleBytesPerLayerPage);
+      // Pages no table leases, and the other layer of every page, must keep
+      // their zeros through the direct stores.
+      const HostKvExtents &pages = *data.pool->pages;
+      for (uint32_t page = 0; page < pages.pageCount(); ++page) {
+        const bool leased = std::find(data.pageTable.begin(), data.pageTable.end(),
+                                      page) != data.pageTable.end();
+        for (uint32_t layer = 0; layer <= kLayer; ++layer)
+          for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor) {
+            if (leased && layer == kLayer) continue;
+            const auto *bytes = pages.slab<const uint8_t>(layer, tensor, page);
+            const uint64_t pageBytes =
+                tensor % 2 ? kKeyScaleBytesPerLayerPage : kKeyDataBytesPerLayerPage;
+            require(std::all_of(bytes, bytes + pageBytes,
+                                [](uint8_t value) { return value == 0; }),
+                    "an unleased Q8 page or another layer was overwritten");
+          }
       }
     }
 }
@@ -696,13 +707,13 @@ void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const Q8PrefillAttentionParams valid{
       data.params.committed_tokens, data.params.chunk_tokens,
       data.params.chunk_stride, data.params.page_table_entries,
-      data.params.physical_page_count, plan.splits, 0, 0};
+      data.params.kv, plan.splits, 0};
   for (uint32_t invalidField = 0; invalidField < 4; ++invalidField) {
     auto params = valid;
     if (invalidField == 0) params.split_count = 0;
     if (invalidField == 1) params.split_count = 33;
     if (invalidField == 2) params.reserved0 = 1;
-    if (invalidField == 3) params.reserved1 = 1;
+    if (invalidField == 3) params.kv.extent_pages = 0;
     for (id<MTLBuffer> buffer : {data.partials, data.statistics, data.output})
       std::memset(buffer.contents, 0xa5, buffer.length);
     id<MTLCommandBuffer> command = [queue commandBuffer];
@@ -714,7 +725,7 @@ void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
       const auto *bytes = static_cast<const uint8_t *>(buffer.contents);
       require(std::all_of(bytes, bytes + buffer.length,
                           [](uint8_t value) { return value == 0xa5; }),
-              "invalid prefill split count or reserved field wrote scratch/output");
+              "invalid prefill split count, reserved field or KV layer wrote scratch/output");
     }
   }
 }
@@ -763,7 +774,6 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   constexpr uint32_t committed = 31;
   constexpr uint32_t rows = 8;
   constexpr uint32_t stride = 32;
-  constexpr uint32_t physicalPages = lanes * 2;
   constexpr uint64_t laneElements =
       uint64_t{kKvHeads} * stride * kHeadDimension;
 
@@ -771,14 +781,10 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
       makeBuffer(device, lanes * laneElements * sizeof(BFloat16Bits));
   id<MTLBuffer> chunkValues =
       makeBuffer(device, lanes * laneElements * sizeof(BFloat16Bits));
-  id<MTLBuffer> q8Keys = makeBuffer(
-      device, uint64_t{physicalPages} * kKeyDataBytesPerLayerPage);
-  id<MTLBuffer> keyScales = makeBuffer(
-      device, uint64_t{physicalPages} * kKeyScaleBytesPerLayerPage);
-  id<MTLBuffer> q8Values = makeBuffer(
-      device, uint64_t{physicalPages} * kValueDataBytesPerLayerPage);
-  id<MTLBuffer> valueScales = makeBuffer(
-      device, uint64_t{physicalPages} * kValueScaleBytesPerLayerPage);
+  const auto geometry = HostKvExtents::spread(2 * lanes);
+  const Pool pool(device, geometry);
+  const std::vector<uint32_t> ids =
+      HostKvExtents::mixedPages(geometry, 2 * lanes, lanes);
 
   std::array<Q8ChunkedPrefillParams, lanes> params{};
   std::array<std::array<uint32_t, 2>, lanes> tables{};
@@ -786,11 +792,10 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   auto *keys = static_cast<BFloat16Bits *>(chunkKeys.contents);
   auto *values = static_cast<BFloat16Bits *>(chunkValues.contents);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    params[lane] = {committed, rows, stride, 2, physicalPages, 0, 0, 0};
-    tables[lane] = {lane * 2, lane * 2 + 1};
-    tableBuffers[lane] = makeBuffer(device, 2 * sizeof(uint32_t));
-    std::memcpy(tableBuffers[lane].contents, tables[lane].data(),
-                2 * sizeof(uint32_t));
+    params[lane] = {committed, rows, stride, 2, pool.pages->layer(kLayer).kv, 0, 0};
+    tables[lane] = {ids[lane * 2], ids[lane * 2 + 1]};
+    tableBuffers[lane] = makeBuffer(device, 2 * sizeof(SplashKvPage));
+    pool.pages->writeTable(tables[lane], tableBuffers[lane].contents);
     for (uint32_t head = 0; head < kKvHeads; ++head) {
       for (uint32_t token = 0; token < rows; ++token) {
         const uint32_t global = committed + token;
@@ -813,30 +818,24 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setComputePipelineState:store];
   [encoder setBuffer:chunkKeys offset:0 atIndex:0];
   [encoder setBuffer:chunkValues offset:0 atIndex:1];
-  [encoder setBuffer:q8Keys offset:0 atIndex:2];
-  [encoder setBuffer:keyScales offset:0 atIndex:3];
-  [encoder setBuffer:q8Values offset:0 atIndex:4];
-  [encoder setBuffer:valueScales offset:0 atIndex:5];
   for (uint32_t lane = 0; lane < lanes; ++lane)
-    [encoder setBuffer:tableBuffers[lane] offset:0 atIndex:6 + lane];
-  [encoder setBytes:params.data() length:sizeof(params) atIndex:10];
+    [encoder setBuffer:tableBuffers[lane] offset:0 atIndex:2 + lane];
+  [encoder setBytes:params.data() length:sizeof(params) atIndex:6];
+  pool.use(encoder, MTLResourceUsageWrite);
   [encoder dispatchThreadgroups:MTLSizeMake(
                                      lanes * 2 * rows * kKvHeads, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(kHeadDimension, 1, 1)];
   [encoder endEncoding];
   finish(command);
 
-  const auto *storedKeys = static_cast<const int8_t *>(q8Keys.contents);
-  const auto *storedValues = static_cast<const int8_t *>(q8Values.contents);
-  const auto *storedKeyScales =
-      static_cast<const float *>(keyScales.contents);
-  const auto *storedValueScales =
-      static_cast<const float *>(valueScales.contents);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     for (uint32_t token : {0U, rows - 1}) {
       const uint32_t global = committed + token;
       const uint32_t page = tables[lane][global / kPageTokens];
       const uint32_t pageToken = global % kPageTokens;
+      const auto slab = [&](uint32_t tensor) {
+        return pool.pages->slab<const std::byte>(kLayer, tensor, page);
+      };
       for (bool valueTensor : {false, true}) {
         float maximum = 0.0f;
         std::array<float, kHeadDimension> source{};
@@ -849,11 +848,9 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
           maximum = std::max(maximum, std::abs(source[dimension]));
         }
         const float expectedScale = maximum / 127.0f;
-        const float observedScale =
-            (valueTensor ? storedValueScales : storedKeyScales)[
-                uint64_t{page} * kScalesPerTensorLayerPage +
-                (valueTensor ? valueScaleIndex(0, pageToken)
-                             : keyScaleIndex(0, pageToken))];
+        const float observedScale = reinterpret_cast<const float *>(
+            slab(valueTensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES))[
+            valueTensor ? valueScaleIndex(0, pageToken) : keyScaleIndex(0, pageToken)];
         require(std::abs(expectedScale - observedScale) <= 2e-7f,
                 "batched verify store scale differs");
         for (uint32_t dimension = 0; dimension < kHeadDimension;
@@ -861,15 +858,36 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
           const int8_t expected = static_cast<int8_t>(std::clamp(
               int(std::nearbyint(source[dimension] * 127.0f / maximum)),
               -127, 127));
-          const uint64_t index =
-              uint64_t{page} * kElementsPerLayerPage +
-              (valueTensor ? valueDataIndex(0, pageToken, dimension)
-                           : keyDataIndex(0, pageToken, dimension));
-          require((valueTensor ? storedValues : storedKeys)[index] == expected,
+          const uint64_t index = valueTensor ? valueDataIndex(0, pageToken, dimension)
+                                             : keyDataIndex(0, pageToken, dimension);
+          require(reinterpret_cast<const int8_t *>(
+                      slab(valueTensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS))[index] ==
+                      expected,
                   "batched verify store payload differs");
         }
       }
     }
+  }
+}
+
+// A zero table entry is no page: a store through it writes nothing.
+void testZeroEntryStoresNothing(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                                id<MTLComputePipelineState> store) {
+  Case data = makeCase(device, 40, 8, 32);
+  for (id<MTLBuffer> extent : data.pool->extents)
+    std::memset(extent.contents, 0xa5, extent.length);
+  static_cast<SplashKvPage *>(data.pageTableBuffer.contents)[1] = 0;
+  fillCurrent(data);
+  id<MTLCommandBuffer> command = [queue commandBuffer];
+  id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+  encodeStore(encoder, store, data);
+  [encoder endEncoding];
+  finish(command);
+  for (id<MTLBuffer> extent : data.pool->extents) {
+    const auto *bytes = static_cast<const uint8_t *>(extent.contents);
+    require(std::all_of(bytes, bytes + extent.length,
+                        [](uint8_t value) { return value == 0xa5; }),
+            "a store through a zero page entry wrote KV");
   }
 }
 
@@ -879,11 +897,10 @@ void testContract() {
   static_assert(offsetof(Q8PrefillAttentionParams, rows) == 4);
   static_assert(offsetof(Q8PrefillAttentionParams, chunk_stride) == 8);
   static_assert(offsetof(Q8PrefillAttentionParams, page_table_entries) == 12);
-  static_assert(offsetof(Q8PrefillAttentionParams, physical_page_count) == 16);
-  static_assert(offsetof(Q8PrefillAttentionParams, split_count) == 20);
-  static_assert(offsetof(Q8PrefillAttentionParams, reserved0) == 24);
-  static_assert(offsetof(Q8PrefillAttentionParams, reserved1) == 28);
-  Q8ChunkedPrefillParams params{129, 8, 32, 5, 8, 0, 0, 0};
+  static_assert(offsetof(Q8PrefillAttentionParams, kv) == 16);
+  static_assert(offsetof(Q8PrefillAttentionParams, split_count) == 24);
+  static_assert(offsetof(Q8PrefillAttentionParams, reserved0) == 28);
+  Q8ChunkedPrefillParams params{129, 8, 32, 5, {}, 0, 0};
   require(chunkedPrefillValid(params),
           "partial committed page must be a valid direct-Q8 input");
   require(chunkedPrefillRequiredPages(params) == 5,
@@ -898,9 +915,7 @@ void testContract() {
       32,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) /
           kPageTokens,
-      (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) /
-          kPageTokens,
-      0,
+      {},
       0,
       0};
   require(chunkedPrefillValid(finalCycle),
@@ -934,6 +949,7 @@ void run(const char *libraryPath) {
   testChunkAndSplitReference(device, queue, store, attention);
   testInvalidAttentionParams(device, queue, attention);
   testCommitIndexOverwrite(device, queue, store);
+  testZeroEntryStoresNothing(device, queue, store);
   testBatchedVerifyStore(device, queue, verifyStore);
   std::cout << "q8_chunked_prefill_metal_test: ok\n";
 }

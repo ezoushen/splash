@@ -26,9 +26,9 @@ uint64_t KvCopy::tableBytes(uint32_t stagingSlots) noexcept {
   return uint64_t{stagingSlots} * sizeof(SplashKvCopySlot);
 }
 
-void KvCopy::setEntry(const metal::MetalBuffer &table, uint32_t slot, uint32_t page,
+void KvCopy::setEntry(const metal::MetalBuffer &table, uint32_t slot, SplashKvPage page,
                       Direction value) noexcept {
-  static_cast<SplashKvCopySlot *>(table.contents())[slot] = {page, direction(value)};
+  static_cast<SplashKvCopySlot *>(table.contents())[slot] = {page, direction(value), 0};
 }
 
 void KvCopy::addPages(metal::CommandGraph &graph, const kv::PageStorage &pages,
@@ -39,17 +39,13 @@ void KvCopy::addPages(metal::CommandGraph &graph, const kv::PageStorage &pages,
   params.data_bytes = static_cast<uint32_t>(layout.dataBytesPerLayerPage());
   params.scale_bytes = static_cast<uint32_t>(layout.scaleBytesPerLayerPage());
   params.slot_bytes = static_cast<uint32_t>(slotBytes);
-  params.physical_pages = pages.pageCount();
+  params.extent_pages = pages.extentPages();
   params.staging_slots = stagingSlots;
   for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer) {
-    const kv::LayerStorage &storage = pages.layer(layer);
     params.layer_offset = static_cast<uint32_t>(layer * layout.bytesPerLayerPage());
-    // BF16 has no scales. Bind valid buffers to those zero-byte copy ranges.
-    graph.add("kv_copy_pages",
-              {storage.keyData, params.scale_bytes ? storage.keyScales : storage.keyData,
-               storage.valueData, params.scale_bytes ? storage.valueScales : storage.valueData,
-               staging, table},
-              params, {stagingSlots, 1, 1}, {kCopyThreads, 1, 1});
+    params.layer = layer;
+    graph.add("kv_copy_pages", {staging, table}, params, {stagingSlots, 1, 1},
+              {kCopyThreads, 1, 1});
   }
 }
 

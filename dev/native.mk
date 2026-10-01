@@ -391,8 +391,8 @@ $(TEST_Q8_ATTENTION_LIB): $(TEST_Q8_KERNEL_AIRS) $(TEST_Q8_AIR) $(TEST_RESIDENCY
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
 $(TEST_Q8_ATTENTION_TEST): dev/tests/engine/q8_flash_attention_metal_test.mm \
-		$(TEST_Q8_ATTENTION_LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(TEST_Q8_ATTENTION_LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_Q8_PREFILL_TEST): dev/tests/engine/q8_chunked_prefill_metal_test.mm \

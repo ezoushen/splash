@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/PagedAttention.h"
+#include "metal/kernels/common/kv_extent.h"
 #include "metal/kernels/common/q8_paging.h"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
@@ -26,8 +27,8 @@ splash_chunk_contract_valid(constant SplashChunkedPrefillParams &params) {
          params.chunk_stride <= SplashChunkMaximumRows &&
          params.chunk_stride % SPLASH_TARGET_KV_BLOCK_TOKENS == 0 &&
          params.page_table_entries >= required_pages &&
-         params.physical_page_count > 0 && params.reserved0 == 0 &&
-         params.reserved1 == 0 && params.reserved2 == 0;
+         params.kv.extent_pages > 0 && params.reserved0 == 0 &&
+         params.reserved1 == 0;
 }
 
 inline ulong splash_current_key_index(uint stride, uint head, uint token,
@@ -41,19 +42,23 @@ inline ulong splash_current_value_index(uint stride, uint head, uint token,
 }
 
 // One lane per dimension stores a current row in its final page slot.
-// INT8 derives a per-row scale; BF16 copies the original bits.
+// INT8 derives a per-row scale; BF16 copies the original bits. A zero table
+// entry has no page and stores nothing. Slots are addressed inside the
+// head's slab of the page: the page index functions at page zero and head
+// zero.
 template <uint KVHeads, typename CacheElement>
 __attribute__((always_inline)) inline void splash_store_kv_row(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
-    device CacheElement *cache_keys, device float *key_scales_buffer, device CacheElement *cache_values,
-    device float *value_scales_buffer, device const uint *page_table,
+    device const SplashKvPage *page_table,
     constant SplashChunkedPrefillParams &params, threadgroup float *maxima,
     bool value_tensor, uint head, uint chunk_token, uint dimension,
     uint simd_lane, uint simd_group) {
   uint logical_token = params.committed_tokens + chunk_token;
-  uint physical_page = page_table[logical_token / SplashQ8PageTokens];
-  if (physical_page >= params.physical_page_count)
+  const SplashKvPage page = page_table[logical_token / SplashQ8PageTokens];
+  if (!page)
     return;
+  const SplashKvPageTensors<CacheElement> slab =
+      SplashKvAddressing<KVHeads, CacheElement>(params.kv, head).page(page);
   uint page_token = logical_token % SplashQ8PageTokens;
   ulong source_index =
       value_tensor ? splash_current_value_index(params.chunk_stride, head,
@@ -64,11 +69,9 @@ __attribute__((always_inline)) inline void splash_store_kv_row(
 
   if constexpr (is_same<CacheElement, bfloat>::value) {
     if (value_tensor)
-      cache_values[splash_q8_value_index<KVHeads>(physical_page, head, page_token,
-                                               dimension)] = source;
+      slab.values[splash_q8_value_index<KVHeads>(0, 0, page_token, dimension)] = source;
     else
-      cache_keys[splash_q8_key_index<KVHeads>(physical_page, head, page_token,
-                                           dimension)] = source;
+      slab.keys[splash_q8_key_index<KVHeads>(0, 0, page_token, dimension)] = source;
     return;
   } else {
 
@@ -92,17 +95,15 @@ __attribute__((always_inline)) inline void splash_store_kv_row(
                         : clamp(int(rint(value * 127.0f / maximum)), -127, 127);
 
     if (value_tensor) {
-      cache_values[splash_q8_value_index<KVHeads>(physical_page, head, page_token,
-                                                dimension)] = char(quantized);
+      slab.values[splash_q8_value_index<KVHeads>(0, 0, page_token, dimension)] =
+          char(quantized);
       if (dimension == 0)
-        value_scales_buffer[splash_q8_scale_index<KVHeads>(physical_page, head,
-                                                         page_token)] = scale;
+        slab.value_scales[splash_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
     } else {
-      cache_keys[splash_q8_key_index<KVHeads>(physical_page, head, page_token,
-                                            dimension)] = char(quantized);
+      slab.keys[splash_q8_key_index<KVHeads>(0, 0, page_token, dimension)] =
+          char(quantized);
       if (dimension == 0)
-        key_scales_buffer[splash_q8_scale_index<KVHeads>(physical_page, head,
-                                                       page_token)] = scale;
+        slab.key_scales[splash_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
     }
   }
 }

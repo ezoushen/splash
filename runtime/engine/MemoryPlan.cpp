@@ -58,9 +58,7 @@ std::string deviceStatusJson(const DeviceCapabilities &device) {
       << device.maxThreadgroupMemoryBytes << ','
       << "\"max_threadgroup_width\":" << device.maxThreadgroupWidth << ','
       << "\"has_unified_memory\":"
-      << (device.hasUnifiedMemory ? "true" : "false") << ','
-      << "\"supports_placement_sparse\":"
-      << (device.supportsPlacementSparse ? "true" : "false") << '}';
+      << (device.hasUnifiedMemory ? "true" : "false") << '}';
   return out.str();
 }
 
@@ -162,11 +160,8 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
       << "\"dynamic_budget_bytes\":" << dynamicBudgetBytes << ','
       << "\"kv_page_tokens\":" << kvPageTokens << ','
       << "\"kv_page_bytes\":" << kvPageBytes << ','
-      << "\"kv_sparse_mapping_batch_pages\":" << kvSparseMappingBatchPages
-      << ','
       << "\"kv_extent_pages\":" << kvExtentPages << ','
       << "\"kv_extent_bytes\":" << kvExtentBytes << ','
-      << "\"maximum_kv_pages\":" << maximumKvPages << ','
       << "\"kv_virtual_pages\":" << kvVirtualPages << ','
       << "\"kv_virtual_bytes\":" << kvVirtualBytes << ','
       << "\"kv_virtual_tokens\":" << kvVirtualTokens << ','
@@ -203,11 +198,10 @@ std::string EngineMemoryBreakdown::describe() const {
       << "elastic state/KV budget: " << bytesAndMiB(dynamicBudgetBytes) << '\n'
       << "KV page: " << kvPageTokens << " tokens, "
       << bytesAndMiB(kvPageBytes) << '\n'
-      << "KV physical extent: " << kvExtentPages << " pages, "
+      << "KV extent: " << kvExtentPages << " pages, "
       << bytesAndMiB(kvExtentBytes) << '\n'
-      << "KV virtual address space: " << kvVirtualPages << " pages / "
-      << kvVirtualTokens << " tokens (geometry maximum " << maximumKvPages
-      << ")\n"
+      << "KV pool: " << kvVirtualPages << " pages / " << kvVirtualTokens
+      << " tokens\n"
       << "minimum dynamic runtime: " << bytesAndMiB(minimumDynamicBytes) << '\n'
       << "minimum required: " << bytesAndMiB(minimumRequiredBytes) << '\n'
       << "deficit: " << bytesAndMiB(deficitBytes);
@@ -291,9 +285,6 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       model.footprint.runtimeOverheadReserveBytes;
   breakdown.kvStagingBytes = model.footprint.kvStagingBytes;
   breakdown.kvPageTokens = kv::kPageTokens;
-  breakdown.kvSparseMappingBatchPages =
-      model.targetKvLayout.sparseMappingBatchPages();
-  breakdown.kvExtentPages = model.targetKvLayout.backingExtentPages();
 
   if (auto error = device.validationError()) {
     return {std::nullopt, failure(BudgetErrorCode::InvalidDeviceCapabilities,
@@ -321,9 +312,12 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       breakdown.hardBudgetBytes > breakdown.fixedRuntimeBytes
           ? breakdown.hardBudgetBytes - breakdown.fixedRuntimeBytes
           : 0;
-  if (!checkedMultiply(breakdown.kvPageBytes, breakdown.kvExtentPages,
-                       breakdown.kvExtentBytes) ||
-      !checkedAdd(breakdown.activeStateCellBytes, breakdown.kvExtentBytes,
+  // The minimum holds one state cell and the smallest extent a pool can use.
+  uint64_t minimumExtentBytes = 0;
+  if (!checkedMultiply(breakdown.kvPageBytes,
+                       model.targetKvLayout.minimumExtentPages(),
+                       minimumExtentBytes) ||
+      !checkedAdd(breakdown.activeStateCellBytes, minimumExtentBytes,
                   breakdown.minimumDynamicBytes) ||
       !checkedAdd(breakdown.fixedRuntimeBytes, breakdown.minimumDynamicBytes,
                   breakdown.minimumRequiredBytes)) {
@@ -332,37 +326,32 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                     "minimum elastic runtime footprint overflows uint64",
                     std::move(breakdown))};
   }
-  const uint64_t largestBufferBytesPerPage =
-      std::max(model.targetKvLayout.dataBytesPerLayerPage(),
-               model.targetKvLayout.scaleBytesPerLayerPage());
-  uint64_t geometryMaximum =
-      device.maxBufferLengthBytes / largestBufferBytesPerPage;
-  geometryMaximum -= geometryMaximum % breakdown.kvSparseMappingBatchPages;
-  if (geometryMaximum > std::numeric_limits<uint32_t>::max()) {
-    geometryMaximum = std::numeric_limits<uint32_t>::max();
-    geometryMaximum -= geometryMaximum % breakdown.kvSparseMappingBatchPages;
-  }
-  breakdown.maximumKvPages = static_cast<uint32_t>(geometryMaximum);
+  // Page ids stay 32-bit. The pool is the whole extents of the size that
+  // leaves the fewest of the budget's pages unused.
   const uint64_t availableForOneRequestKv =
       breakdown.dynamicBudgetBytes > breakdown.activeStateCellBytes
           ? breakdown.dynamicBudgetBytes - breakdown.activeStateCellBytes
           : 0;
-  uint64_t clampedKvPages =
+  const uint64_t budgetPages =
       std::min<uint64_t>(availableForOneRequestKv / breakdown.kvPageBytes,
-                         breakdown.maximumKvPages);
-  clampedKvPages -= clampedKvPages % breakdown.kvSparseMappingBatchPages;
-  breakdown.kvVirtualPages = static_cast<uint32_t>(clampedKvPages);
+                         std::numeric_limits<uint32_t>::max());
+  breakdown.kvExtentPages = model.targetKvLayout.extentPagesFor(budgetPages);
+  if (breakdown.kvExtentPages) {
+    breakdown.kvVirtualPages = static_cast<uint32_t>(
+        budgetPages - budgetPages % breakdown.kvExtentPages);
+  }
 
-  if (!checkedMultiply(breakdown.kvPageBytes, breakdown.kvVirtualPages,
+  if (!checkedMultiply(breakdown.kvPageBytes, breakdown.kvExtentPages,
+                       breakdown.kvExtentBytes) ||
+      !checkedMultiply(breakdown.kvPageBytes, breakdown.kvVirtualPages,
                        breakdown.kvVirtualBytes) ||
       !checkedMultiply(breakdown.kvPageTokens, breakdown.kvVirtualPages,
                        breakdown.kvVirtualTokens)) {
     return {std::nullopt, failure(BudgetErrorCode::ArithmeticOverflow,
-                                  "virtual KV capacity overflows uint64",
+                                  "KV pool capacity overflows uint64",
                                   std::move(breakdown))};
   }
-  if (breakdown.maximumKvPages < breakdown.kvExtentPages ||
-      breakdown.kvVirtualPages < breakdown.kvExtentPages ||
+  if (!breakdown.kvExtentPages ||
       breakdown.dynamicBudgetBytes < breakdown.minimumDynamicBytes) {
     if (breakdown.minimumRequiredBytes > breakdown.hardBudgetBytes) {
       breakdown.deficitBytes =
@@ -372,8 +361,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
         std::nullopt,
         failure(
             BudgetErrorCode::KvPoolDoesNotFit,
-            "hard budget or Metal geometry cannot fit one active state cell "
-            "and one KV physical extent",
+            "hard budget cannot fit one active state cell and one KV extent",
             std::move(breakdown))};
   }
 

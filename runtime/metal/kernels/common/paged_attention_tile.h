@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/PagedAttention.h"
+#include "metal/kernels/common/kv_extent.h"
 #include "metal/kernels/common/q8_paging.h"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
@@ -34,11 +35,11 @@ inline bool splash_q8_prefill_attention_contract_valid(
              (params.committed_tokens + params.rows +
               SplashQ8PageTokens - 1) /
                  SplashQ8PageTokens &&
-         params.physical_page_count > 0 && params.split_count > 0 &&
+         params.kv.extent_pages > 0 && params.split_count > 0 &&
          params.split_count <= SplashPrefillMaximumSplits &&
          ulong(params.committed_tokens) + params.rows <=
              ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS) &&
-         params.reserved0 == 0 && params.reserved1 == 0;
+         params.reserved0 == 0;
 }
 
 inline bool splash_q8_verify_attention_contract_valid(
@@ -51,14 +52,13 @@ inline bool splash_q8_verify_attention_contract_valid(
              (params.committed_tokens + params.active_rows +
               SplashQ8PageTokens - 1) /
                  SplashQ8PageTokens &&
-         params.physical_page_count > 0 &&
+         params.kv.extent_pages > 0 &&
          ulong(params.committed_tokens) + params.active_rows <=
              ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS) &&
          params.split_count > 0 &&
          params.split_count <= SplashVerifyMaximumSplits &&
          params.slot_splits >= params.split_count &&
-         params.slot_splits <= SplashVerifyMaximumSplits &&
-         params.reserved2 == 0;
+         params.slot_splits <= SplashVerifyMaximumSplits;
 }
 
 // Split and reduce derive the same balanced partition of each query tile's
@@ -79,8 +79,8 @@ inline uint splash_attention_pages_per_split(uint pages, uint splits) {
 // (kv4_g6: simdgroups 6 and 7) only take part in the caller's barriers.
 // The float4 loads need 16-byte aligned slabs (alignas in the entries) and
 // the page's 32 key and value scales as float4 vectors, in device memory
-// (splash_q8_scale_index is a multiple of 32 floats and the bound scale
-// buffers start at their placement-aligned base).
+// (splash_q8_scale_index is a multiple of 32 floats and every region of an
+// extent starts 64 KiB-aligned).
 // Rows whose running maximum grew atomically set the shared boolean rescale
 // flag. Existing threadgroup barriers separate reset, concurrent set, and
 // read; relaxed atomics make the same-value writes safe without changing
@@ -180,15 +180,15 @@ inline void splash_attention_page_softmax(
 // in place as device tensor operands: the prefill tile, and the verify tile
 // in its direct placement, which differs only in RowsPerTile. Queries are
 // KV-head-major [kv head][row][query head in group][dimension], so the tile's
-// fused rows form one contiguous M x D tensor. Three barriers per page order
-// the score store, the softmax and the probability reads of PV.
+// fused rows form one contiguous M x D tensor. Each page is reached through
+// its table entry (kv_extent.h).
+// Three barriers per page order the score store, the softmax and the
+// probability reads of PV.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
           bool ScaleInSoftmax, typename CacheElement>
 inline void splash_paged_attention_tile(
-    device bfloat *tile_queries, device CacheElement *cache_keys,
-    device const float *key_scales_buffer, device CacheElement *cache_values,
-    device const float *value_scales_buffer, device const uint *page_table,
-    uint kv_head, uint committed_tokens, uint active_rows, uint splits,
+    device bfloat *tile_queries, device const SplashKvPage *page_table,
+    SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
@@ -215,9 +215,11 @@ inline void splash_paged_attention_tile(
   auto st = tensor(scores, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto pt = tensor(probabilities, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto p0 = pt.slice<N, M>(0, 0);
-  auto key_type = tensor(cache_keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
-  auto value_type =
-      tensor(cache_values, dextents<int, 2>{N, D}, array<int, 2>{1, N});
+  auto key_type = tensor(static_cast<device CacheElement *>(nullptr),
+                         dextents<int, 2>{D, N}, array<int, 2>{1, D});
+  auto value_type = tensor(static_cast<device CacheElement *>(nullptr),
+                           dextents<int, 2>{N, D}, array<int, 2>{1, N});
+  const SplashKvAddressing<KVHeads, CacheElement> addressing(kv, kv_head);
   auto q0 = qt.slice<D, M>(0, 0);
   auto k0 = key_type.template slice<D, N>(0, 0);
   auto v0 = value_type.template slice<N, D>(0, 0);
@@ -244,21 +246,13 @@ inline void splash_paged_attention_tile(
   }
 
   for (uint page = page_begin; page < page_end; ++page) {
-    uint physical = page_table[page];
+    const SplashKvPageTensors<CacheElement> tensors =
+        addressing.page(page_table[page]);
     uint token_start = page * N;
-    auto kt = tensor(
-        cache_keys + splash_q8_key_index<KVHeads>(physical, kv_head, 0, 0),
-        dextents<int, 2>{D, N}, array<int, 2>{1, D});
-    auto vt = tensor(
-        cache_values + splash_q8_value_index<KVHeads>(physical, kv_head, 0, 0),
-        dextents<int, 2>{N, D}, array<int, 2>{1, N});
-    device const float *key_scales = nullptr;
-    device const float *value_scales = nullptr;
-    if constexpr (Quantized) {
-      ulong scale_index = splash_q8_scale_index<KVHeads>(physical, kv_head, 0);
-      key_scales = key_scales_buffer + scale_index;
-      value_scales = value_scales_buffer + scale_index;
-    }
+    auto kt = tensor(tensors.keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
+    auto vt = tensor(tensors.values, dextents<int, 2>{N, D}, array<int, 2>{1, N});
+    device const float *key_scales = tensors.key_scales;
+    device const float *value_scales = tensors.value_scales;
 
     auto page_scores = qk.template get_destination_cooperative_tensor<
         decltype(q0), decltype(k0), float>();

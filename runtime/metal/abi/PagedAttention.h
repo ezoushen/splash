@@ -7,6 +7,8 @@
 #include <stdint.h>
 #endif
 
+#include "metal/abi/KvExtent.h"
+
 struct FullPrefillParams {
   uint32_t tokens;
   uint32_t cache_stride;
@@ -30,16 +32,16 @@ static_assert(sizeof(FullDecodeBatchParams) == 16,
 // into its final Q8 page slot before attention. Prefill and verify both read
 // all visible history from the same paged representation. Decode accepts rows
 // only by advancing committed_tokens; the next command overwrites rejected
-// slots.
+// slots. Page tables hold one SplashKvPage per logical page, and kv places the
+// layer in the pool's extents; the host sets it for each layer it encodes.
 struct SplashChunkedPrefillParams {
   uint32_t committed_tokens;
   uint32_t chunk_tokens;
   uint32_t chunk_stride;
   uint32_t page_table_entries;
-  uint32_t physical_page_count;
+  SplashKvLayer kv;
   uint32_t reserved0;
   uint32_t reserved1;
-  uint32_t reserved2;
 };
 
 static_assert(sizeof(SplashChunkedPrefillParams) == 32,
@@ -52,10 +54,9 @@ struct SplashQ8PrefillAttentionParams {
   uint32_t rows;
   uint32_t chunk_stride;
   uint32_t page_table_entries;
-  uint32_t physical_page_count;
+  SplashKvLayer kv;
   uint32_t split_count;
   uint32_t reserved0;
-  uint32_t reserved1;
 };
 
 static_assert(sizeof(SplashQ8PrefillAttentionParams) == 32,
@@ -66,12 +67,11 @@ struct SplashQ8VerifyAttentionParams {
   uint32_t active_rows;
   uint32_t chunk_stride;
   uint32_t page_table_entries;
-  uint32_t physical_page_count;
+  SplashKvLayer kv;
   // Filled from the plan: this lane's history-scaled split count and the
   // plan-wide slot stride that every lane's partials use.
   uint32_t split_count;
   uint32_t slot_splits;
-  uint32_t reserved2;
 };
 
 static_assert(sizeof(SplashQ8VerifyAttentionParams) == 32,

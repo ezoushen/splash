@@ -70,7 +70,7 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
               kv::Format format) {
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
-                          std::max(16u, layout.backingExtentPages()));
+                        layout.minimumExtentPages(), layout.minimumExtentPages());
   const uint64_t bytes = KvPageTier::slotBytesFor(pages);
   for (bool restoring : {false, true}) {
     bool completed = false;
@@ -106,8 +106,9 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
 // page: a range the kernel skipped would surface as the wrong pattern.
 void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                kv::Layout layout) {
-  const uint32_t extent = layout.backingExtentPages();
-  kv::PageStorage pages(backend, governor.allocationAdmission(), layout, 2 * extent);
+  const uint32_t extent = layout.minimumExtentPages();
+  kv::PageStorage pages(backend, governor.allocationAdmission(), layout, 2 * extent,
+                        extent);
   const uint32_t pageA = extent - 1;
   const uint32_t pageB = extent;
   require(pages.isResident(pageA) && pages.ensureResident(pageB) && pages.isResident(pageB),
@@ -179,7 +180,7 @@ void staging(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
               kv::Format format) {
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
-                          std::max(16u, layout.backingExtentPages()));
+                        layout.minimumExtentPages(), layout.minimumExtentPages());
   const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
   const uint64_t payload = pages.bytesPerPage();
   auto file = std::make_shared<SlotFile>(slotBytes, 3 * slotBytes);
@@ -232,7 +233,7 @@ void shares(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
               kv::Format format) {
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
-                          std::max(16u, layout.backingExtentPages()));
+                        layout.minimumExtentPages(), layout.minimumExtentPages());
   const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
   auto file = std::make_shared<SlotFile>(slotBytes, 8 * slotBytes);
   KvPageTier tier(backend, pages, file, 4);
@@ -274,7 +275,7 @@ void lateReport(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                 kv::Format format) {
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
-                          std::max(16u, layout.backingExtentPages()));
+                        layout.minimumExtentPages(), layout.minimumExtentPages());
   const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
   auto file = std::make_shared<SlotFile>(slotBytes, 2 * slotBytes);
   std::function<void()> late;
@@ -298,7 +299,8 @@ void lateReport(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
     for (uint32_t slot = 0; slot < 4; ++slot) {
       if (table[slot].direction == SPLASH_KV_COPY_NONE) continue;
       ++live;
-      require(table[slot].page == 1 && table[slot].direction == SPLASH_KV_COPY_TO_STAGING,
+      require(table[slot].page == pages.entry(1) &&
+                  table[slot].direction == SPLASH_KV_COPY_TO_STAGING,
               "a command carried another command's copy");
     }
     require(live == 1, "the second command did not carry exactly its own copy");
@@ -318,7 +320,7 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
               kv::Format format) {
   const kv::Layout layout{16, 4, 256, format}; // Qwen3.8-27B
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
-                          std::max(16u, layout.backingExtentPages()));
+                        layout.minimumExtentPages(), layout.minimumExtentPages());
   const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
   auto file = std::make_shared<SlotFile>(slotBytes, 16 * slotBytes);
   {

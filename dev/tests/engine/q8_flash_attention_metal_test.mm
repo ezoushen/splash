@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include "ops/PagedAttention.hpp"
+#include "tuning/HostKvExtents.hpp"
 #include "Q8PageFormatReference.hpp"
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include <vector>
 
 using namespace splash::kv;
+using splash::ops::tuning::HostKvExtents;
 
 namespace {
 
@@ -48,10 +50,9 @@ void testContract() {
       splash::kv::kQ8VerifyMaximumRows,
       32,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens,
-      (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens,
+      {},
       kQ8VerifySplits,
-      kQ8VerifySplits,
-      0};
+      kQ8VerifySplits};
   require(q8VerifyAttentionValidationError(finalCycle).empty(),
           "final fixed-eight verification rows exceeded physical KV scratch");
   Q8VerifyAttentionParams scaled = finalCycle;
@@ -154,15 +155,19 @@ float queryPattern(uint32_t row, uint32_t head, uint32_t dimension) {
   return float(centered) / 2036.0f;
 }
 
+// The attention layer under test is the second of a pool's two, so its region
+// starts past the first one's in every extent.
+constexpr uint32_t kLayer = 1;
+
 struct Case {
   Shape shape;
   Q8VerifyAttentionParams params;
+  // Page ids, and their entries for the kernels.
   std::vector<uint32_t> pageTable;
   id<MTLBuffer> pageTableBuffer;
-  id<MTLBuffer> q8Keys;
-  id<MTLBuffer> keyScales;
-  id<MTLBuffer> q8Values;
-  id<MTLBuffer> valueScales;
+  // The pool's extents, which a dispatch reaching them makes resident.
+  std::vector<id<MTLBuffer>> extents;
+  std::unique_ptr<HostKvExtents> pool;
   id<MTLBuffer> queries;
 
   uint64_t queryIndex(uint32_t head, uint32_t row, uint32_t dimension) const {
@@ -173,34 +178,55 @@ struct Case {
                kHeadDimension +
            dimension;
   }
+  template <typename T> T *slab(uint32_t tensor, uint32_t logicalPage) const {
+    return pool->slab<T>(kLayer, tensor, pageTable[logicalPage]);
+  }
 };
 
+// The case's pages, mixed over three or more extents of its pool, or in one
+// extent of the same pages.
 Case makeCase(id<MTLDevice> device, Shape shape, uint32_t committed,
-              uint32_t activeRows, uint32_t splits) {
+              uint32_t activeRows, uint32_t splits, bool oneExtent = false) {
   Case result;
   result.shape = shape;
-  const Layout layout = shape.layout();
+  Layout layout = shape.layout();
+  layout.attentionLayers = kLayer + 1;
   uint32_t pages = (committed + activeRows + kPageTokens - 1) / kPageTokens;
-  uint32_t physicalPages = pages * 2 + 1;
-  result.params = {committed,     activeRows, kStride, pages,
-                   physicalPages, splits,     splits,  0};
-  result.pageTable.resize(pages);
-  for (uint32_t logical = 0; logical < pages; ++logical)
-    result.pageTable[logical] = (logical * 2 + 1) % physicalPages;
-  result.pageTableBuffer = makeBuffer(device, pages * sizeof(uint32_t));
-  std::memcpy(result.pageTableBuffer.contents, result.pageTable.data(),
-              pages * sizeof(uint32_t));
-  result.q8Keys =
-      makeBuffer(device, uint64_t{physicalPages} * layout.dataBytesPerLayerPage());
-  result.keyScales =
-      makeBuffer(device, uint64_t{physicalPages} * layout.scaleBytesPerLayerPage());
-  result.q8Values =
-      makeBuffer(device, uint64_t{physicalPages} * layout.dataBytesPerLayerPage());
-  result.valueScales =
-      makeBuffer(device, uint64_t{physicalPages} * layout.scaleBytesPerLayerPage());
+  const auto spread = HostKvExtents::spread(pages + 2);
+  const HostKvExtents::Geometry geometry =
+      oneExtent ? HostKvExtents::Geometry{spread.extentPages * spread.extents, 1} : spread;
+  std::vector<HostKvExtents::Extent> extents;
+  for (uint32_t extent = 0; extent < geometry.extents; ++extent) {
+    result.extents.push_back(makeBuffer(
+        device, HostKvExtents::extentBytes(layout, geometry.extentPages)));
+    extents.push_back({static_cast<std::byte *>(result.extents.back().contents),
+                       result.extents.back().gpuAddress});
+  }
+  result.pool = std::make_unique<HostKvExtents>(layout, geometry.extentPages,
+                                                std::move(extents));
+  result.pageTable = HostKvExtents::mixedPages(spread, pages, committed + activeRows);
+  result.pageTableBuffer = makeBuffer(device, pages * sizeof(SplashKvPage));
+  result.pool->writeTable(result.pageTable, result.pageTableBuffer.contents);
+  result.params = {committed,  activeRows, kStride, pages,
+                   result.pool->layer(kLayer).kv, splits, splits};
   uint64_t queryElements =
       uint64_t{shape.queryHeads()} * kQueryStride * kHeadDimension;
   result.queries = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
+  return result;
+}
+
+// The same pages and queries in one extent.
+Case oneExtentCopy(id<MTLDevice> device, const Case &data) {
+  Case result = makeCase(device, data.shape, data.params.committed_tokens,
+                         data.params.active_rows, data.params.split_count, true);
+  const Layout layout = data.shape.layout();
+  const uint64_t dataBytes = layout.dataBytesPerLayerPage();
+  const uint64_t scaleBytes = layout.scaleBytesPerLayerPage();
+  for (uint32_t page = 0; page < data.pageTable.size(); ++page)
+    for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor)
+      std::memcpy(result.slab<std::byte>(tensor, page), data.slab<std::byte>(tensor, page),
+                  tensor % 2 ? scaleBytes : dataBytes);
+  std::memcpy(result.queries.contents, data.queries.contents, data.queries.length);
   return result;
 }
 
@@ -210,10 +236,6 @@ Case makeCase(id<MTLDevice> device, Shape shape, uint32_t committed,
 void fill(Case &data) {
   const Shape shape = data.shape;
   const Layout layout = shape.layout();
-  auto *storedKeys = static_cast<int8_t *>(data.q8Keys.contents);
-  auto *storedKeyScales = static_cast<float *>(data.keyScales.contents);
-  auto *storedValues = static_cast<int8_t *>(data.q8Values.contents);
-  auto *storedValueScales = static_cast<float *>(data.valueScales.contents);
   std::vector<float> pageKeys;
   std::vector<float> pageValues;
   auto quantized = std::make_unique<Q8LayerPage>();
@@ -237,17 +259,16 @@ void fill(Case &data) {
       }
     }
     quantizeLayerPage(pageKeys, pageValues, valid, *quantized);
-    uint32_t physical = data.pageTable[logicalPage];
     const uint64_t elements = layout.elementsPerLayerPage();
     const uint64_t scales = layout.scalesPerTensorLayerPage();
     std::copy_n(quantized->keys.begin(), elements,
-                storedKeys + uint64_t{physical} * elements);
+                data.slab<int8_t>(SPLASH_KV_KEYS, logicalPage));
     std::copy_n(quantized->keyScales.begin(), scales,
-                storedKeyScales + uint64_t{physical} * scales);
+                data.slab<float>(SPLASH_KV_KEY_SCALES, logicalPage));
     std::copy_n(quantized->values.begin(), elements,
-                storedValues + uint64_t{physical} * elements);
+                data.slab<int8_t>(SPLASH_KV_VALUES, logicalPage));
     std::copy_n(quantized->valueScales.begin(), scales,
-                storedValueScales + uint64_t{physical} * scales);
+                data.slab<float>(SPLASH_KV_VALUE_SCALES, logicalPage));
   }
 
   auto *queries = static_cast<BFloat16Bits *>(data.queries.contents);
@@ -260,31 +281,23 @@ void fill(Case &data) {
 
 float loadKey(const Case &data, uint32_t token, uint32_t head,
               uint32_t dimension) {
-  const Layout layout = data.shape.layout();
-  uint32_t physical = data.pageTable[token / kPageTokens];
+  uint32_t logicalPage = token / kPageTokens;
   uint32_t pageToken = token % kPageTokens;
-  float scale = static_cast<const float *>(
-      data.keyScales.contents)[uint64_t{physical} * layout.scalesPerTensorLayerPage() +
-                               keyScaleIndex(head, pageToken)];
-  return float(static_cast<const int8_t *>(
-             data.q8Keys.contents)[uint64_t{physical} * layout.elementsPerLayerPage() +
-                                   keyDataIndex(head, pageToken, dimension)]) *
+  float scale = data.slab<const float>(SPLASH_KV_KEY_SCALES,
+                                       logicalPage)[keyScaleIndex(head, pageToken)];
+  return float(data.slab<const int8_t>(SPLASH_KV_KEYS, logicalPage)[keyDataIndex(
+             head, pageToken, dimension)]) *
          scale;
 }
 
 float loadValue(const Case &data, uint32_t token, uint32_t head,
                 uint32_t dimension) {
-  const Layout layout = data.shape.layout();
-  uint32_t physical = data.pageTable[token / kPageTokens];
+  uint32_t logicalPage = token / kPageTokens;
   uint32_t pageToken = token % kPageTokens;
-  float scale = static_cast<const float *>(
-      data.valueScales
-          .contents)[uint64_t{physical} * layout.scalesPerTensorLayerPage() +
-                     valueScaleIndex(head, pageToken)];
-  return float(static_cast<const int8_t *>(
-             data.q8Values
-                 .contents)[uint64_t{physical} * layout.elementsPerLayerPage() +
-                            valueDataIndex(head, pageToken, dimension)]) *
+  float scale = data.slab<const float>(SPLASH_KV_VALUE_SCALES,
+                                       logicalPage)[valueScaleIndex(head, pageToken)];
+  return float(data.slab<const int8_t>(SPLASH_KV_VALUES, logicalPage)[valueDataIndex(
+             head, pageToken, dimension)]) *
          scale;
 }
 
@@ -405,17 +418,16 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
   [encoder setBuffer:queries offset:0 atIndex:0];
-  [encoder setBuffer:data.q8Keys offset:0 atIndex:1];
-  [encoder setBuffer:data.keyScales offset:0 atIndex:2];
-  [encoder setBuffer:data.q8Values offset:0 atIndex:3];
-  [encoder setBuffer:data.valueScales offset:0 atIndex:4];
-  [encoder setBuffer:partials offset:0 atIndex:5];
-  [encoder setBuffer:statistics offset:0 atIndex:6];
-  for (uint32_t index = 7; index < 11; ++index)
+  [encoder setBuffer:partials offset:0 atIndex:1];
+  [encoder setBuffer:statistics offset:0 atIndex:2];
+  for (uint32_t index = 3; index < 7; ++index)
     [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:index];
   [encoder setBytes:params.data()
               length:sizeof(Q8VerifyAttentionParams) * params.size()
-             atIndex:11];
+             atIndex:7];
+  // The kernel reaches the extents only through the page entries.
+  for (id<MTLBuffer> extent : data.extents)
+    [encoder useResource:extent usage:MTLResourceUsageRead];
   [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, splits, width)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];
@@ -522,11 +534,12 @@ void checkOutput(const Case &data, uint32_t width,
                   "inactive verify row was not zeroed");
 }
 
-// Independent submissions of the same graph must preserve all outputs and
-// scratch results. Report the first differing element before failing.
+// Independent submissions of the same graph, and of the same pages in another
+// extent layout, must preserve all outputs and scratch results. Report the
+// first differing element before failing.
 void requireIdentical(const Pipelines &placement, const Case &data,
                       uint32_t width, const Dispatch &first,
-                      const Dispatch &repeat) {
+                      const Dispatch &repeat, const char *repeated) {
   struct Buffer {
     const char *name;
     const std::vector<uint8_t> Dispatch::*bytes;
@@ -561,7 +574,7 @@ void requireIdentical(const Pipelines &placement, const Case &data,
     for (size_t i = 0; i < std::min(left.size(), right.size()); ++i)
       differing += left[i] != right[i];
     differing += std::max(left.size(), right.size()) - std::min(left.size(), right.size());
-    std::cout << "verify repeat differs from the first submission: pipeline="
+    std::cout << repeated << " differs from the first submission: pipeline="
               << placement.splitName << " kv_heads=" << data.shape.kvHeads
               << " group=" << data.shape.queryHeadsPerKvHead
               << " committed=" << data.params.committed_tokens
@@ -571,13 +584,14 @@ void requireIdentical(const Pipelines &placement, const Case &data,
               << " first_differing_element=" << element << " first=" << value(left)
               << " repeat=" << value(right) << " differing_bytes=" << differing
               << " of " << left.size() << '\n';
-    throw std::runtime_error(
-        "verify repeat is not bit-identical to the first submission");
+    throw std::runtime_error(std::string(repeated) +
+                             " is not bit-identical to the first submission");
   }
 }
 
 // Keep the CPU reference gates for both scale placements and verify that a
-// second independent submission produces identical output and scratch.
+// second independent submission, and the same pages in one extent, produce
+// identical output and scratch.
 void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
              const std::array<Pipelines, 2> &pipelines, Shape shape,
              uint32_t committed, uint32_t activeRows, uint32_t width,
@@ -585,6 +599,7 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
   require(width >= 1 && width <= 4, "invalid verify batch width");
   Case data = makeCase(device, shape, committed, activeRows, splits);
   fill(data);
+  const Case oneExtent = oneExtentCopy(device, data);
   const std::vector<BFloat16Bits> expectedQ8 = cpuReference(data, true);
   const std::vector<BFloat16Bits> expectedBf16 = cpuReference(data, false);
   for (const Pipelines &placement : pipelines) {
@@ -596,7 +611,11 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
         dispatch(device, queue, placement.split, placement.reduce, data, width);
     checkOutput(data, width, expectedQ8, expectedBf16, repeat.output,
                 qualityGate, placement.splitName + "_repeat");
-    requireIdentical(placement, data, width, first, repeat);
+    requireIdentical(placement, data, width, first, repeat, "verify repeat");
+    requireIdentical(placement, data, width, first,
+                     dispatch(device, queue, placement.split, placement.reduce,
+                              oneExtent, width),
+                     "verify over one extent");
   }
 }
 
@@ -627,7 +646,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
           p[index * d + dim] = float(int((split * 71 + dim * 37 + row * 13) % 257) - 128) * 0.125f;
       }
   Q8VerifyAttentionParams params{splits * 32 - activeRows, activeRows, kStride,
-                                 splits, 1, splits, splits, 0};
+                                 splits, {1, 0}, splits, splits};
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:makePipeline(
@@ -647,7 +666,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS) {
     sequential = makeBuffer(device, output.length);
     SplashQ8PrefillAttentionParams referenceParams{
-        params.committed_tokens, activeRows, kStride, splits, 1, splits, 0, 0};
+        params.committed_tokens, activeRows, kStride, splits, {1, 0}, splits, 0};
     command = [queue commandBuffer];
     encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:makePipeline(

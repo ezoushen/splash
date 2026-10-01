@@ -715,9 +715,9 @@ class MultiplexedRuntime:
         self._mask_executor.shutdown(wait=True, cancel_futures=True)
 
     def kill(self) -> None:
-        """SIGKILL the engine now, skipping its paced teardown.
+        """SIGKILL the engine now, without waiting for its graceful exit.
 
-        Safe in a signal handler: close() may be waiting for that teardown.
+        Safe in a signal handler: close() may be waiting for that exit.
         """
         process = self._process
         if process is not None:

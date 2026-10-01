@@ -121,7 +121,7 @@ std::span<std::byte> KvPageTier::staging(uint32_t slot) noexcept {
   return {memory_.get() + uint64_t{slot} * slotBytes_, slotBytes_};
 }
 
-void KvPageTier::setTable(uint32_t slot, uint32_t page,
+void KvPageTier::setTable(uint32_t slot, SplashKvPage page,
                           ops::KvCopy::Direction direction) noexcept {
   ops::KvCopy::setEntry(table_, slot, page, direction);
 }
@@ -174,8 +174,10 @@ std::function<void()> KvPageTier::encode(metal::CommandGraph &graph) {
     for (const auto &transfer : batch.copies)
       setTable(transfer->stagingSlot, 0, ops::KvCopy::Direction::None);
   }
+  // A page in transfer keeps its reference until the transfer lands, so its
+  // extent stays backed while this command runs.
   for (auto &transfer : queued_) {
-    setTable(transfer->stagingSlot, transfer->page,
+    setTable(transfer->stagingSlot, pages_.entry(transfer->page),
              transfer->toStaging ? ops::KvCopy::Direction::ToStaging
                                  : ops::KvCopy::Direction::ToPage);
   }

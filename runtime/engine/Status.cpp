@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <iomanip>
-#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -15,12 +14,6 @@ namespace splash::engine {
 namespace {
 
 const char *boolean(bool value) noexcept { return value ? "true" : "false"; }
-
-uint64_t saturatingAdd(uint64_t left, uint64_t right) noexcept {
-  return right > std::numeric_limits<uint64_t>::max() - left
-             ? std::numeric_limits<uint64_t>::max()
-             : left + right;
-}
 
 void appendBatch(std::ostringstream &out,
                  const RuntimeBatchMetricsSnapshot &batch) {
@@ -69,12 +62,10 @@ std::string runtimeStatusJson(
   const auto &pool = resources.pool;
   const auto &state = resources.stateCache;
   const auto &lookup = resources.lookup;
-  const uint64_t trackedPhysical = saturatingAdd(
-      metalMemory.allocatedBytes, metalMemory.sparseResidentBytes);
-  const uint64_t currentBytes =
-      std::max(trackedPhysical, metalMemory.deviceCurrentAllocatedBytes);
+  const uint64_t currentBytes = std::max(
+      metalMemory.allocatedBytes, metalMemory.deviceCurrentAllocatedBytes);
   const uint64_t peakBytes = std::max(
-      {currentBytes, metalMemory.peakResidentBytes,
+      {currentBytes, metalMemory.peakAllocatedBytes,
        metalMemory.devicePeakAllocatedBytes});
   // Warning pressure pauses growth but permits serving; only the governor's
   // critical verdict makes host pressure a readiness failure.
@@ -126,8 +117,6 @@ std::string runtimeStatusJson(
   out << "},"
       << "\"memory_plan\":" << plan.toStatusJson()
       << ",\"memory_actual\":{\"dense_bytes\":" << metalMemory.allocatedBytes
-      << ",\"sparse_virtual_bytes\":" << metalMemory.sparseVirtualBytes
-      << ",\"sparse_resident_bytes\":" << metalMemory.sparseResidentBytes
       << ",\"current_bytes\":" << currentBytes
       << ",\"peak_bytes\":" << peakBytes << "}"
       << ",\"memory_governor\":{\"limit_bytes\":" << memoryGovernor.limitBytes
@@ -156,17 +145,10 @@ std::string runtimeStatusJson(
       << ",\"pages_resident\":" << pool.pagesResident
       << ",\"resident_backing_bytes\":" << pool.residentBackingBytes
       << ",\"reclaimable_backing_bytes\":" << pool.reclaimableBackingBytes
-      << ",\"sparse_tile_bytes\":" << metalMemory.sparseTileBytes
-      << ",\"pending_unmaps\":" << metalMemory.pendingSparseUnmaps
-      << ",\"pending_unmap_ms\":"
-      << metalMemory.pendingSparseUnmapSeconds * 1000.0
-      << ",\"unmaps_completed\":" << metalMemory.completedSparseUnmaps
-      << ",\"unmap_last_ms\":" << metalMemory.lastSparseUnmapSeconds * 1000.0
-      << ",\"unmap_max_ms\":" << metalMemory.maxSparseUnmapSeconds * 1000.0
-      << ",\"map_wait_event\":" << metalMemory.sparseMapWaitEvent
-      << ",\"pending_map_wait_ms\":" << metalMemory.pendingSparseMapWaitSeconds * 1000.0
-      << ",\"map_wait_last_ms\":" << metalMemory.lastSparseMapWaitSeconds * 1000.0
-      << ",\"map_wait_max_ms\":" << metalMemory.maxSparseMapWaitSeconds * 1000.0
+      << ",\"extent_allocations\":" << pool.extentAllocations
+      << ",\"extent_releases\":" << pool.extentReleases
+      << ",\"extent_allocate_max_ms\":" << pool.extentAllocateMaxMilliseconds
+      << ",\"extent_release_max_ms\":" << pool.extentReleaseMaxMilliseconds
       << "}"
       << ",\"state\":{\"entries\":" << state.entries
       << ",\"pinned\":" << state.pinned << ",\"bytes\":" << state.bytes

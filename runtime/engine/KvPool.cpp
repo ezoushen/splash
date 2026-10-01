@@ -1,9 +1,20 @@
 #include "engine/KvPool.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 
 namespace splash::engine {
+namespace {
+
+double millisecondsSince(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - start)
+      .count();
+}
+
+} // namespace
 
 KvPool::KvPool(KvBacking &backing)
     : backing_(backing), pages_(backing.pageCount()) {
@@ -65,6 +76,7 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
     const uint32_t page = freeUnbacked_.head;
     const uint32_t extent = pages_[page].extent;
     metal::AllocationResult mapped = false;
+    const auto growth = std::chrono::steady_clock::now();
     try {
       mapped = backing_.ensureResident(page);
     } catch (...) {
@@ -75,14 +87,23 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
       returnSelected();
       // Paced like reclaim: an extent the backing cannot release yet stays
       // resident and reclaimable rather than waiting on the serving path.
+      const auto release = std::chrono::steady_clock::now();
+      bool released = false;
       for (uint32_t resident : newlyResidentExtents) {
         if (!extents_[resident].usedPages && releaseReady() &&
             releaseBacking(extents_[resident].firstPage)) {
           setExtentResident(resident, false);
+          released = true;
         }
       }
+      if (released)
+        extentReleaseMaxMilliseconds_ =
+            std::max(extentReleaseMaxMilliseconds_, millisecondsSince(release));
       return {{}, KvPageAcquireFailure::PhysicalCapacity, mapped.failure};
     }
+    ++extentAllocations_;
+    extentAllocateMaxMilliseconds_ =
+        std::max(extentAllocateMaxMilliseconds_, millisecondsSince(growth));
     setExtentResident(extent, true);
     newlyResidentExtents.push_back(extent);
   }
@@ -156,6 +177,7 @@ uint64_t KvPool::residentBackingBytes() const noexcept {
 }
 
 uint32_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t maxExtents) {
+  const auto start = std::chrono::steady_clock::now();
   uint32_t reclaimed = 0;
   bool kept = false;
   uint32_t extent = reclaimableExtents_.head;
@@ -173,6 +195,9 @@ uint32_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t maxExtents) {
     }
     extent = next;
   }
+  if (reclaimed)
+    extentReleaseMaxMilliseconds_ =
+        std::max(extentReleaseMaxMilliseconds_, millisecondsSince(start));
   return reclaimed;
 }
 
@@ -183,6 +208,7 @@ uint32_t KvPool::reclaimableExtentCount() const noexcept {
 bool KvPool::releaseBacking(uint32_t page) {
   if (!backing_.releaseBackingForPage(page))
     return false;
+  ++extentReleases_;
   ++releaseGeneration_;
   releaseOutstanding_ = true;
   return true;
@@ -218,6 +244,10 @@ KvPoolSnapshot KvPool::snapshot() const {
   result.residentBackingBytes = residentBackingBytes();
   result.reclaimableExtents = reclaimableExtents_.count;
   result.reclaimableBackingBytes = reclaimableBackingBytes_;
+  result.extentAllocations = extentAllocations_;
+  result.extentReleases = extentReleases_;
+  result.extentAllocateMaxMilliseconds = extentAllocateMaxMilliseconds_;
+  result.extentReleaseMaxMilliseconds = extentReleaseMaxMilliseconds_;
   return result;
 }
 

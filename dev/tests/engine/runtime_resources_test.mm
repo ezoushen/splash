@@ -109,7 +109,7 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
       root.packageBytes + model::kPipelineReserveBytes +
       model::kRuntimeOverheadReserveBytes +
       config.model.stateLayout.activeCellBytes() +
-      uint64_t{kvLayout.backingExtentPages()} * kvLayout.bytesPerModelPage();
+      uint64_t{kvLayout.minimumExtentPages()} * kvLayout.bytesPerModelPage();
   for (uint64_t ceiling : {minimumBytes - 1, minimumBytes, uint64_t{0}}) {
     config.maximumMemoryBytes = ceiling;
     try {

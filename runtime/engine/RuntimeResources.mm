@@ -308,7 +308,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
          {model::preparedModelWeightBytes(config.modelRoot, config.model),
           model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
           config.model.stateLayout.activeCellBytes(),
-          uint64_t{kvLayout.backingExtentPages()} *
+          uint64_t{kvLayout.minimumExtentPages()} *
               kvLayout.bytesPerModelPage(),
           config.maximumCacheDiskBytes ? model::KvPageTier::stagingBytesFor(kvLayout)
                                        : 0}) {
@@ -467,7 +467,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     auto kvPages = std::make_unique<kv::PageStorage>(
         *backend, memoryGovernor->allocationAdmission(), package.targetKvLayout(config.kvFormat),
-        budget.kvVirtualPages);
+        budget.kvVirtualPages, budget.kvExtentPages);
     // One disk quota serves KV pages and states. Without room for a state,
     // disk KV cannot preserve a restorable prefix, so the tier stays off.
     std::shared_ptr<model::DiskBudget> diskBudget;

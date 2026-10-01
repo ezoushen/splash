@@ -169,7 +169,7 @@ void testAdvertisedContextIsGrantable() {
   for (const Machine &machine :
        {Machine{"32 GB INT8", 32, 2, 3, kv::Format::Int8, 69'625},
         Machine{"36 GB INT8", 36, 3, 4, kv::Format::Int8, 253'945},
-        Machine{"36 GB BF16", 36, 3, 4, kv::Format::BFloat16, 129'241}}) {
+        Machine{"36 GB BF16", 36, 3, 4, kv::Format::BFloat16, 129'049}}) {
     // The 27B with its draft and vision tower: 16.2 GiB of weights.
     ModelMemoryProfile model =
         test::modelMemoryProfile(15 * kGiB, kGiB / 2, 7 * kGiB / 10);

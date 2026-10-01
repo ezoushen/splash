@@ -19,14 +19,14 @@ void testByteAccounting() {
   constexpr Layout bf16{16, 4, 256, Format::BFloat16};
   static_assert(bf16.valid());
   static_assert(bf16.bytesPerModelPage() == 2'097'152);
-  static_assert(bf16.sparseMappingBatchPages() == 1);
-  static_assert(bf16.backingExtentPages() == 64);
+  static_assert(bf16.extentAlignmentPages() == 1);
+  static_assert(bf16.minimumExtentPages() == 32 && bf16.maximumExtentPages() == 96);
   static_assert(bf16.storageByteCounts(4096).total == 8ULL * 1024 * 1024 * 1024);
   static_assert(bf16.scaleBytesPerLayerPage() == 0);
   constexpr Layout compact{10, 2, 256, Format::BFloat16};
   static_assert(compact.bytesPerModelPage() == 655'360);
-  static_assert(compact.sparseMappingBatchPages() == 2);
-  static_assert(compact.backingExtentPages() == 206);
+  static_assert(compact.extentAlignmentPages() == 2);
+  static_assert(compact.minimumExtentPages() == 104 && compact.maximumExtentPages() == 306);
   static_assert(!Layout{16, 4, 256, static_cast<Format>(0)}.valid());
   static_assert(kBytesPerModelPage == 1'064'960);
   StorageByteCounts one = storageByteCounts(1);

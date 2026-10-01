@@ -933,6 +933,7 @@ void sparseExtentChurn(MetalBackend &backend) {
     // virtual extents, retaining one as a witness while its replacement is
     // mapped and used: at most two 130-MiB heaps plus one extent of readback.
     constexpr splash::kv::Layout layout{16, 4, 256};
+    constexpr uint32_t kExtentPages = 128;
     constexpr uint32_t kSegments = layout.attentionLayers * 4;
     constexpr uint32_t kExtentCount = 3;
     constexpr uint32_t kRepetitions = 256;
@@ -941,8 +942,7 @@ void sparseExtentChurn(MetalBackend &backend) {
     constexpr uint32_t kSampleWords = 64;
     constexpr uint32_t kCanary = 0xd15ca11u;
     constexpr uint64_t kGuardBytes = kGuardWords * sizeof(uint32_t);
-    constexpr uint64_t kExtentBytes =
-        layout.backingExtentPages() * layout.bytesPerModelPage();
+    constexpr uint64_t kExtentBytes = kExtentPages * layout.bytesPerModelPage();
     constexpr uint64_t kWitnessBytes =
         kSegments * 2 * kSampleWords * sizeof(uint32_t);
     const auto before = backend.memoryStats();
@@ -954,7 +954,7 @@ void sparseExtentChurn(MetalBackend &backend) {
         std::array<uint32_t, kSegments> counts{};
         uint64_t offset = 0;
         for (uint32_t segment = 0; segment < kSegments; ++segment) {
-            segmentBytes[segment] = layout.backingExtentPages() *
+            segmentBytes[segment] = kExtentPages *
                 (segment % 2 ? layout.scaleBytesPerLayerPage()
                              : layout.dataBytesPerLayerPage());
             offsets[segment] = offset;
@@ -962,7 +962,7 @@ void sparseExtentChurn(MetalBackend &backend) {
             offset += segmentBytes[segment];
             buffers[segment] = backend.allocatePlacementSparseBuffer(
                 kExtentCount * segmentBytes[segment],
-                splash::kv::kSparseMappingAlignmentBytes,
+                MetalBackend::kPlacementSparsePageBytes,
                 "sparse-churn-layer-buffer-" + std::to_string(segment));
         }
         require(offset == kExtentBytes, "sparse churn geometry disagrees");
@@ -994,7 +994,7 @@ void sparseExtentChurn(MetalBackend &backend) {
                 auto mapExtent = [&] {
                     require(!heaps[extent], "sparse churn reused a resident extent");
                     heaps[extent].emplace(backend.allocatePlacementHeap(
-                        kExtentBytes, splash::kv::kSparseMappingAlignmentBytes,
+                        kExtentBytes, MetalBackend::kPlacementSparsePageBytes,
                         "sparse-churn-extent-" + std::to_string(extent)));
                     require(heaps[extent]->sizeBytes() == kExtentBytes,
                             "sparse churn heap size changed");
@@ -1148,7 +1148,7 @@ void sparseExtentChurn(MetalBackend &backend) {
 // Releases are paced: a second unmap waits for the first, heaps stay resident
 // until completion, and a remap of the same range orders behind the unmap.
 void sparsePacedRelease(MetalBackend &backend) {
-    constexpr uint64_t kTile = splash::kv::kSparseMappingAlignmentBytes;
+    constexpr uint64_t kTile = MetalBackend::kPlacementSparsePageBytes;
     constexpr uint32_t kExtents = 3;
     constexpr uint32_t kTilesPerExtent = 4;
     constexpr uint64_t kExtentBytes = kTilesPerExtent * kTile;
@@ -1479,7 +1479,7 @@ void run(const std::string &metallibPath) {
             "private allocation release was not tracked");
 
     constexpr uint64_t kSparseTileBytes =
-        splash::kv::kSparseMappingAlignmentBytes;
+        MetalBackend::kPlacementSparsePageBytes;
     static_assert(kSparseTileBytes == 64 * 1024,
                   "KV mapping alignment must match the 64 KiB sparse tile");
     requireBackendError(

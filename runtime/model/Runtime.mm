@@ -237,10 +237,13 @@ struct Runtime::Impl {
     bool draftComputed = false;
   };
 
+  // What a lane's GPU page table was last written from: the request's page
+  // list at a revision, translated under the KV storage's generation.
   struct PageTableBinding final {
     uint64_t requestId = 0;
     uint64_t revision = 0;
     uint32_t entries = 0;
+    uint64_t generation = 0;
   };
 
   MetalBackend &backend;
@@ -610,29 +613,26 @@ struct Runtime::Impl {
     return result;
   }
 
-  void copyPageTable(const MetalBuffer &destination,
-                     std::span<const uint32_t> pages) const {
-    if (pages.empty() || pages.size() > kMaximumPageTableEntries) {
-      throw std::invalid_argument("request page table has invalid length");
-    }
-    auto *target = contents<uint32_t>(destination, "request page table");
-    std::copy(pages.begin(), pages.end(), target);
-  }
-
   [[nodiscard]] MetalBuffer synchronizedPageTable(Request &entry,
                                                   const ModelBatchItem &item) {
     if (entry.slot >= pageTableBindings.size())
       throw std::out_of_range("request state slot is outside page tables");
+    if (item.pageTable.empty() ||
+        item.pageTable.size() > kMaximumPageTableEntries) {
+      throw std::invalid_argument("request page table has invalid length");
+    }
     PageTableBinding &binding = pageTableBindings[entry.slot];
     MetalBuffer destination =
         decodeArena->get(entry.slot, DecodeTensor::PageTable);
     const bool unversioned = item.pageTableRevision == 0;
     if (unversioned || binding.requestId != entry.id ||
         binding.revision != item.pageTableRevision ||
-        binding.entries != item.pageTable.size()) {
-      copyPageTable(destination, item.pageTable);
+        binding.entries != item.pageTable.size() ||
+        binding.generation != kvPages.generation()) {
+      kvPages.writeEntries(item.pageTable, destination);
       binding = {entry.id, item.pageTableRevision,
-                 static_cast<uint32_t>(item.pageTable.size())};
+                 static_cast<uint32_t>(item.pageTable.size()),
+                 kvPages.generation()};
     }
     return destination;
   }
@@ -1293,8 +1293,7 @@ struct Runtime::Impl {
                           item.pageTable);
       verify[lane] = kv::q8VerifyAttentionParams(
           q8[lane].committed_tokens, q8[lane].chunk_tokens,
-          q8[lane].chunk_stride, q8[lane].page_table_entries,
-          q8[lane].physical_page_count);
+          q8[lane].chunk_stride, q8[lane].page_table_entries);
       if (!kv::q8VerifyAttentionValidationError(verify[lane]).empty())
         throw std::invalid_argument("invalid batched KV verify geometry");
       Request &entry = laneEntry(entries, lane);

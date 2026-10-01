@@ -19,8 +19,8 @@
 namespace splash::model {
 
 // Moves KV pages between the KV page pool and a slot file. Pages live in
-// private sparse buffers, so every transfer is a copy through host-visible
-// staging that rides a command: a demotion copies the page out and the worker
+// private extents, so every transfer is a copy through host-visible staging
+// that rides a command: a demotion copies the page out and the worker
 // then writes the staging slot; a restore reads the disk slot into staging
 // and the next command copies it into the page. Every transfer in flight
 // holds one staging slot; demotions hold at most half of the ring and
@@ -83,7 +83,7 @@ private:
   };
 
   [[nodiscard]] std::span<std::byte> staging(uint32_t slot) noexcept;
-  void setTable(uint32_t slot, uint32_t page, ops::KvCopy::Direction direction) noexcept;
+  void setTable(uint32_t slot, SplashKvPage page, ops::KvCopy::Direction direction) noexcept;
   void finish(Transfer &transfer, bool success) noexcept;
 
   metal::MetalBackend &backend_;

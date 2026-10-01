@@ -866,10 +866,12 @@ int main(int argc, char **argv) {
     EngineMemoryPlan memoryPlan =
         requireEngineMemoryPlan(backend.capabilities(), profile);
 
-    // The pool is a whole number of sparse-mapping batches: the 4-head layout
-    // maps 128 pages at a time, the 2-head layout 256 (64 KiB tiles).
-    const uint32_t pageCount =
-        std::max(128U, model.targetKvLayout(format).sparseMappingBatchPages());
+    // A pool of 128 pages, or the smallest extent if larger, in whole extents
+    // of the size the memory plan would pick for it.
+    const kv::Layout kvLayout = model.targetKvLayout(format);
+    const uint32_t budgetPages = std::max(128U, kvLayout.minimumExtentPages());
+    const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
+    const uint32_t pageCount = budgetPages - budgetPages % extentPages;
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     require(budget.pipelineReserveBytes <= budget.hardBudgetBytes &&
                 budget.runtimeOverheadReserveBytes <
@@ -921,7 +923,7 @@ int main(int argc, char **argv) {
             return kvAdmissionFailure;
           return governed(bytes, allocate);
         },
-        model.targetKvLayout(format), pageCount);
+        kvLayout, pageCount, extentPages);
     model::QwenStateStorage states(backend,
                                     admission,
                                     model.stateLayout());

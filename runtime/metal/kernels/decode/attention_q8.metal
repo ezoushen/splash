@@ -9,7 +9,7 @@
 // lane fails the contract, is inactive and does nothing.
 struct SplashQ8VerifyTile {
   device bfloat *queries;
-  device const uint *page_table;
+  device const SplashKvPage *page_table;
   ulong slot;
   uint kv_head;
   uint split;
@@ -21,9 +21,9 @@ struct SplashQ8VerifyTile {
 
 template <uint KVHeads, uint QueryHeadsPerKVHead>
 inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
-    device bfloat *queries, device const uint *page_table0,
-    device const uint *page_table1, device const uint *page_table2,
-    device const uint *page_table3,
+    device bfloat *queries, device const SplashKvPage *page_table0,
+    device const SplashKvPage *page_table1, device const SplashKvPage *page_table2,
+    device const SplashKvPage *page_table3,
     constant SplashQ8VerifyAttentionParams *params, uint3 group) {
   constexpr uint D = SplashQ8HeadDimension;
   SplashQ8VerifyTile tile{};
@@ -53,20 +53,18 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
 
 // Verify entries: one lane per group.z, eight rows, one configured history
 // partition, with scratch for scores, probabilities and row statistics.
+// INT8 and BF16 entries share one signature: pages are reached through the
+// tables, so no entry binds KV storage.
 #define Q8_VERIFY_SPLIT_SIGNATURE(Name)                                        \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
-      device int8_t *cache_keys [[buffer(1)]],                                 \
-      device const float *key_scales_buffer [[buffer(2)]],                     \
-      device int8_t *cache_values [[buffer(3)]],                               \
-      device const float *value_scales_buffer [[buffer(4)]],                   \
-      device float *partials [[buffer(5)]],                                    \
-      device float *statistics [[buffer(6)]],                                  \
-      device const uint *page_table0 [[buffer(7)]],                            \
-      device const uint *page_table1 [[buffer(8)]],                            \
-      device const uint *page_table2 [[buffer(9)]],                            \
-      device const uint *page_table3 [[buffer(10)]],                           \
-      constant SplashQ8VerifyAttentionParams *params [[buffer(11)]],           \
+      device float *partials [[buffer(1)]],                                    \
+      device float *statistics [[buffer(2)]],                                  \
+      device const SplashKvPage *page_table0 [[buffer(3)]],                    \
+      device const SplashKvPage *page_table1 [[buffer(4)]],                    \
+      device const SplashKvPage *page_table2 [[buffer(5)]],                    \
+      device const SplashKvPage *page_table3 [[buffer(6)]],                    \
+      constant SplashQ8VerifyAttentionParams *params [[buffer(7)]],            \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]])
 
@@ -88,59 +86,27 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
   if (!tile.active)                                                            \
     return;
 
-#define Q8_VERIFY_SPLIT(Name, Heads, Group, ScaleInSoftmax)                    \
+#define Q8_VERIFY_SPLIT(Name, Heads, Group, ScaleInSoftmax, CacheElement)      \
   Q8_VERIFY_SPLIT_SIGNATURE(Name) {                                            \
     Q8_VERIFY_SCRATCH(Group)                                                   \
     Q8_VERIFY_TILE_AT(Heads, Group)                                            \
-    splash_paged_attention_tile<Heads, Group,                                  \
-                                      SPLASH_TARGET_VERIFY_ROWS,               \
-                                      ScaleInSoftmax>(                         \
-        tile.queries, cache_keys, key_scales_buffer, cache_values, value_scales_buffer,\
-        tile.page_table, tile.kv_head, tile.committed_tokens, tile.active_rows,\
-        tile.splits, tile.split, partials, statistics, tile.slot, scores,      \
-        probabilities, row_max, row_sum, previous_scale, &rescale,             \
-        thread_index);                                                         \
+    splash_paged_attention_tile<Heads, Group, SPLASH_TARGET_VERIFY_ROWS,       \
+                                ScaleInSoftmax, CacheElement>(                 \
+        tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
+        tile.committed_tokens, tile.active_rows, tile.splits, tile.split,      \
+        partials, statistics, tile.slot, scores, probabilities, row_max,       \
+        row_sum, previous_scale, &rescale, thread_index);                      \
   }
 
-Q8_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, true)
+Q8_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, true, int8_t)
 Q8_VERIFY_SPLIT(verify_attention_q8_split_cooperative_scale,
-                       4, 6, false)
-Q8_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, true)
+                       4, 6, false, int8_t)
+Q8_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, true, int8_t)
 Q8_VERIFY_SPLIT(
-    verify_attention_q8_split_cooperative_scale_kv2_g8, 2, 8, false)
-#define BF16_VERIFY_SPLIT_SIGNATURE(Name)                                      \
-  kernel void Name(                                                            \
-      device bfloat *queries [[buffer(0)]],                                    \
-      device bfloat *cache_keys [[buffer(1)]],                                 \
-      device bfloat *cache_values [[buffer(2)]],                               \
-      device float *partials [[buffer(3)]],                                    \
-      device float *statistics [[buffer(4)]],                                  \
-      device const uint *page_table0 [[buffer(5)]],                            \
-      device const uint *page_table1 [[buffer(6)]],                            \
-      device const uint *page_table2 [[buffer(7)]],                            \
-      device const uint *page_table3 [[buffer(8)]],                            \
-      constant SplashQ8VerifyAttentionParams *params [[buffer(9)]],            \
-      uint3 group [[threadgroup_position_in_grid]],                            \
-      uint thread_index [[thread_index_in_threadgroup]])
-
-#define BF16_VERIFY_SPLIT(Name, Heads, Group)                                  \
-  BF16_VERIFY_SPLIT_SIGNATURE(Name) {                                          \
-    Q8_VERIFY_SCRATCH(Group)                                                   \
-    Q8_VERIFY_TILE_AT(Heads, Group)                                            \
-    splash_paged_attention_tile<Heads, Group,                                  \
-                                      SPLASH_TARGET_VERIFY_ROWS,               \
-                                      true>(                                   \
-        tile.queries, cache_keys, nullptr, cache_values, nullptr,              \
-        tile.page_table, tile.kv_head, tile.committed_tokens, tile.active_rows,\
-        tile.splits, tile.split, partials, statistics, tile.slot, scores,      \
-        probabilities, row_max, row_sum, previous_scale, &rescale,             \
-        thread_index);                                                         \
-  }
-
-BF16_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6)
-BF16_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8)
-#undef BF16_VERIFY_SPLIT
-#undef BF16_VERIFY_SPLIT_SIGNATURE
+    verify_attention_q8_split_cooperative_scale_kv2_g8, 2, 8, false, int8_t)
+// BF16 shares the page loop and reduction, without quantization scales.
+Q8_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, true, bfloat)
+Q8_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, true, bfloat)
 #undef Q8_VERIFY_SPLIT
 #undef Q8_VERIFY_TILE_AT
 #undef Q8_VERIFY_SCRATCH
