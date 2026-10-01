@@ -138,9 +138,9 @@ DeviceCapabilities mac(uint64_t physicalGiB, uint64_t numerator,
 uint32_t grantKvPages(MemoryGovernor &governor,
                       const EngineMemoryBreakdown &budget) {
   uint32_t granted = 0;
-  while (granted < budget.kvVirtualPages) {
+  while (granted < budget.kvCapacityPages) {
     const uint32_t pages =
-        std::min(budget.kvExtentPages, budget.kvVirtualPages - granted);
+        std::min(budget.kvExtentPages, budget.kvCapacityPages - granted);
     const uint64_t bytes = uint64_t{pages} * budget.kvPageBytes;
     auto reservation = governor.tryReserve(bytes);
     if (!reservation)
@@ -203,16 +203,16 @@ void testAdvertisedContextIsGrantable() {
                                   std::to_string(untracked / kMiB) +
                                   " MiB untracked: granted " +
                                   std::to_string(granted) + " of " +
-                                  std::to_string(budget.kvVirtualPages) +
+                                  std::to_string(budget.kvCapacityPages) +
                                   " KV pages";
       require(metal::statistics.deviceCurrentAllocatedBytes <=
                   budget.hardBudgetBytes,
               context + ", beyond the hard budget");
       if (untracked <= reserves)
-        require(granted == budget.kvVirtualPages,
+        require(granted == budget.kvCapacityPages,
                 context + ", short of the advertised context");
       else
-        require(granted < budget.kvVirtualPages,
+        require(granted < budget.kvCapacityPages,
                 context + ", memory beyond the reserves was not charged");
     }
   }

@@ -57,15 +57,15 @@ void testUnifiedElasticBudget() {
               budget.minimumRequiredBytes ==
                   budget.fixedRuntimeBytes + budget.minimumDynamicBytes,
           "minimum B1 plus one physical extent is incorrect");
-  require(budget.kvVirtualPages % 128 == 0 && budget.kvVirtualPages >= 128 &&
-              budget.kvVirtualPages == budgetPages(budget) - budgetPages(budget) % 128 &&
-              budget.kvVirtualBytes ==
-                  uint64_t{budget.kvVirtualPages} * budget.kvPageBytes &&
-              budget.kvVirtualTokens == uint64_t{budget.kvVirtualPages} * 32,
+  require(budget.kvCapacityPages % 128 == 0 && budget.kvCapacityPages >= 128 &&
+              budget.kvCapacityPages == budgetPages(budget) - budgetPages(budget) % 128 &&
+              budget.kvCapacityBytes ==
+                  uint64_t{budget.kvCapacityPages} * budget.kvPageBytes &&
+              budget.kvCapacityTokens == uint64_t{budget.kvCapacityPages} * 32,
           "the KV pool is not the budget's whole extents");
   require(plan.maximumContextTokens() ==
               std::min<uint64_t>(model().maximumContextTokens,
-                                 budget.kvVirtualTokens -
+                                 budget.kvCapacityTokens -
                                      model::ExecutionLimits::speculativeScratchTokens),
           "advertised context exceeds elastic KV capacity");
   const std::string json = plan.toStatusJson();
@@ -84,10 +84,10 @@ void testBf16BudgetAndStatus() {
               budget.kvPageBytes > int8.breakdown().kvPageBytes &&
               budget.kvExtentPages ==
                   profile.targetKvLayout.extentPagesFor(budgetPages(budget)) &&
-              budget.kvVirtualPages % budget.kvExtentPages == 0,
+              budget.kvCapacityPages % budget.kvExtentPages == 0,
           "BF16 planning did not use its payload size and its pool's extent size");
-  require(budget.kvVirtualBytes <= budget.dynamicBudgetBytes &&
-              budget.kvVirtualPages < int8.breakdown().kvVirtualPages,
+  require(budget.kvCapacityBytes <= budget.dynamicBudgetBytes &&
+              budget.kvCapacityPages < int8.breakdown().kvCapacityPages,
           "BF16 virtual capacity exceeded the shared budget");
   const auto json = bf16.toStatusJson();
   require(json.find("\"kv_format\":\"bf16\"") != std::string::npos &&
@@ -132,7 +132,7 @@ void testDiskTierKvStagingIsBudgeted() {
   const EngineMemoryPlan with = requireEngineMemoryPlan(device(), tiered);
   const auto &budget = with.breakdown();
   require(without.breakdown().fixedRuntimeBytes + ring +
-                  budget.activeStateCellBytes + budget.kvVirtualBytes <=
+                  budget.activeStateCellBytes + budget.kvCapacityBytes <=
               budget.hardBudgetBytes,
           "the advertised context cannot be mapped beside the KV staging ring");
   require(with.maximumContextTokens() < without.maximumContextTokens(),
@@ -230,7 +230,7 @@ void testExtentSizeFollowsThePool() {
                                               {10'751, 256}, {511, 256}}}) {
     const auto result = planFor(pages);
     require(result.plan && result.plan->breakdown().kvExtentPages == extent &&
-                result.plan->breakdown().kvVirtualPages == pages - pages % extent &&
+                result.plan->breakdown().kvCapacityPages == pages - pages % extent &&
                 result.plan->breakdown().kvExtentBytes == extent * 332'800,
             "the extent size does not leave the fewest pool pages over");
   }

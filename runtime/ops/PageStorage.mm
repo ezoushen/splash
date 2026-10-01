@@ -41,7 +41,7 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
     }
 }
 
-uint64_t PageStorage::declaredBytes() const noexcept {
+uint64_t PageStorage::capacityBytes() const noexcept {
     return uint64_t(pageCount_) * layout_.bytesPerModelPage();
 }
 

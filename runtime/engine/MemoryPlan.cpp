@@ -162,9 +162,9 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
       << "\"kv_page_bytes\":" << kvPageBytes << ','
       << "\"kv_extent_pages\":" << kvExtentPages << ','
       << "\"kv_extent_bytes\":" << kvExtentBytes << ','
-      << "\"kv_virtual_pages\":" << kvVirtualPages << ','
-      << "\"kv_virtual_bytes\":" << kvVirtualBytes << ','
-      << "\"kv_virtual_tokens\":" << kvVirtualTokens << ','
+      << "\"kv_capacity_pages\":" << kvCapacityPages << ','
+      << "\"kv_capacity_bytes\":" << kvCapacityBytes << ','
+      << "\"kv_capacity_tokens\":" << kvCapacityTokens << ','
       << "\"minimum_dynamic_bytes\":" << minimumDynamicBytes << ','
       << "\"minimum_required_bytes\":" << minimumRequiredBytes << ','
       << "\"deficit_bytes\":" << deficitBytes << '}';
@@ -200,7 +200,7 @@ std::string EngineMemoryBreakdown::describe() const {
       << bytesAndMiB(kvPageBytes) << '\n'
       << "KV extent: " << kvExtentPages << " pages, "
       << bytesAndMiB(kvExtentBytes) << '\n'
-      << "KV pool: " << kvVirtualPages << " pages / " << kvVirtualTokens
+      << "KV pool: " << kvCapacityPages << " pages / " << kvCapacityTokens
       << " tokens\n"
       << "minimum dynamic runtime: " << bytesAndMiB(minimumDynamicBytes) << '\n'
       << "minimum required: " << bytesAndMiB(minimumRequiredBytes) << '\n'
@@ -238,7 +238,7 @@ EngineMemoryPlan::EngineMemoryPlan(DeviceCapabilities device,
       breakdown_(std::move(breakdown)) {}
 
 uint32_t EngineMemoryPlan::maximumContextTokens() const noexcept {
-  const uint64_t physicalCapacity = breakdown_.kvVirtualTokens;
+  const uint64_t physicalCapacity = breakdown_.kvCapacityTokens;
   const uint64_t logicalCapacity =
       physicalCapacity > model::ExecutionLimits::speculativeScratchTokens
           ? physicalCapacity - model::ExecutionLimits::speculativeScratchTokens
@@ -337,16 +337,16 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                          std::numeric_limits<uint32_t>::max());
   breakdown.kvExtentPages = model.targetKvLayout.extentPagesFor(budgetPages);
   if (breakdown.kvExtentPages) {
-    breakdown.kvVirtualPages = static_cast<uint32_t>(
+    breakdown.kvCapacityPages = static_cast<uint32_t>(
         budgetPages - budgetPages % breakdown.kvExtentPages);
   }
 
   if (!checkedMultiply(breakdown.kvPageBytes, breakdown.kvExtentPages,
                        breakdown.kvExtentBytes) ||
-      !checkedMultiply(breakdown.kvPageBytes, breakdown.kvVirtualPages,
-                       breakdown.kvVirtualBytes) ||
-      !checkedMultiply(breakdown.kvPageTokens, breakdown.kvVirtualPages,
-                       breakdown.kvVirtualTokens)) {
+      !checkedMultiply(breakdown.kvPageBytes, breakdown.kvCapacityPages,
+                       breakdown.kvCapacityBytes) ||
+      !checkedMultiply(breakdown.kvPageTokens, breakdown.kvCapacityPages,
+                       breakdown.kvCapacityTokens)) {
     return {std::nullopt, failure(BudgetErrorCode::ArithmeticOverflow,
                                   "KV pool capacity overflows uint64",
                                   std::move(breakdown))};

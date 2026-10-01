@@ -467,7 +467,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     auto kvPages = std::make_unique<kv::PageStorage>(
         *backend, memoryGovernor->allocationAdmission(), package.targetKvLayout(config.kvFormat),
-        budget.kvVirtualPages, budget.kvExtentPages);
+        budget.kvCapacityPages, budget.kvExtentPages);
     // One disk quota serves KV pages and states. Without room for a state,
     // disk KV cannot preserve a restorable prefix, so the tier stays off.
     std::shared_ptr<model::DiskBudget> diskBudget;
@@ -507,8 +507,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     auto cache = std::make_unique<engine::Cache>(*kvPool, cacheIdentity.cacheNamespace,
                                                  kvTier.get(), diskBudget);
 
-    if (kvPages->declaredBytes() != budget.kvVirtualBytes ||
-        kvPages->actualAllocatedBytes() > budget.kvVirtualBytes) {
+    if (kvPages->capacityBytes() != budget.kvCapacityBytes ||
+        kvPages->actualAllocatedBytes() > budget.kvCapacityBytes) {
       throw std::runtime_error(
           "actual KV page storage exceeds its planned category");
     }

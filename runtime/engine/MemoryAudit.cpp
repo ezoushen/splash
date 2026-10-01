@@ -77,7 +77,7 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   const Category categories[] = {
       {"shared prefill", actual.sharedPrefillBytes, budget.sharedPrefillBytes},
       {"shared decode", actual.sharedDecodeBytes, budget.sharedDecodeBytes},
-      {"Q8 virtual storage", actual.kvResidentBytes, budget.kvVirtualBytes},
+      {"KV pool", actual.kvResidentBytes, budget.kvCapacityBytes},
       {"KV staging", actual.kvStagingBytes, budget.kvStagingBytes},
   };
   for (const Category &category : categories) {

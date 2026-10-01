@@ -116,9 +116,8 @@ struct EngineMemoryBreakdown {
   uint64_t kvStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
-  // All active state cells, cached composite states, and physical KV
-  // extents grow from this one governor-controlled byte budget. None is
-  // preallocated merely because the address space exists.
+  // All active state cells, cached composite states, and KV extents grow
+  // from this one governor-controlled byte budget; none is preallocated.
   uint64_t dynamicBudgetBytes = 0;
 
   uint32_t kvPageTokens = 0;
@@ -130,9 +129,9 @@ struct EngineMemoryBreakdown {
   uint64_t kvExtentBytes = 0;
   // The pool: the whole extents one request's KV can use within the budget.
   // Request context and four-lane execution are independent policy limits.
-  uint32_t kvVirtualPages = 0;
-  uint64_t kvVirtualBytes = 0;
-  uint64_t kvVirtualTokens = 0;
+  uint32_t kvCapacityPages = 0;
+  uint64_t kvCapacityBytes = 0;
+  uint64_t kvCapacityTokens = 0;
 
   uint64_t minimumDynamicBytes = 0;
   uint64_t minimumRequiredBytes = 0;
