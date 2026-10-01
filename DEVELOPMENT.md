@@ -510,6 +510,19 @@ weights stay wired between requests until 10 minutes pass without a command,
 and the next command wires them again. macOS page cache, driver allocations and
 other applications still affect memory pressure and swap.
 
+KV pages live in extents: ordinary private Metal buffers of one size per pool,
+between half and one and a half times 128 MiB, with a 64 KiB-aligned region per
+attention layer, sized to leave the fewest of the budget's pages unused
+(`Layout::extentPagesFor`). The pool allocates an extent when it needs one of
+its pages. An extent whose last page is free stays allocated until a reclaim
+releases it, at once and only between commands: memory pressure, an admission
+the budget denies, or startup cleanup. Kernels reach a page through the GPU
+address in its request's page table, so no command binds KV; extents join the
+weights' residency set and stay wired as they do. A reclaim pass releases every
+extent that is empty or that its evictions empty. `/status` reports under `kv`
+the extents allocated and released, the longest growth and the longest release
+pass, evictions within it included.
+
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
 (`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or
 `GgufTargetLoader` prepared) through the format that stores them.
