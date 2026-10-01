@@ -817,6 +817,9 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   }
   addCandidate(junctionBoundary, Request::StateBoundary::Purpose::Junction);
   addCandidate(latestReplayBoundary, Request::StateBoundary::Purpose::Replay);
+  // A resumed lane below its prompt's replay point lost that state; it
+  // rebuilds the one its conversation's next turn resumes from on the way.
+  addCandidate(promptReplayBoundary(active), Request::StateBoundary::Purpose::Replay);
   std::sort(active.stateBoundaries.begin(), active.stateBoundaries.end(),
             [](const Request::StateBoundary &left,
                const Request::StateBoundary &right) {

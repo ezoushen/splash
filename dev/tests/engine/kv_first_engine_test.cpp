@@ -3011,9 +3011,10 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   require(resources.snapshot().stateCache.entries == 0,
           "snapshot denial left a composite state to restore");
 
-  // Retain a KV junction one draft window past the original prompt boundary.
-  // The old prompt boundary, this junction, and the generated history's end
-  // would require three capture spans if replay still used the old boundary.
+  // Retain a KV junction one draft window past the prompt's replay boundary,
+  // whose state is gone. The resumed lane rebuilds that state, where the
+  // conversation's next turn resumes, then captures the junction and the
+  // generated history's end.
   constexpr uint32_t retainedKvTokens = 6144;
   while (resources.snapshot().kvCache.blocks >
          retainedKvTokens / KvCache::pageTokens) {
@@ -3034,8 +3035,9 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   now += 101;
   require(engine.tick(now++), "long replay did not resume after pressure eased");
   const auto &plan = executor.plans.at(id);
-  require(plan.replayEnd == history.size() && plan.captureSpans.size() == 2,
-          "resumed draft plan did not cover generated history in two spans");
+  require(plan.replayEnd == history.size() && plan.captureSpans.size() == 3 &&
+              plan.boundaries.front().boundary == 4096,
+          "resumed draft plan did not rebuild the prompt's replay point first");
   const double finishBy = now + 100;
   for (; now < finishBy && !engine.idle(); ++now)
     static_cast<void>(engine.tick(now));
@@ -3058,6 +3060,12 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
               resources.snapshot().pool.pagesActive == 0 &&
               resources.snapshot().activeRequests == 0,
           "long replay leaked active resources");
+  // The conversation's next turn resumes from the rebuilt point.
+  std::vector<uint32_t> next = prompt;
+  next.resize(next.size() + 40, 9);
+  require(resources.lookup(next).resumeBoundary() == 4096 &&
+              resources.snapshot().stateCache.inUse == 0,
+          "the resumed lane did not rebuild the prompt's replay point");
 }
 
 void testPreemptedDecodeRestoresItsResidentCompositeState() {
