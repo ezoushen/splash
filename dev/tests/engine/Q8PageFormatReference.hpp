@@ -36,11 +36,6 @@ inline constexpr uint64_t kBytesPerLayerPage =
 inline constexpr uint64_t kBytesPerModelPage =
     kOracleLayout.bytesPerModelPage();
 
-[[nodiscard]] constexpr StorageByteCounts
-storageByteCounts(uint64_t pages) noexcept {
-  return kOracleLayout.storageByteCounts(pages);
-}
-
 struct Q8LayerPage final {
   std::array<int8_t, kElementsPerLayerPage> keys{};
   std::array<float, kScalesPerTensorLayerPage> keyScales{};

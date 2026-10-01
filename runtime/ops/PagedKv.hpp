@@ -75,14 +75,6 @@ inline constexpr uint64_t kExtentRegionAlignmentBytes = 64 * 1024;
 inline constexpr uint64_t kAllocationExtentTargetBytes =
     SPLASH_ALLOCATION_EXTENT_TARGET_BYTES;
 
-struct StorageByteCounts final {
-  uint64_t keyData = 0;
-  uint64_t keyScales = 0;
-  uint64_t valueData = 0;
-  uint64_t valueScales = 0;
-  uint64_t total = 0;
-};
-
 namespace detail {
 
 [[nodiscard]] constexpr uint64_t gcd(uint64_t left, uint64_t right) noexcept {
@@ -202,14 +194,6 @@ struct Layout final {
       }
     }
     return static_cast<uint32_t>(best);
-  }
-
-  [[nodiscard]] constexpr StorageByteCounts
-  storageByteCounts(uint64_t pageCount) const noexcept {
-    const uint64_t data = pageCount * attentionLayers * dataBytesPerLayerPage();
-    const uint64_t scale =
-        pageCount * attentionLayers * scaleBytesPerLayerPage();
-    return {data, scale, data, scale, pageCount * bytesPerModelPage()};
   }
 
   bool operator==(const Layout &) const = default;

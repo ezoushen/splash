@@ -187,10 +187,6 @@ void KvPool::recordReleasePass(double milliseconds) noexcept {
       std::max(extentReleaseMaxMilliseconds_, milliseconds);
 }
 
-uint32_t KvPool::reclaimableExtentCount() const noexcept {
-  return reclaimableExtents_.count;
-}
-
 bool KvPool::releaseBacking(uint32_t page) {
   if (!backing_.releaseBackingForPage(page))
     return false;

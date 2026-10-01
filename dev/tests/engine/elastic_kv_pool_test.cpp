@@ -223,13 +223,13 @@ void testPassReleasesEveryEmptyExtent() {
     require(pages.granted() && pool.snapshot().pagesResident == 4 * extents,
             "release setup did not acquire every page");
     release(pool, pages.pages);
-    require(pool.reclaimableExtentCount() == extents,
+    require(pool.snapshot().reclaimableExtents == extents,
             "every empty resident extent was not reclaimable");
     const auto before = pool.snapshot().extentReleases;
     require(pool.reclaimEmptyExtents(true) == extents - 1 &&
                 backing.releasedExtents == extents - 1 &&
                 pool.snapshot().extentReleases == before + extents - 1 &&
-                pool.reclaimableExtentCount() == 1,
+                pool.snapshot().reclaimableExtents == 1,
             "a pass did not release every empty extent but the runway");
     require(pool.reclaimEmptyExtents(false) == 1 &&
                 pool.snapshot().pagesResident == 0 &&
@@ -246,7 +246,7 @@ void testFullestExtentFillsFirstSoColdExtentsDrain() {
     // Leave extent 0 with three holes, extent 1 with one and extent 2 with two.
     release(pool, {0, 1, 2, 5, 8, 9});
     require(pool.snapshot().pagesFreeResident == 6 &&
-                pool.reclaimableExtentCount() == 0,
+                pool.snapshot().reclaimableExtents == 0,
             "partial release accounting is incorrect");
 
     // New pages come from the fullest extents; the coldest keeps its holes.
@@ -261,7 +261,7 @@ void testFullestExtentFillsFirstSoColdExtentsDrain() {
 
     // Its last page going cold empties the extent so it can be released.
     release(pool, {3});
-    require(pool.reclaimableExtentCount() == 1 &&
+    require(pool.snapshot().reclaimableExtents == 1 &&
                 pool.reclaimEmptyExtents(false) == 1 &&
                 pool.snapshot().pagesResident == 8 &&
                 backing.releasedExtents == 1,
@@ -283,7 +283,7 @@ void testShorterTrailingExtentIsNotPreferredForBeingSmall() {
     require(page.granted() && page.pages.front() < 4,
             "partial trailing extent was refilled ahead of a fuller extent");
     release(pool, {9});
-    require(pool.reclaimableExtentCount() == 1,
+    require(pool.snapshot().reclaimableExtents == 1,
             "trailing extent did not drain after its last page was freed");
 
     // Empty: the tail's two free pages still lose to extent 0's one live page.

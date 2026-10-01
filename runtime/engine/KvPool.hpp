@@ -80,7 +80,6 @@ public:
   // A reclaim pass that released extents between its evictions held the
   // serving thread this long; the snapshot keeps the longest pass.
   void recordReleasePass(double milliseconds) noexcept;
-  [[nodiscard]] uint32_t reclaimableExtentCount() const noexcept;
   [[nodiscard]] KvPoolSnapshot snapshot() const;
 
 private:

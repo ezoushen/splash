@@ -2999,7 +2999,7 @@ void testReclaimPassReleasesEveryEmptyExtent() {
                                         : ReclaimOutcome::Untargeted) &&
                 result.releasedBytes == uint64_t{extents} * 4 * 4096 &&
                 pool.snapshot().pagesResident == 0 &&
-                pool.reclaimableExtentCount() == 0,
+                pool.snapshot().reclaimableExtents == 0,
             "a pass did not release every empty extent or report what was left");
   }
 }

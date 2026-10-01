@@ -21,7 +21,7 @@ void testByteAccounting() {
   static_assert(bf16.bytesPerModelPage() == 2'097'152);
   static_assert(bf16.extentAlignmentPages() == 1);
   static_assert(bf16.minimumExtentPages() == 32 && bf16.maximumExtentPages() == 96);
-  static_assert(bf16.storageByteCounts(4096).total == 8ULL * 1024 * 1024 * 1024);
+  static_assert(4096 * bf16.bytesPerModelPage() == 8ULL * 1024 * 1024 * 1024);
   static_assert(bf16.scaleBytesPerLayerPage() == 0);
   constexpr Layout compact{10, 2, 256, Format::BFloat16};
   static_assert(compact.bytesPerModelPage() == 655'360);
@@ -29,14 +29,11 @@ void testByteAccounting() {
   static_assert(compact.minimumExtentPages() == 104 && compact.maximumExtentPages() == 306);
   static_assert(!Layout{16, 4, 256, static_cast<Format>(0)}.valid());
   static_assert(kBytesPerModelPage == 1'064'960);
-  StorageByteCounts one = storageByteCounts(1);
-  assert(one.keyData == 512 * 1024);
-  assert(one.keyScales == 8 * 1024);
-  assert(one.valueData == 512 * 1024);
-  assert(one.valueScales == 8 * 1024);
-  assert(one.total == 1'064'960);
-  StorageByteCounts production = storageByteCounts(4608);
-  assert(production.total == 4'907'335'680ULL); // 147456 tokens.
+  // One page's keys (or values) and their scales across the layers.
+  static_assert(kOracleLayout.attentionLayers * kKeyDataBytesPerLayerPage == 512 * 1024);
+  static_assert(kOracleLayout.attentionLayers * kKeyScaleBytesPerLayerPage == 8 * 1024);
+  static_assert(kBytesPerModelPage == 2 * (512 + 8) * 1024);
+  static_assert(4608 * kBytesPerModelPage == 4'907'335'680ULL); // 147456 tokens.
 }
 
 void testLayouts() {
