@@ -2140,15 +2140,49 @@ int main(int argc, char **argv) {
       std::vector<uint32_t> transcript;
       uint32_t pendingAnchorIndex = 0;
     };
-    const auto runPreemption = [&](BatchCohort cohort, uint32_t preemptionMode) {
+    // The sampling penalties; the defaults change nothing.
+    struct Penalties final {
+      float presence = 0.0F;
+      float frequency = 0.0F;
+      float repetition = 1.0F;
+
+      [[nodiscard]] bool active() const {
+        return presence != 0.0F || frequency != 0.0F || repetition != 1.0F;
+      }
+    };
+    // A sampling request keeps its topK tokens, all of them for 0, then its
+    // topP nucleus.
+    const auto runPreemption = [&](BatchCohort cohort, uint32_t preemptionMode,
+                                   Penalties penalties = {},
+                                   uint32_t topK = 20, float topP = 0.95F,
+                                   uint32_t flags = 0) {
       const bool preempt = preemptionMode != 0;
       EngineRequest sequence = makeRequest(80, prompt129, 24, cohort);
+      sequence.flags = flags;
       if (cohort == BatchCohort::Sampling)
-        sequence.sampling = {0.8F, 0.95F, 20, 91199};
+        sequence.sampling = {0.8F, topP, topK, 91199};
       if (cohort == BatchCohort::Constrained)
         sequence.constraint = ConstraintMode::TokenMask;
+      sequence.sampling.presencePenalty = penalties.presence;
+      sequence.sampling.frequencyPenalty = penalties.frequency;
+      sequence.sampling.repetitionPenalty = penalties.repetition;
       beginCold(executor, sequence, 0);
       uint32_t slot = 0;
+      // A penalized request resumes in a slot other than lane 0, which it
+      // decodes in: its penalty words follow the slot, not the lane.
+      const auto resume = [&] {
+        std::optional<EngineRequest> holder;
+        if (penalties.active()) {
+          holder = makeRequest(81, {1}, 1);
+          beginCold(executor, *holder, 0);
+        }
+        StateAdmission admission = executor.resume(sequence.modelView());
+        if (holder)
+          executor.end(holder->id);
+        require(admission.granted() && (!holder || *admission.cell != 0),
+                "recompute admission failed");
+        return *admission.cell;
+      };
       const auto rebuild = [&](bool repeatDuringReplay,
                                 bool deliverInitialMask = false) {
         const StateSamples before = repeatDuringReplay
@@ -2161,9 +2195,7 @@ int main(int argc, char **argv) {
           const std::array<uint32_t, 1> anchor{100};
           executor.provideMask(sequence.id, singletonMasks(anchor));
         }
-        StateAdmission admission = executor.resume(sequence.modelView());
-        require(admission.granted(), "recompute admission failed");
-        slot = *admission.cell;
+        slot = resume();
         const uint32_t length = static_cast<uint32_t>(sequence.prompt.size());
         executor.setDraftContextPlan(
             sequence.id, planDraftContext(0, length, std::nullopt, {}));
@@ -2175,9 +2207,7 @@ int main(int argc, char **argv) {
           executor.suspend(sequence.id);
           require(states.actualSlotBytes(slot) == 0,
                   "repeated preemption retained its state buffers");
-          admission = executor.resume(sequence.modelView());
-          require(admission.granted(), "repeated recompute admission failed");
-          slot = *admission.cell;
+          slot = resume();
           executor.setDraftContextPlan(
               sequence.id, planDraftContext(0, length, std::nullopt, {}));
         }
@@ -2308,6 +2338,166 @@ int main(int argc, char **argv) {
                 << " reference_rows=" << reference.transcript.size()
                 << " resumed_rows=" << resumed.transcript.size()
                 << " preserved_prefix_rows=" << resumed.pendingAnchorIndex + 1 << '\n';
+    }
+
+    // Score probe of a greedy transcript: for every emitted token, a score
+    // request on the context before it returns the raw logits of every
+    // prompt and earlier output token and of the emitted one, the host
+    // applies the penalties with the counts of the tokens emitted before it,
+    // and the emitted token must be the best of them. The penalties only
+    // move tokens the context holds, so a count the runtime got wrong (in
+    // the prefill's first token, a verify row's draft prefix, or the words a
+    // resume rebuilds) shows up as an option that beats the emitted token by
+    // about the penalty. The score logits come from the prefill graph and
+    // most decisions from the verify graph, whose logits differ by a share of
+    // their size: on the 35B UD-Q4_K_M on Apple9, a prompt token's logit
+    // divided by the repetition ties a new token's at a repetition 1-2% lower
+    // in verify than in prefill (1.29-1.30 against 1.31-1.32). So the emitted
+    // token may trail by graphDrift of the values compared, well inside what
+    // a wrong count moves (presence here at least 1.5, repetition 1.3 at
+    // least 23% of the logit). Returns the largest amount it trails by beyond
+    // that.
+    constexpr float graphDrift = 0.03F;
+    const auto probeLoss = [&](const std::vector<uint32_t> &transcript,
+                               const Penalties &penalties) {
+      float worst = 0.0F;
+      for (size_t position = 0; position < transcript.size(); ++position) {
+        std::vector<uint32_t> context = prompt129;
+        context.insert(context.end(), transcript.begin(),
+                       transcript.begin() + position);
+        std::vector<uint32_t> options = context;
+        options.push_back(transcript[position]);
+        std::sort(options.begin(), options.end());
+        options.erase(std::unique(options.begin(), options.end()), options.end());
+        require(options.size() >= model::ExecutionLimits::minimumScoreOptions &&
+                    options.size() <= model::ExecutionLimits::maximumScoreOptions,
+                "score probe options do not fit one score request");
+        EngineRequest score = makeRequest(90, context, 0);
+        score.scoreTokens = options;
+        beginCold(executor, score, 0);
+        const ModelStepResult scored =
+            prefillChunk(executor, score.id, 0, 0, 0, context, pageTable);
+        executor.end(score.id);
+        require(scored.scoreLogits.size() == options.size(),
+                "score probe returned the wrong logit count");
+        float best = -std::numeric_limits<float>::infinity();
+        float emitted = best;
+        for (size_t index = 0; index < options.size(); ++index) {
+          const uint32_t token = options[index];
+          const auto count = static_cast<uint32_t>(
+              std::count(transcript.begin(), transcript.begin() + position, token));
+          float value = scored.scoreLogits[index];
+          if (count || std::find(prompt129.begin(), prompt129.end(), token) !=
+                           prompt129.end())
+            value = value > 0.0F ? value / penalties.repetition
+                                 : value * penalties.repetition;
+          if (count)
+            value -= penalties.frequency * float(count) + penalties.presence;
+          best = std::max(best, value);
+          if (token == transcript[position])
+            emitted = value;
+        }
+        const float allowance =
+            graphDrift * std::max(std::abs(best), std::abs(emitted));
+        worst = std::max(worst, best - emitted - allowance);
+      }
+      return worst;
+    };
+
+    // Penalized requests keep every preemption guarantee above, and the
+    // score probe checks their decisions within the drift between score
+    // (prefill) and verify logits, and any further drift the unpenalized
+    // transcript shows.
+    // Negative presence and frequency favour the output's tokens by their
+    // counts, so the decisions they change follow the counts, a verify row's
+    // draft prefix included; presence 1.5 is Qwen's recommendation, and
+    // repetition also reads the prompt's tokens.
+    const PreemptionRun control = runPreemption(BatchCohort::Greedy, 0);
+    const float drift = probeLoss(control.transcript, {});
+    const float tolerance = std::max(2.0F * drift, 0.1F);
+    std::cout << "penalty_probe control_drift=" << drift
+              << " tolerance=" << tolerance << '\n';
+    bool penaltiesDecided = false;
+    for (const Penalties penalties :
+         {Penalties{-2.0F, -2.0F, 1.0F}, Penalties{1.5F, 0.0F, 1.0F},
+          Penalties{1.5F, 0.0F, 1.3F}}) {
+      const auto reference = runPreemption(BatchCohort::Greedy, 0, penalties);
+      const auto promptResumed = runPreemption(BatchCohort::Greedy, 1, penalties);
+      require(promptResumed.transcript == reference.transcript,
+              "prompt recomputation changed a penalized transcript");
+      const auto resumed = runPreemption(BatchCohort::Greedy, 2, penalties);
+      require(resumed.transcript.size() > resumed.pendingAnchorIndex &&
+                  reference.transcript.size() > resumed.pendingAnchorIndex &&
+                  std::equal(resumed.transcript.begin(),
+                             resumed.transcript.begin() +
+                                 resumed.pendingAnchorIndex + 1,
+                             reference.transcript.begin()),
+              "preemption changed penalized history or its pending anchor");
+      const float referenceLoss = probeLoss(reference.transcript, penalties);
+      const float resumedLoss = probeLoss(resumed.transcript, penalties);
+      penaltiesDecided |= reference.transcript != control.transcript;
+      std::cout << "penalty_probe presence=" << penalties.presence
+                << " frequency=" << penalties.frequency
+                << " repetition=" << penalties.repetition
+                << " changed=" << (reference.transcript != control.transcript)
+                << " reference_loss=" << referenceLoss
+                << " resumed_loss=" << resumedLoss << '\n';
+      require(referenceLoss <= tolerance && resumedLoss <= tolerance,
+              "a penalized token is not the best of its penalized logits");
+    }
+    require(penaltiesDecided, "no penalty changed a decision to probe");
+    // Sampled lanes with presence and frequency repeat under a fixed seed;
+    // a constrained lane with repetition keeps its masked continuation.
+    {
+      const Penalties sampled{1.5F, 0.5F, 1.0F};
+      const auto reference = runPreemption(BatchCohort::Sampling, 0, sampled);
+      require(runPreemption(BatchCohort::Sampling, 1, sampled).transcript ==
+                  reference.transcript,
+              "prompt recomputation changed a penalized sampled transcript");
+      const auto resumed = runPreemption(BatchCohort::Sampling, 2, sampled);
+      require(std::equal(resumed.transcript.begin(),
+                         resumed.transcript.begin() +
+                             resumed.pendingAnchorIndex + 1,
+                         reference.transcript.begin()) &&
+                  runPreemption(BatchCohort::Sampling, 2, sampled).transcript ==
+                      resumed.transcript,
+              "penalized sampled recomputation is not deterministic");
+      const Penalties repetition{0.0F, 0.0F, 1.3F};
+      const auto masked = runPreemption(BatchCohort::Constrained, 0, repetition);
+      require(runPreemption(BatchCohort::Constrained, 1, repetition).transcript ==
+                  masked.transcript,
+              "prompt recomputation changed a penalized constrained transcript");
+      const auto maskedResumed =
+          runPreemption(BatchCohort::Constrained, 2, repetition);
+      require(std::equal(maskedResumed.transcript.begin(),
+                         maskedResumed.transcript.begin() +
+                             maskedResumed.pendingAnchorIndex + 1,
+                         masked.transcript.begin()),
+              "preemption changed penalized constrained history");
+    }
+    // Sampled requests whose top_k keeps every token keep the preemption
+    // guarantees and repeat under a fixed seed, at top_p 0.95 and 1. They
+    // ignore the stop tokens: a row that keeps every token can draw one, the
+    // first row too (the 35B UD-Q4_K_M at top_p 1 does under this seed),
+    // which would end the request at its prompt.
+    for (const float topP : {0.95F, 1.0F}) {
+      const auto run = [&](uint32_t preemptionMode) {
+        return runPreemption(BatchCohort::Sampling, preemptionMode, {}, 0, topP,
+                             RequestIgnoreEndOfSequence);
+      };
+      const auto reference = run(0);
+      require(run(1).transcript == reference.transcript,
+              "prompt recomputation changed a top_k -1 transcript");
+      const auto resumed = run(2);
+      require(std::equal(resumed.transcript.begin(),
+                         resumed.transcript.begin() +
+                             resumed.pendingAnchorIndex + 1,
+                         reference.transcript.begin()) &&
+                  run(2).transcript == resumed.transcript,
+              "top_k -1 recomputation is not deterministic");
+      std::cout << "top_k -1 top_p=" << topP
+                << " transcript_equal=" << (resumed.transcript == reference.transcript)
+                << " rows=" << reference.transcript.size() << '\n';
     }
 
     const auto rowsBeforeInvalidWarmup = executor.telemetry().targetPrefillRows;

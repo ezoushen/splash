@@ -626,6 +626,22 @@ def run_text_only(port: int, model: str, nonce: str) -> None:
     print("text-only media refusal: PASS", flush=True)
 
 
+# A tool whose only valid call is {"value": "ok"}.
+PROBE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "record_probe",
+        "description": "Record the fixed smoke-test value.",
+        "parameters": {
+            "type": "object",
+            "properties": {"value": {"type": "string", "const": "ok"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 def run(port: int, model: str) -> None:
     nonce = uuid.uuid4().hex
     modalities = input_modalities(port, model)
@@ -672,19 +688,6 @@ def run(port: int, model: str) -> None:
     )
     print("chat streaming: PASS", flush=True)
 
-    tool = {
-        "type": "function",
-        "function": {
-            "name": "record_probe",
-            "description": "Record the fixed smoke-test value.",
-            "parameters": {
-                "type": "object",
-                "properties": {"value": {"type": "string", "const": "ok"}},
-                "required": ["value"],
-                "additionalProperties": False,
-            },
-        },
-    }
     code, tool_response = request(
         port,
         "POST",
@@ -692,7 +695,7 @@ def run(port: int, model: str) -> None:
         chat_body(
             model,
             f"Call record_probe for request {nonce}.",
-            tools=[tool],
+            tools=[PROBE_TOOL],
             tool_choice={"type": "function", "function": {"name": "record_probe"}},
             max_completion_tokens=96,
         ),
@@ -786,6 +789,7 @@ def run(port: int, model: str) -> None:
         )
     print("anthropic messages: PASS", flush=True)
 
+    run_sampling(port, model)
     vision = "image" in modalities
     if vision:
         run_images(port, model, nonce)
@@ -793,6 +797,84 @@ def run(port: int, model: str) -> None:
         run_text_only(port, model, nonce)
     run_protocol_extensions(port, model, vision)
     run_judgments(port, model, nonce)
+
+
+def run_sampling(port: int, model: str) -> None:
+    """The sampling penalties and top_k on the real model: a penalized greedy
+    request repeats itself exactly once its prompt is cached (the first run
+    chunks the prompt differently), and penalized requests of every cohort
+    finish side by side with an unpenalized one and with sampled ones whose
+    top_k keeps every token."""
+    prompt = "Name the days of the week, three times over, separated by commas."
+    penalized = chat_body(
+        model,
+        prompt,
+        presence_penalty=1.5,
+        frequency_penalty=0.5,
+        repetition_penalty=1.05,
+        max_completion_tokens=48,
+    )
+    answers = []
+    for _ in range(3):
+        code, chat = request(port, "POST", "/v1/chat/completions", penalized)
+        require(code == 200, f"penalized greedy Chat failed: {chat!r}")
+        answers.append(answer_text(chat))
+    require(answers[1] == answers[2], "a penalized greedy request did not repeat")
+
+    bodies = {
+        "greedy": penalized,
+        "sampled": chat_body(
+            model,
+            prompt,
+            temperature=0.8,
+            top_k=-1,
+            presence_penalty=1.5,
+            seed=7,
+            max_completion_tokens=48,
+        ),
+        "whole": chat_body(
+            model,
+            prompt,
+            temperature=1.0,
+            top_k=0,
+            top_p=1.0,
+            seed=11,
+            max_completion_tokens=48,
+        ),
+        "tool": chat_body(
+            model,
+            "Call record_probe.",
+            tools=[PROBE_TOOL],
+            tool_choice={"type": "function", "function": {"name": "record_probe"}},
+            repetition_penalty=1.1,
+            presence_penalty=0.5,
+            max_completion_tokens=96,
+        ),
+        "ignore_eos": chat_body(model, prompt, ignore_eos=True),
+    }
+    results = {}
+
+    def send(name: str) -> None:
+        results[name] = request(port, "POST", "/v1/chat/completions", bodies[name])
+
+    workers = [threading.Thread(target=send, args=(name,)) for name in bodies]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    for name, (code, document) in results.items():
+        require(code == 200, f"concurrent {name} request failed: {document!r}")
+    calls = results["tool"][1]["choices"][0]["message"].get("tool_calls", [])
+    require(
+        len(calls) == 1
+        and json.loads(calls[0]["function"]["arguments"]) == {"value": "ok"},
+        "a penalized tool call failed",
+    )
+    require(
+        results["ignore_eos"][1]["usage"]["completion_tokens"] == 32,
+        "ignore_eos beside penalized requests stopped early",
+    )
+    print("sampling penalties and top_k: PASS", flush=True)
 
 
 def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
