@@ -90,7 +90,8 @@ struct GgufRotation {
 
 class GgufFile final {
 public:
-  // Parses the header of source and sets where its tensor data starts.
+  // Parses the header of source, sets where its tensor data starts and adds
+  // its tensors.
   explicit GgufFile(WeightSource &source);
 
   [[nodiscard]] const WeightSource &source() const noexcept { return source_; }

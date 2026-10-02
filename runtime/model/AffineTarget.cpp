@@ -77,6 +77,17 @@ void validateConfiguration(const SafetensorsCheckpoint &source, const Layout &la
   }
 }
 
+// An FFN's gate, up and down projections, each a slab of `experts`.
+template<class Layout>
+void ffn(Image &image, const Layout &layout, const std::string &name, uint32_t intermediate, uint32_t experts = 1) {
+  for (const std::string projectionName : {"gate_proj", "up_proj", "down_proj"}) {
+    const bool down = projectionName == "down_proj";
+    const uint32_t n = down ? layout.hiddenSize : intermediate;
+    const uint32_t k = down ? intermediate : layout.hiddenSize;
+    projection(image, {{name + projectionName, n}}, n, k, 4, experts);
+  }
+}
+
 template<class Layout>
 Image layerImage(const Layout &layout, uint32_t layer) {
   const bool full = layout.isFullAttentionLayer(layer);
@@ -111,24 +122,27 @@ Image layerImage(const Layout &layout, uint32_t layer) {
   }
   copy(result, prefix + "post_attention_layernorm.weight", {layout.hiddenSize});
   const std::string mlp = prefix + "mlp.";
-  const auto ffn = [&](const std::string &name, uint32_t intermediate, uint32_t experts = 1) {
-    for (const std::string projectionName : {"gate_proj", "up_proj", "down_proj"}) {
-      const bool down = projectionName == "down_proj";
-      const uint32_t n = down ? layout.hiddenSize : intermediate;
-      const uint32_t k = down ? intermediate : layout.hiddenSize;
-      projection(result, {{name + projectionName, n}}, n, k, 4, experts);
-    }
-  };
   if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) {
     // The router and the shared-expert scalar gate are 8-bit, their rows padded to
-    // whole 256-row tiles as the reader expects.
+    // whole 256-row tiles as the reader expects. The routed experts are
+    // expertsImage's.
     projection(result, {{mlp + "gate", layout.experts}}, layout.experts, layout.hiddenSize, 8);
-    ffn(mlp + "switch_mlp.", layout.expertIntermediateSize, layout.experts);
-    ffn(mlp + "shared_expert.", layout.expertIntermediateSize);
+    ffn(result, layout, mlp + "shared_expert.", layout.expertIntermediateSize);
     projection(result, {{mlp + "shared_expert_gate", 1}}, kQ4StorageN, layout.hiddenSize, 8);
   } else {
-    ffn(mlp, layout.intermediateSize);
+    ffn(result, layout, mlp, layout.intermediateSize);
   }
+  return result;
+}
+
+// A sparse MoE layer's routed experts, most of its bytes, in a file of their
+// own: a checkpoint that changes only the rest of the layer, such as a
+// fine-tune of its attention or shared expert, keeps this file's key.
+template<class Layout>
+Image expertsImage(const Layout &layout, uint32_t layer) {
+  Image result = image("experts-" + std::to_string(layer) + ".bin", Layout::expertsMagic, layer, 0);
+  ffn(result, layout, "language_model.model.layers." + std::to_string(layer) + ".mlp.switch_mlp.",
+      layout.expertIntermediateSize, layout.experts);
   return result;
 }
 
@@ -152,11 +166,15 @@ Image embeddingImage(const Layout &layout) {
   return result;
 }
 
-// Every image of a layout: the layers, the head, the embedding.
+// Every image of a layout in the order a load opens them: each layer, a
+// sparse MoE layer followed by its experts, then the head and the embedding.
 template<class Layout>
 std::vector<Image> images(const Layout &layout) {
   std::vector<Image> result;
-  for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(layerImage(layout, layer));
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    result.push_back(layerImage(layout, layer));
+    if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) result.push_back(expertsImage(layout, layer));
+  }
   result.push_back(headImage(layout));
   result.push_back(embeddingImage(layout));
   return result;
@@ -174,13 +192,16 @@ uint64_t preparedBytes(const Layout &layout) {
 struct AffineTargetLoader::Impl {
   metal::MetalBackend &backend;
   SafetensorsCheckpoint source;
-  std::vector<Image> images; // layers, head, embedding
+  std::vector<Image> images; // as model::images plans them
+  // A layer's images: the layer's, and a sparse MoE layer's experts'.
+  size_t layerImages;
   std::vector<PreparedWeight> weights;
   PreparedFiles files;
   template<class Layout>
   Impl(metal::MetalBackend &backend, const std::filesystem::path &directory, const Layout &layout,
        PreparationCheck admitConversion)
       : backend(backend), source(directory, [&backend] { backend.checkOperation(); }),
+        layerImages(Layout::ffnKind == QwenFfnKind::SparseMoe ? 2 : 1),
         files([&backend] { backend.checkOperation(); }, std::move(admitConversion),
               [this] { source.checkUnchanged(); }) {
     validateConfiguration(source, layout);
@@ -196,6 +217,11 @@ struct AffineTargetLoader::Impl {
     return files.open(backend, weights[index], affine::affineImageWriter(image), image.magic, image.layer,
                       image.type);
   }
+  // Image `part` of target layer `layer`.
+  WeightFile openLayer(uint32_t layer, size_t part) {
+    if (layer >= (images.size() - 2) / layerImages) throw WeightStoreError("target layer is out of range");
+    return open(layer * layerImages + part);
+  }
 };
 AffineTargetLoader::AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
                                        const Qwen3_8Layout &layout, PreparationCheck admitConversion)
@@ -209,16 +235,21 @@ void AffineTargetLoader::prepare() {
   for (size_t index = 0; index < impl_->images.size(); ++index)
     static_cast<void>(impl_->files.prepare(impl_->weights[index], affine::affineImageWriter(impl_->images[index])));
 }
-WeightFile AffineTargetLoader::layer(uint32_t index) {
-  if (index >= impl_->images.size() - 2) throw WeightStoreError("target layer is out of range");
-  return impl_->open(index);
+WeightFile AffineTargetLoader::layer(uint32_t index) { return impl_->openLayer(index, 0); }
+WeightFile AffineTargetLoader::experts(uint32_t index) {
+  if (impl_->layerImages != 2) throw WeightStoreError("a dense target has no experts file");
+  return impl_->openLayer(index, 1);
 }
 WeightFile AffineTargetLoader::head() { return impl_->open(impl_->images.size() - 2); }
 WeightFile AffineTargetLoader::embedding() { return impl_->open(impl_->images.size() - 1); }
 
 uint64_t preparedAffineBytes(const Qwen3_8Layout &layout) { return preparedBytes(layout); }
 uint64_t preparedAffineBytes(const Qwen3_6MoeLayout &layout) { return preparedBytes(layout); }
-Image affineLayerImage(const Qwen3_8Layout &layout, uint32_t layer) { return layerImage(layout, layer); }
-Image affineLayerImage(const Qwen3_6MoeLayout &layout, uint32_t layer) { return layerImage(layout, layer); }
+std::vector<Image> affineLayerImages(const Qwen3_8Layout &layout, uint32_t layer) {
+  return {layerImage(layout, layer)};
+}
+std::vector<Image> affineLayerImages(const Qwen3_6MoeLayout &layout, uint32_t layer) {
+  return {layerImage(layout, layer), expertsImage(layout, layer)};
+}
 
 } // namespace splash::model

@@ -206,7 +206,7 @@ void writeDecay(int destination, const Section &section) {
 // dimensions and quantization the plan records; nothing else in it changes
 // these bytes.
 PreparedWeight affineImageWeight(const Image &image, std::string_view directory, const std::string &source) {
-  WeightIdentity identity("splash-affine-preparation-v2 " SPLASH_AFFINE_PREPARATION_ID);
+  WeightIdentity identity("splash-affine-preparation-v3 " SPLASH_AFFINE_PREPARATION_ID);
   identity.record("image", image.magic, image.layer, image.type, image.bytes);
   for (const Section &section : image.sections) {
     identity.record("section", int(section.kind), section.offset, section.bytes, section.rows, section.columns,

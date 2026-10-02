@@ -66,9 +66,14 @@ def fixture(root, moe=False, rope_type_key="rope_type", rope_type="default"):
 
     expected = root / "expected"
     expected.mkdir()
+    # The MoE target as a package stores it, each layer's routed experts in
+    # its file after the router, which the loader must read alike.
+    package = root / "package"
+    if moe:
+        package.mkdir()
 
-    def image(name, magic, index, kind, sections):
-        (expected / name).write_bytes(weight_file(magic, index, kind, sections))
+    def image(name, magic, index, kind, sections, directory=expected):
+        (directory / name).write_bytes(weight_file(magic, index, kind, sections))
 
     for layer in range(2):
         p = f"language_model.model.layers.{layer}."
@@ -108,13 +113,15 @@ def fixture(root, moe=False, rope_type_key="rope_type", rope_type="default"):
         sections.append(add(p + "post_attention_layernorm.weight", [256]))
         if moe:
             # The 8-bit router and shared-expert scalar gate; the gate's one row is
-            # padded to a 256-row tile.
+            # padded to a 256-row tile. The routed experts have a file of their own.
             projection(p + "mlp.gate", 256, 256, bits=8)
             sections.append(packed([p + "mlp.gate"], 256, 256, bits=8))
+            routed, experts = len(sections), []
             for name in ("gate_proj", "up_proj", "down_proj"):
                 name = p + "mlp.switch_mlp." + name
                 projection(name, 256, 256, experts=256)
-                sections.append(packed([name], 256, 256, experts=256))
+                experts.append(packed([name], 256, 256, experts=256))
+            image(f"experts-{layer}.bin", "MDFM0003", layer, 0, experts)
             for name in ("gate_proj", "up_proj", "down_proj"):
                 name = p + "mlp.shared_expert." + name
                 projection(name, 256, 256)
@@ -132,6 +139,9 @@ def fixture(root, moe=False, rope_type_key="rope_type", rope_type="default"):
                 sections.append(packed([name], rows, columns))
         magic = "MDFM0001" if moe else "MDFL0006"
         image(f"layer-{layer}.bin", magic, layer, layer, sections)
+        if moe:
+            sections[routed:routed] = experts
+            image(f"layer-{layer}.bin", magic, layer, layer, sections, package)
     norm = add("language_model.model.norm.weight", [256])
     projection("language_model.lm_head", 256, 256)
     image(
@@ -152,6 +162,9 @@ def fixture(root, moe=False, rope_type_key="rope_type", rope_type="default"):
             for field in ("weight", "scales", "biases")
         ],
     )
+    if moe:
+        for name in ("head.bin", "embedding.bin"):
+            (package / name).write_bytes((expected / name).read_bytes())
     config = {
         "model_type": "qwen3_5_text",
         "num_hidden_layers": 2,

@@ -248,6 +248,7 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
     if (tensor.offset % alignment) throw GgufError("tensor data is misaligned: " + tensor.name);
     if (tensor.offset > dataBytes || tensor.bytes > dataBytes - tensor.offset)
       throw GgufError("tensor data runs past the end of the file: " + tensor.name);
+    source.addTensor(tensor.offset, tensor.bytes);
   }
   rotation_ = readRotation();
 }

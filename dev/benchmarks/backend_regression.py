@@ -19,7 +19,10 @@ machine, which must be otherwise idle:
   the candidate keeps the cache its other release steps use, so neither
   re-prepares between steps; the candidate's cache must hold the bytes of
   every entry the baseline prepared from the model (prepared.compare). Equal
-  identities share every entry, which then holds by construction.
+  identities share every entry, which then holds by construction. With
+  --expect-prepared-change (or EXPECT_PREPARED_CHANGE=1), for a change that
+  means to change prepared bytes, the differing entries are recorded but do
+  not fail the comparison.
 
 The candidate's own benchmark invariants must hold too, and the baseline must
 be another build: one with the candidate's build_id compares nothing. The
@@ -329,6 +332,12 @@ def parse_args(argv=None):
         default=os.environ.get("EXPECT_OUTPUT_CHANGE", "") not in ("", "0"),
         help="allow changed outputs with acceptance within 0.02 (EXPECT_OUTPUT_CHANGE=1)",
     )
+    parser.add_argument(
+        "--expect-prepared-change",
+        action="store_true",
+        default=os.environ.get("EXPECT_PREPARED_CHANGE", "") not in ("", "0"),
+        help="record changed prepared bytes without failing (EXPECT_PREPARED_CHANGE=1)",
+    )
     args = parser.parse_args(argv)
     if args.samples < 1:
         parser.error("--samples must be positive")
@@ -399,8 +408,9 @@ def main(argv=None) -> int:
                 ),
             }
         )
-        document["pass"] = (
-            document["comparison"]["pass"] and document["prepared"]["pass"]
+        document["prepared"]["expect_prepared_change"] = args.expect_prepared_change
+        document["pass"] = document["comparison"]["pass"] and (
+            document["prepared"]["pass"] or args.expect_prepared_change
         )
     except Exception as error:
         document["error"] = str(error)
@@ -425,10 +435,18 @@ def report(document: dict) -> None:
             f"candidate {rate['candidate']:.4f}"
         )
     prepared_bytes = document["prepared"]
+    if prepared_bytes["pass"]:
+        verdict = " PASS"
+    elif prepared_bytes.get("expect_prepared_change"):
+        verdict = (
+            f", changes allowed (EXPECT_PREPARED_CHANGE) {prepared_bytes['failures']}"
+        )
+    else:
+        verdict = f" FAIL {prepared_bytes['failures']}"
     print(
         "prepared bytes: "
         + ("shared identity" if prepared_bytes.get("shared_identity") else "compared")
-        + (" PASS" if prepared_bytes["pass"] else f" FAIL {prepared_bytes['failures']}")
+        + verdict
     )
     for failure in comparison["failures"]:
         print(f"FAIL: {failure}")

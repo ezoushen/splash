@@ -16,7 +16,9 @@ import argparse
 import hashlib
 import itertools
 import json
+import math
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,11 @@ RESTART_SECONDS = 10
 UNREACHABLE_HUB = "http://127.0.0.1:9"
 # Each run's Hub, whatever the caller's HF_HUB_OFFLINE says.
 ONLINE = {"HF_HUB_OFFLINE": "0"}
+
+
+# The element bytes of the GGML types a vision tower's mmproj stores, which
+# preparation reads (VisionLoader.cpp): F32, F16 and BF16.
+MMPROJ_ELEMENT_BYTES = {0: 4, 1: 2, 30: 2}
 
 
 class RestartFailure(RuntimeError):
@@ -147,29 +154,90 @@ def check(arguments, run=run_installer, hub_cache=None):
     return selection
 
 
-def data_digest(path: Path) -> str:
-    """The SHA-256 of a source file's tensor data, after its header, as a
-    prepared entry's inputs name it (WeightSource::digest). The name of path
-    gives the format, so path is an assembly's link, not the Hub cache blob
-    it resolves to: a blob is named by its hash."""
+def update(file, size, *hashes):
+    """Hashes the next size bytes of file, all the rest when size is None."""
+    while size is None or size > 0:
+        chunk = file.read(1 << 20 if size is None else min(size, 1 << 20))
+        if not chunk:
+            if size is None:
+                return
+            raise ValueError(f"truncated source file {file.name}")
+        for hasher in hashes:
+            hasher.update(chunk)
+        if size is not None:
+            size -= len(chunk)
+
+
+def gguf_tensors(path: Path):
+    """The (offset in the tensor data, bytes) of each tensor of an mmproj,
+    read from its tensor table, which follows its metadata."""
+    ranges = []
+    with path.open("rb") as file:
+        file.seek(8)
+        (count,) = struct.unpack("<Q", file.read(8))
+        file.seek(gguf.Metadata(path).consumed)
+        for _ in range(count):
+            (length,) = struct.unpack("<Q", file.read(8))
+            name = file.read(length).decode()
+            (rank,) = struct.unpack("<I", file.read(4))
+            shape = struct.unpack(f"<{rank}Q", file.read(8 * rank))
+            kind, offset = struct.unpack("<IQ", file.read(12))
+            if kind not in MMPROJ_ELEMENT_BYTES:
+                raise ValueError(f"{path}: {name} is not F32, F16 or BF16")
+            ranges.append((offset, math.prod(shape) * MMPROJ_ELEMENT_BYTES[kind]))
+    return ranges
+
+
+def source_digests(path: Path, tensors=True):
+    """The SHA-256 of a source file's tensor data, after its header, as the
+    inputs of an entry that lists no tensors name it (WeightSource::digest),
+    and with tensors the set of those of each of its tensors, as an entry's
+    tensors file lists them (WeightSource::tensorDigest); one pass. The name
+    of path gives the format, so path is an assembly's link, not the Hub
+    cache blob it resolves to: a blob is named by its hash."""
+    ranges = []
     if path.suffix == ".gguf":
         header = gguf.Metadata(path, tensors=True)
         alignment = header.values.get("general.alignment", 32)
         offset = -(-header.consumed // alignment) * alignment
+        if tensors:
+            ranges = gguf_tensors(path)
     else:
         with path.open("rb") as file:
-            offset = 8 + int.from_bytes(file.read(8), "little")
+            length = int.from_bytes(file.read(8), "little")
+            records = json.loads(file.read(length)) if tensors else {}
+        offset = 8 + length
+        for name, record in records.items():
+            if name != "__metadata__":
+                begin, end = record["data_offsets"]
+                ranges.append((begin, end - begin))
+    data, digests = hashlib.sha256(), set()
     with path.open("rb") as file:
         file.seek(offset)
-        return hashlib.file_digest(file, "sha256").hexdigest()
+        at = 0
+        for begin, size in sorted(ranges):
+            if begin < at:
+                raise ValueError(f"overlapping tensors in {path}")
+            update(file, begin - at, data)
+            tensor = hashlib.sha256()
+            update(file, size, data, tensor)
+            digests.add(tensor.hexdigest())
+            at = begin + size
+        update(file, None, data)
+    return data.hexdigest(), digests
 
 
 def loaded_entries(link: Path, cache: Path):
     """The (component, SHA-256) of each cache entry the installation at link
     loads. An entry's key hashes the preparation identity and plan too, but
-    its source file names its component and the digest of the sorted digests
-    of the source files it reads; one entry holds each component and inputs
-    (PreparedWeights.cpp evictSuperseded)."""
+    its source file names its component and its inputs; one entry holds each
+    component and inputs (PreparedWeights.cpp evictSuperseded). An entry
+    keyed by the content of its source tensors lists their digests, all of
+    which a source of the installation holds; another model's source may
+    hold them too, as a fine-tune shares its base's unchanged tensors. The
+    inputs of any other entry (a GGUF target's, or one of the first
+    provenance version) are the digest of the sorted data digests of the
+    source files it reads."""
     if models.installation_kind(link) == models.PACKAGE:
         return []  # A package's files are mapped as they are.
     record = models.read_json(link / "model.json")
@@ -182,6 +250,11 @@ def loaded_entries(link: Path, cache: Path):
         "draft/model.bin",
         *(f"draft/layer-{index}.bin" for index in range(family.draft.layers)),
     }
+    # An MLX target prepares each MoE layer's routed experts into a file of
+    # their own (AffineTarget.cpp).
+    moe = "num_experts" in dict(family.signature)
+    if moe and record["target_format"] == "mlx-affine":
+        components.update(f"target/experts-{index}.bin" for index in range(layers))
     if record["vision_format"] != "none":
         components.add("vision/model.bin")
     # Each file is hashed once, through one of its links: the vision tower
@@ -191,8 +264,16 @@ def loaded_entries(link: Path, cache: Path):
         if name.startswith(("target/", "draft/", "vision/")) and name.endswith(
             (".safetensors", ".gguf")
         ):
-            sources.setdefault((link / name).resolve(), link / name)
-    digests = sorted({data_digest(path) for path in sources.values()})
+            sources.setdefault((link / name).resolve(), name)
+    files, tensors = set(), set()
+    for name in sources.values():
+        # A GGUF target's entries list no tensors.
+        data, digests = source_digests(
+            link / name, not (name.startswith("target/") and name.endswith(".gguf"))
+        )
+        files.add(data)
+        tensors |= digests
+    digests = sorted(files)
     inputs = {
         hashlib.sha256("".join(subset).encode()).hexdigest()
         for size in range(1, len(digests) + 1)
@@ -200,7 +281,11 @@ def loaded_entries(link: Path, cache: Path):
     }
     found = {}
     for entry in prepared.entries(cache):
-        if entry.get("component") in components and entry.get("inputs") in inputs:
+        if entry.get("component") in components and (
+            tensors.issuperset(entry["tensors"])
+            if "tensors" in entry
+            else entry.get("inputs") in inputs
+        ):
             found.setdefault(entry["component"], []).append(entry)
     for component in sorted(components):
         entries = found.get(component, [])

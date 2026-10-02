@@ -99,7 +99,7 @@ void writeSection(int destination, const Section &s, uint32_t pixels, Staging &s
 // The plan and the source tensors are all these bytes depend on; no
 // configuration value enters them.
 PreparedWeight visionWeight(const Plan &plan, const std::string &source) {
-  WeightIdentity identity("splash-vision-preparation-v2 " SPLASH_VISION_PREPARATION_ID);
+  WeightIdentity identity("splash-vision-preparation-v3 " SPLASH_VISION_PREPARATION_ID);
   identity.record("file", plan.depth, plan.patchSize, plan.bytes);
   for (const auto &s : plan.sections) {
     identity.record("section", s.offset, s.rows, s.columns, s.storedRows, s.storedColumns, s.patch);

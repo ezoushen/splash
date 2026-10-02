@@ -281,8 +281,9 @@ class BackendRegressionTests(unittest.TestCase):
         return checkout
 
     @staticmethod
-    def run_main(root: Path) -> int:
-        """main on the fake checkouts under root and a legacy package."""
+    def run_main(root: Path, *options: str, environment=None) -> int:
+        """main on the fake checkouts under root and a legacy package, with
+        options and the variables of environment."""
         models = root / "models"
         package = models / "incoai/Qwen3.8-27B-Splash"
         package.mkdir(parents=True)
@@ -296,10 +297,12 @@ class BackendRegressionTests(unittest.TestCase):
             str(package),
             "--output-dir",
             str(root / "release"),
+            *options,
         ]
+        variables = {"SPLASH_WEIGHT_CACHE": str(root / "cache")} | (environment or {})
         with (
             mock.patch.object(smoke.model_artifacts, "MODELS", models),
-            mock.patch.dict(os.environ, {"SPLASH_WEIGHT_CACHE": str(root / "cache")}),
+            mock.patch.dict(os.environ, variables),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
@@ -376,6 +379,51 @@ class BackendRegressionTests(unittest.TestCase):
                 )
                 # A legacy package prepares nothing, which is no failure.
                 self.assertEqual(document["prepared"].get("entries", []), [])
+
+    def test_changed_prepared_bytes_fail_unless_a_change_is_expected(self):
+        for options, environment, expected in (
+            ((), {"EXPECT_PREPARED_CHANGE": "0"}, False),
+            (("--expect-prepared-change",), {}, True),
+            ((), {"EXPECT_PREPARED_CHANGE": "1"}, True),
+        ):
+            with (
+                self.subTest(options=options, environment=environment),
+                TemporaryDirectory() as directory,
+            ):
+                root = Path(directory).resolve()
+                self.fake_checkout(root, "baseline", "same", True)
+                self.fake_checkout(root, "candidate", "new", True)
+                # The baseline prepared bytes of the package that the
+                # candidate, of another preparation identity, never writes.
+                entry = root / "release/baseline-weights" / ("a" * 64)
+                entry.mkdir(parents=True)
+                (entry / "sha256").write_text("b" * 64)
+                (entry / "source").write_text(
+                    f"{root / 'models/incoai/Qwen3.8-27B-Splash'}\nlayer-0.bin\n"
+                )
+                self.assertEqual(
+                    self.run_main(root, *options, environment=environment),
+                    0 if expected else 1,
+                )
+                document = json.loads(
+                    (root / "release/backend-regression.json").read_text()
+                )
+                self.assertEqual(document["pass"], expected)
+                # The changed bytes are recorded either way.
+                result = document["prepared"]
+                self.assertFalse(result["pass"])
+                self.assertEqual(result["expect_prepared_change"], expected)
+                self.assertIn(
+                    "lacks the baseline's prepared bytes", result["failures"][0]
+                )
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    regression.report(document)
+                self.assertIn(
+                    "prepared bytes: compared, changes allowed (EXPECT_PREPARED_CHANGE)"
+                    if expected
+                    else "prepared bytes: compared FAIL",
+                    output.getvalue(),
+                )
 
     def test_package_slug_names_results_by_selection(self):
         models = Path("/install/models")
