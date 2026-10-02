@@ -1,3 +1,59 @@
+# About this fork
+
+This is [ezoushen](https://github.com/ezoushen)'s fork of [Inco AI's Splash](https://github.com/incoai/splash).
+It exists to serve a fine-tuned model beside its base model on one Mac, to ask that fine-tune typed
+questions about images, and to sample agent replies with repetition penalties. We use it to run
+[Umpire](https://huggingface.co/ezoushen/umpire-35b-a3b-mlx-4bit), a decision fine-tune of Ornith 1.5
+35B-A3B, next to Ornith itself.
+
+It adds three things to upstream Splash:
+
+- **Shared weights between a fine-tune and its base.** Prepared weight files are keyed by the tensors they
+  read, and a MoE layer's routed experts get a file of their own. A fine-tune that leaves the experts
+  unchanged maps its base's files instead of preparing a second copy. In our measurements, starting Umpire
+  beside Ornith added 3.0 GiB of host memory instead of 18.5 GiB. Proposed upstream in
+  [incoai/splash#203](https://github.com/incoai/splash/issues/203).
+- **Images on `POST /v1/systemone`.** A request may carry `"images"`: 1 to 64 `data:` URLs, which every
+  question's prompt shows before the evidence. A server started with `--language-only` answers 422. The
+  model needs a vision tower; Umpire's MLX repository carries Ornith's. Image decisions are smoke-tested
+  only, not evaluated.
+- **Sampling penalties, `min_p` and an exact whole-vocabulary sampler**, from upstream's open
+  [incoai/splash#243](https://github.com/incoai/splash/pull/243): `presence_penalty`, `frequency_penalty`
+  and `repetition_penalty` on chat, completions and responses, exact under DFlash. Score requests stay
+  neutral.
+
+```bash
+git clone https://github.com/ezoushen/splash.git && cd splash && make -j4
+./splash serve --model ezoushen/umpire-35b-a3b-mlx-4bit --max-context 16K
+```
+
+```bash
+curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -d '{
+  "model": "ezoushen/umpire-35b-a3b-mlx-4bit",
+  "state": "Answer about the attached image.",
+  "images": ["data:image/png;base64,..."],
+  "questions": {"colour": {"type": "choice", "criteria": {"red": null, "blue": null}}}
+}'
+```
+
+## Branches, changes from upstream, and credit
+
+`main` is the integration branch. It merges three topic branches, each of which holds one feature:
+
+| Branch | Content | Author | Origin |
+| --- | --- | --- | --- |
+| `pr243-sampling-penalties` | upstream `main` (`a105662`) plus [#243](https://github.com/incoai/splash/pull/243) and the open PRs it stacks on: [#244](https://github.com/incoai/splash/pull/244), [#245](https://github.com/incoai/splash/pull/245), [#246](https://github.com/incoai/splash/pull/246), [#247](https://github.com/incoai/splash/pull/247), [#248](https://github.com/incoai/splash/pull/248); pinned at `95664ce`, unmodified | [jianc99](https://github.com/jianc99) and the Splash contributors | upstream, not yet merged there |
+| `shared-expert-weights` | Key prepared files by the tensors they read; prepare a MoE layer's routed experts in a file of their own | ezoushen | this fork ([#203](https://github.com/incoai/splash/issues/203)) |
+| `vision-systemone` | Allow score-only requests to carry images | [Audrey Tang](https://github.com/audreyt) | cherry-picked unchanged from [#159](https://github.com/incoai/splash/pull/159); the commit credits Devin as co-author, as the original does |
+| | Accept images on `/v1/systemone` | ezoushen, co-authored by Audrey Tang | adapted from the `images` field of [#159](https://github.com/incoai/splash/pull/159), keeping its request shape and limits, with tests written for this branch; #159's other extensions are not included |
+
+The two merge commits record how the topics were fitted to upstream's newer code. Everything else is
+Splash by Inco AI, under the [Apache-2.0 licence](LICENSE), which also covers our changes. Nothing here
+is merged upstream yet. When upstream merges #243 and its stack, `pr243-sampling-penalties` goes away
+and `main` is rebuilt from upstream `main`. The original README follows.
+
+---
+
 # Splash
 
 [![CI](https://github.com/incoai/splash/actions/workflows/ci.yml/badge.svg)](https://github.com/incoai/splash/actions/workflows/ci.yml)
