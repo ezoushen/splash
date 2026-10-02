@@ -763,8 +763,6 @@ def _request_issue(
         generation = _u32(request.generation_prompt_tokens, "generation prompt tokens")
         if generation >= len(prompt):
             raise ValueError("generation prompt must leave a prompt token")
-        if scores and (request.image_spans or request.image_pixels):
-            raise ValueError("score requests are text-only")
         if scores and (
             len(scores) < MIN_SCORE_TOKENS
             or len(scores) > MAX_SCORE_TOKENS

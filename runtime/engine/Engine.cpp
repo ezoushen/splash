@@ -92,7 +92,7 @@ void Engine::submit(EngineRequest value) {
   const uint64_t id = value.id;
   if (scoring) {
     if (value.cohort != BatchCohort::Greedy ||
-        value.constraint != ConstraintMode::None || !value.images.empty() ||
+        value.constraint != ConstraintMode::None ||
         value.sampling.temperature != 0.0f || value.sampling.topP != 1.0f ||
         value.sampling.topK != 0 || value.sampling.penalized() ||
         value.sampling.minP != 0.0f ||

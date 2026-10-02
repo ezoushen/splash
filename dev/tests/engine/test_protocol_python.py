@@ -435,6 +435,17 @@ class ProtocolPythonTests(unittest.TestCase):
             p.decode_frame(parse_all(wire)[0]),
             request,
         )
+        # Score requests may carry image spans with matching pixels.
+        span = p.ImageSpan(0, 1, 2, 2, 1, 2)
+        imaged = replace(
+            request,
+            image_spans=(span,),
+            image_pixels=bytes(span.pixel_bytes),
+        )
+        self.assertEqual(
+            p.decode_frame(parse_all(p.serialize_message(imaged))[0]),
+            imaged,
+        )
         # A wrong score count desynchronizes the tail and must fail closed.
         bad = mutate_u32(wire, 24 + 76, 2)
         self.assert_protocol_error(
@@ -553,6 +564,10 @@ class ProtocolPythonTests(unittest.TestCase):
                     image_spans=(p.ImageSpan(0, 1, 2, 2, 1, 2),),
                     image_pixels=bytes(48),
                 ),
+                p.IssueCode.INVALID_COUNT,
+            ),
+            (
+                replace(base, image_pixels=bytes(48)),
                 p.IssueCode.INVALID_COUNT,
             ),
         )
