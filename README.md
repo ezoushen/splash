@@ -1,3 +1,54 @@
+# About this fork
+
+This is [ezoushen](https://github.com/ezoushen)'s fork of [Inco AI's Splash](https://github.com/incoai/splash).
+It exists to serve a fine-tuned model beside its base model on one Mac, and to ask that fine-tune typed
+questions about images. We use it to run [Umpire](https://huggingface.co/ezoushen/umpire-35b-a3b-mlx-4bit),
+a decision fine-tune of Ornith 1.5 35B-A3B, next to Ornith itself.
+
+It adds two things to upstream Splash:
+
+- **Shared weights between a fine-tune and its base.** Prepared weight files are keyed by the tensors they
+  read, and a MoE layer's routed experts get a file of their own. A fine-tune that leaves the experts
+  unchanged maps its base's files instead of preparing a second copy. In our measurements, starting Umpire
+  beside Ornith added 3.0 GiB of host memory instead of 18.5 GiB. Proposed upstream in
+  [incoai/splash#203](https://github.com/incoai/splash/issues/203).
+- **Images on `POST /v1/systemone`.** A request may carry `"images"`: 1 to 64 `data:` URLs, which every
+  question's prompt shows before the evidence. A server started with `--language-only` answers 422. The
+  model needs a vision tower; Umpire's MLX repository carries Ornith's. Image decisions are smoke-tested
+  only, not evaluated.
+
+```bash
+git clone https://github.com/ezoushen/splash.git && cd splash && make -j4
+./splash serve --model ezoushen/umpire-35b-a3b-mlx-4bit --max-context 16K
+```
+
+```bash
+curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -d '{
+  "model": "ezoushen/umpire-35b-a3b-mlx-4bit",
+  "state": "Answer about the attached image.",
+  "images": ["data:image/png;base64,..."],
+  "questions": {"colour": {"type": "choice", "criteria": {"red": null, "blue": null}}}
+}'
+```
+
+## Changes from upstream, and credit
+
+The fork is upstream `main` at `c64a578` (Splash 1.1.0) plus these commits, oldest first:
+
+| Commit | Author | Origin |
+| --- | --- | --- |
+| Key prepared files by the tensors they read | ezoushen | this fork |
+| Prepare a MoE layer's routed experts in a file of their own | ezoushen | this fork |
+| Allow score-only requests to carry images | [Audrey Tang](https://github.com/audreyt) | cherry-picked unchanged from [incoai/splash#159](https://github.com/incoai/splash/pull/159); the commit credits Devin as co-author, as the original does |
+| Accept images on `/v1/systemone` | ezoushen, co-authored by Audrey Tang | adapted from the `images` field of [#159](https://github.com/incoai/splash/pull/159), keeping its request shape and limits, with tests written for this branch; #159's other extensions are not included |
+| Describe this fork in the README | ezoushen | this fork |
+
+Everything else is Splash by Inco AI, under the [Apache-2.0 licence](LICENSE), which also covers our
+changes. Neither change is merged upstream; we rebase onto upstream releases by hand. The original README
+follows.
+
+---
+
 # Splash
 
 [![CI](https://github.com/incoai/splash/actions/workflows/ci.yml/badge.svg)](https://github.com/incoai/splash/actions/workflows/ci.yml)
