@@ -14,7 +14,6 @@
 #include <thread>
 #include <cerrno>
 #include <cstdlib>
-#include <iostream>
 #include <limits>
 #include <map>
 #include <optional>
@@ -273,8 +272,9 @@ std::string verifiedTensors(int fd, uint64_t from, const TensorDigests &tensors,
   std::string table = remembered(root, key, 64 * (tensors.size() + 1));
   const bool missing = table.empty();
   if (missing) {
-    std::clog << "Hashing the tensors of " << path.string() << " (" << (uint64_t(before.st_size) - from) / (1024 * 1024)
-              << " MiB) once; later starts reuse the result" << std::endl;
+    writeStderrLine("Hashing the tensors of " + path.string() + " (" +
+                    std::to_string((uint64_t(before.st_size) - from) / (1024 * 1024)) +
+                    " MiB) once; later starts reuse the result");
     table = tensorTable(fd, from, tensors, check);
   }
   if (fstat(fd, &after)) fail("stat verified weights after read");
