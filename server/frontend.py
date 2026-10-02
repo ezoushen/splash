@@ -15,6 +15,7 @@ from . import json_codec, judgments
 from . import protocol as wire
 from .api_shapes import (
     IMAGE_PAD_TOKEN,
+    VISION_UNAVAILABLE,
     canonical_responses_input,
     normalize_messages,
     responses_to_chat_body,
@@ -587,7 +588,16 @@ class Frontend:
         return _PRIORITIES[priority_name]
 
     def _score_job(
-        self, prompt_tokens, slot_ids, deadline, priority, prompt_sha256=None
+        self,
+        prompt_tokens,
+        slot_ids,
+        deadline,
+        priority,
+        prompt_sha256=None,
+        *,
+        image_spans=(),
+        image_pixels=b"",
+        image_owner=None,
     ):
         return Job(
             request_id=next(self.ids),
@@ -598,9 +608,42 @@ class Frontend:
             deadline=deadline,
             priority=priority,
             score_tokens=tuple(slot_ids),
+            image_spans=image_spans,
+            image_pixels=image_pixels,
+            image_owner=image_owner,
             public_id=secrets.token_hex(16),
             prompt_sha256=prompt_sha256,
         )
+
+    def _prepare_systemone_images(self, image_urls, deadline):
+        """Decodes a System One request's images once; every question's
+        prompt and native job references this batch."""
+        if not image_urls:
+            return ()
+        if self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN) is None:
+            raise APIError(400, "the tokenizer does not define the image pad token")
+        parts = [{"type": "image_url", "image_url": {"url": url}} for url in image_urls]
+        with self.latencies.measure("images"):
+            images = self._prepare_images(
+                [{"role": "user", "content": parts}], deadline
+            )
+        remaining_request_time(deadline)
+        return images
+
+    def _systemone_image_tokens(self, messages, tokens, images):
+        """Expands the image placeholders of a scored System One prompt. A
+        second render finds the template's own placeholders by offset, as
+        chat does; its tokens must be the prompt's."""
+        template = {
+            "tokenize": False,
+            "chat_template": self.chat_templates.select(None).source,
+            "add_generation_prompt": True,
+            "enable_thinking": False,
+        }
+        rendered, positions, _ = self._render_image_tokens(messages, template)
+        if rendered != tokens:
+            raise APIError(500, "question prompt could not be rendered")
+        return self._expand_image_pads(tokens, images, positions)
 
     def _encode_score_prompt(self, messages, labels, admit, deadline, what):
         """The tokens, answer-slot token ids and text of a scoring prompt. The
@@ -668,6 +711,14 @@ class Frontend:
             )
         state, specs, question_details = judgments.validate_systemone(body)
         details.extend(question_details)
+        image_urls, image_details = judgments.systemone_images(body)
+        details.extend(image_details)
+        if image_urls and not self.vision:
+            details.append(
+                judgments.detail(
+                    ["images"], f"image input is not supported: {VISION_UNAVAILABLE}"
+                )
+            )
         try:
             priority = self._priority(body)
         except APIError as error:
@@ -677,6 +728,9 @@ class Frontend:
         jobs = []
         total_tokens = 0
         with self._preparation(deadline):
+            images = self._prepare_systemone_images(image_urls, deadline)
+            # Every question's job references this one copy of the pixels.
+            image_pixels = b"".join(image.pixels for image in images)
             for qid, spec in specs:
                 if spec.deterministic:
                     jobs.append((qid, spec, None))
@@ -694,6 +748,7 @@ class Frontend:
                         ]
                     )
                 labels = slots[: len(spec.labels)]
+                messages = judgments.systemone_messages(state, spec, labels, image_urls)
 
                 def admit(prompt_tokens, qid=qid, prepared=total_tokens):
                     remaining_request_time(deadline)
@@ -711,17 +766,38 @@ class Frontend:
                         )
 
                 tokens, slot_ids, _ = self._encode_score_prompt(
-                    judgments.systemone_messages(state, spec, labels),
-                    labels,
-                    admit,
-                    deadline,
-                    "question",
+                    messages, labels, admit, deadline, "question"
                 )
+                image_spans = ()
+                if images:
+                    tokens, image_spans, _ = self._systemone_image_tokens(
+                        messages, tokens, images
+                    )
+                    if (
+                        total_tokens + len(tokens)
+                        > judgments.MAX_SYSTEMONE_TOTAL_TOKENS
+                    ):
+                        raise judgments.SystemOneError(
+                            [
+                                judgments.detail(
+                                    ["questions", qid],
+                                    "total prepared question tokens exceed "
+                                    f"{judgments.MAX_SYSTEMONE_TOTAL_TOKENS}",
+                                )
+                            ]
+                        )
                 remaining_request_time(deadline)
                 total_tokens += len(tokens)
-                jobs.append(
-                    (qid, spec, self._score_job(tokens, slot_ids, deadline, priority))
+                job = self._score_job(
+                    tokens,
+                    slot_ids,
+                    deadline,
+                    priority,
+                    image_spans=image_spans,
+                    image_pixels=image_pixels,
+                    image_owner=images or None,
                 )
+                jobs.append((qid, spec, job))
         return jobs
 
     def apply_template(self, body, *, deadline):
