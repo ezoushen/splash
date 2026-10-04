@@ -26,10 +26,11 @@ struct SharedImagesConfig final {
   std::filesystem::path registry;
   // Where the digests of source tensors are kept, a small table per file.
   std::filesystem::path digestTables;
-  // Identifies the writers' code.
+  // The writers' code (writerIdentity).
   std::string writerIdentity;
   // The model's directory, and the content digest its installation record
-  // gives each source file, by its path relative to the directory.
+  // gives each source file, by its path relative to the directory
+  // (recordedSourceDigests).
   std::filesystem::path modelRoot;
   std::map<std::string, std::string, std::less<>> sourceDigests;
   // How long a load or restore waits for another process that writes an
@@ -60,5 +61,20 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// The SHA-256 of the code that writes images: the engine's code as this
+// process runs it (the __TEXT segment of the executable that holds it, as
+// mapped) and the metallib backend loaded, which writes a GGUF image's on
+// the GPU. Files that replace them on disk change nothing. The toolchain and
+// the system's libraries and frameworks are not covered.
+[[nodiscard]] std::string writerIdentity(const metal::MetalBackend &backend);
+// What writerIdentity gives in a process of the engine executable at path
+// that loaded backend's metallib.
+[[nodiscard]] std::string writerIdentity(const std::filesystem::path &engine, const metal::MetalBackend &backend);
+
+// Sharing for the model at root by writers of writerIdentity: the user's
+// registry, /tmp/splash-<uid>, and digest tables, under
+// ~/Library/Caches/Splash/tensor-digests.
+[[nodiscard]] SharedImagesConfig sharedImagesConfig(const std::filesystem::path &root, std::string writerIdentity);
 
 } // namespace splash::model

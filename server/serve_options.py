@@ -313,6 +313,15 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--share-weights",
+        dict(
+            action="store_true",
+            default=False,
+            help="share weight memory with other Splash processes of this build "
+            "that load the same weights (default: off)",
+        ),
+    ),
+    ServeOption(
         "--allowed-host",
         dict(
             action="append",

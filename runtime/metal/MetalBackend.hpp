@@ -244,6 +244,9 @@ public:
   MetalBackend &operator=(MetalBackend &&) = delete;
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
+  // The SHA-256, in lowercase hex, of the metallib bytes the kernels were
+  // loaded from, whatever later replaced the file.
+  [[nodiscard]] const std::string &libraryDigest() const;
 
   // Every buffer the backend allocates belongs to one residency set, attached
   // to the command queue, until its memory is released or its last view is

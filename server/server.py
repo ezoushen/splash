@@ -1912,6 +1912,8 @@ def _native_command(args):
         command.extend(("--kv-format", args.kv_format))
     if args.decode_share is not None:
         command.extend(("--decode-share", str(args.decode_share)))
+    if args.share_weights:
+        command.append("--share-weights")
     if args.max_image_pixels != image_input.MAX_PIXELS:
         command.extend(
             ("--max-image-patches", str(image_input.max_patches(args.max_image_pixels)))

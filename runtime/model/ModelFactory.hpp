@@ -91,10 +91,12 @@ loadVisionWeights(metal::MetalBackend &backend, WeightImages &images, const std:
 
 // Production loading is selected by the validated package descriptor. There
 // is one shared engine and DFlash controller; only model execution differs.
+// With shared, the images are shared with other processes (WeightImages).
 [[nodiscard]] ModelPackage
 loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor);
+                 const ModelDescriptor &descriptor,
+                 std::shared_ptr<SharedImages> shared = nullptr);
 
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const DeviceCapabilities &device,

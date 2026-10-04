@@ -559,8 +559,8 @@ $(TEST_AFFINE_SOURCE_ORACLE): dev/tests/engine/affine_source_oracle_test.mm \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(WEIGHT_DIGESTS): dev/tools/weight_digests.mm $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $< $(ENGINE_LIBRARY) \
+$(WEIGHT_DIGESTS): dev/tools/weight_digests.mm $(ENGINE_LIBRARY) $(BUILD_ID_HEADER) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) -include $(BUILD_ID_HEADER) $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \

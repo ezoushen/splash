@@ -57,6 +57,7 @@ struct NativeArguments final {
   kv::Format kvFormat = kv::Format::Int8;
   double decodeShare = engine::EngineConfig{}.decodeShare;
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
+  bool shareWeights = false;
 };
 
 // One observer spans bootstrap and serving. The dispatch queue only records
@@ -129,7 +130,8 @@ void printUsage(std::string_view executable) {
       " serve-native MODEL_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|bf16] [--decode-share SHARE]"
-      " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]");
+      " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]"
+      " [--share-weights]");
 }
 
 template <typename T>
@@ -205,11 +207,15 @@ NativeArguments parseArguments(int argc, char **argv) {
     if (quota != "0" && !parsePositive(quota, result.maxCacheDiskBytes))
       throw UsageError("MAX_CACHE_DISK_BYTES must be a nonnegative integer");
   }
-  // Options follow as --name value pairs; a missing value fails its check.
+  // Options follow as --name value pairs, but for switches; a missing value
+  // fails its check.
   for (; next < argc; next += 2) {
     const std::string_view option(argv[next]);
     const std::string_view value(next + 1 < argc ? argv[next + 1] : "");
-    if (option == "--kv-format") {
+    if (option == "--share-weights") {
+      result.shareWeights = true;
+      --next;
+    } else if (option == "--kv-format") {
       if (value != "int8" && value != "bf16")
         throw UsageError("--kv-format requires int8 or bf16");
       result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
@@ -265,6 +271,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.persistentCacheRoot = arguments.persistentCacheRoot;
   config.resources.kvFormat = arguments.kvFormat;
   config.resources.maximumImagePatches = arguments.maxImagePatches;
+  config.resources.shareWeights = arguments.shareWeights;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;

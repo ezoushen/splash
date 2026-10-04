@@ -4,6 +4,7 @@
 #include "engine/Engine.hpp"
 #include "engine/StartupLog.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "model/SharedImages.hpp"
 #include "model/WeightStore.hpp"
 #include "TestConfig.hpp"
 
@@ -378,7 +379,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   model::ModelPackage package;
   try {
     const auto started = std::chrono::steady_clock::now();
-    package = model::loadModelPackage(*backend, config.modelRoot, config.model);
+    std::shared_ptr<model::SharedImages> shared;
+    if (config.shareWeights)
+      shared = std::make_shared<model::SharedImages>(
+          model::sharedImagesConfig(config.modelRoot, model::writerIdentity(*backend)));
+    package = model::loadModelPackage(*backend, config.modelRoot, config.model, std::move(shared));
     requireLoadedModel(package);
     const std::chrono::duration<double> loading =
         std::chrono::steady_clock::now() - started;

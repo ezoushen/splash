@@ -98,6 +98,7 @@ OPTIONS = {
         {"0": 0.0, "0.25": 0.25, "2": 2.0},
         ("-0.5", "inf", "nan", "half"),
     ),
+    "--share-weights": ([(["--share-weights"], True)], []),
     "--allowed-host": values(
         "--allowed-host", {"proxy.example": "proxy.example"}, (), repeatable=True
     ),

@@ -114,13 +114,18 @@ bool writable(const void *address) {
 // source, recorded by its SHA-256 as the installer records a file.
 int runEngine(char **argv) {
   metal::MetalBackend backend(argv[2]);
+  std::cout << "ready" << std::endl;
   const std::filesystem::path root = argv[3];
+  // Sharing begins with the first command, as a server's begins when it
+  // loads its model, some time after it started.
+  std::string line;
+  if (!std::getline(std::cin, line)) return 0;
   std::shared_ptr<model::SharedImages> shared;
   if (std::string_view(argv[6]) == "on") {
     model::SharedImagesConfig config;
     config.registry = argv[4];
     config.digestTables = argv[5];
-    config.writerIdentity = "shared-weights-test";
+    config.writerIdentity = model::writerIdentity(backend);
     config.writeWait = std::chrono::seconds(1);
     config.modelRoot = root;
     for (const auto &entry : std::filesystem::directory_iterator(root))
@@ -131,8 +136,7 @@ int runEngine(char **argv) {
   model::WeightImages images(backend, "sources", shared);
   std::vector<metal::MetalBuffer> payloads;
   std::map<std::string, std::shared_ptr<model::WeightSource>> sources;
-  std::string line;
-  while (std::getline(std::cin, line)) {
+  do {
     std::istringstream command(line);
     std::string verb;
     command >> verb;
@@ -159,6 +163,12 @@ int runEngine(char **argv) {
       };
       model::WeightFile file = images.load(std::move(plan));
       payloads.push_back(file.section(model::kWeightFileAlignment, "payload"));
+    } else if (verb == "identity") {
+      // The writers' identity as this process runs them, and as its
+      // executable file gives it.
+      std::cout << "identity " << model::writerIdentity(backend) << ' ' << model::writerIdentity(argv[0], backend)
+                << std::endl;
+      continue;
     } else if (verb == "writable") {
       unsigned count = 0;
       for (const auto &image : images.contents()) count += writable(image.bytes.data());
@@ -177,7 +187,7 @@ int runEngine(char **argv) {
     }
     std::cout << "writes " << gWrites - before << " contents " << contentsDigest(backend, images, payloads)
               << std::endl;
-  }
+  } while (std::getline(std::cin, line));
   return 0;
 }
 
@@ -228,6 +238,7 @@ public:
     }
     commands_ = fdopen(input[1], "w");
     replies_ = fdopen(output[0], "r");
+    require(reply() == "ready", "an engine process did not start");
   }
   ~Engine() {
     if (stopped_) resume();
@@ -326,10 +337,15 @@ public:
     std::error_code ignored;
     std::filesystem::remove_all(registry_.parent_path(), ignored);
   }
-  std::unique_ptr<Engine> engine(bool shared = true) const {
-    return std::make_unique<Engine>(self_, std::vector<std::string>{metallib_, root_.path(), registry_,
-                                                                    tables_.path(), shared ? "on" : "off"});
+  std::unique_ptr<Engine> engine(bool shared = true) const { return engine(self_, metallib_, shared); }
+  // An engine process of the executable with the metallib.
+  std::unique_ptr<Engine> engine(const std::string &executable, const std::string &metallib,
+                                 bool shared = true) const {
+    return std::make_unique<Engine>(executable, std::vector<std::string>{metallib, root_.path(), registry_,
+                                                                         tables_.path(), shared ? "on" : "off"});
   }
+  const std::string &self() const { return self_; }
+  const std::string &metallib() const { return metallib_; }
   void source(const std::string &name, const std::vector<uint8_t> &bytes) const {
     splash::test::writeFile(root_.path() / name, bytes);
   }
@@ -517,6 +533,33 @@ void testImagesAreReadOnly(const Setup &setup) {
   require(second->ask("writable") == "writable 0", "a process that received an image can write it");
 }
 
+// A process's writers are the code it runs: an executable and a metallib
+// that replace its own on disk after it started change nothing, and the
+// same code at another path writes the same images.
+void testWriterIsTheRunningCode(const Setup &setup) {
+  setup.source("r.safetensors", pattern(100000, 21));
+  const std::filesystem::path copies = setup.registry().parent_path() / "copies";
+  std::filesystem::create_directory(copies);
+  const std::filesystem::path executable = copies / "shared-weights", metallib = copies / "copy.metallib";
+  std::filesystem::copy_file(setup.self(), executable);
+  std::filesystem::copy_file(setup.metallib(), metallib);
+  auto copied = setup.engine(executable, metallib), original = setup.engine();
+  std::istringstream identity(copied->ask("identity"));
+  std::string word, running, file;
+  identity >> word >> running >> file;
+  require(word == "identity" && running == file,
+          "an engine's identity is not that of its executable file: " + identity.str());
+  for (const std::filesystem::path &path : {executable, metallib}) {
+    splash::test::writeFile(copies / "replacement", std::string_view("other code"));
+    std::filesystem::rename(copies / "replacement", path);
+  }
+  const Reply written = parse(copied->ask("load r.safetensors 0 65536"));
+  const Reply received = parse(original->ask("load r.safetensors 0 65536"));
+  require(written.writes == 1 && received.writes == 0,
+          "a process took code that replaced its own on disk for the code it runs");
+  require(received.contents == written.contents, "a received image holds other bytes");
+}
+
 // A process stopped while it writes an image, holding the image's lock,
 // delays another process that needs the image by a bounded wait for the
 // lock, after which that one writes a copy of its own.
@@ -663,6 +706,7 @@ int main(int argc, char **argv) {
     testStoppedHolderIsPassedOver(Setup(self, argv[1]));
     testStoppedWriterIsWaitedForBoundedly(Setup(self, argv[1]));
     testImagesAreReadOnly(Setup(self, argv[1]));
+    testWriterIsTheRunningCode(Setup(self, argv[1]));
     testRewrittenFileIsDigestedAgain(Setup(self, argv[1]));
     testDamagedTableIsDigestedAgain(Setup(self, argv[1]));
     testUnsharedCreatesNothing(Setup(self, argv[1]));
