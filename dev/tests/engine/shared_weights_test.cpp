@@ -19,6 +19,7 @@
 #include <mach/mach_vm.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -680,6 +681,35 @@ void testPackedFilesAreShared(const Setup &setup) {
   require(received.contents == written.contents, "a received packed image holds other bytes");
 }
 
+// Sharing takes a registry or digest table directory only if it is this
+// user's own and no one else's: not a symbolic link, nor a directory others
+// may write, read or search.
+void testForeignDirectoriesAreRefused(const Setup &setup) {
+  const std::filesystem::path base = setup.registry().parent_path();
+  const auto directory = [&](const std::string &name, mode_t mode) {
+    const std::filesystem::path path = base / name;
+    require(mkdir(path.c_str(), 0700) == 0 && chmod(path.c_str(), mode) == 0, "cannot create a directory");
+    return path;
+  };
+  const std::filesystem::path own = directory("own", 0700), link = base / "link";
+  std::filesystem::create_directory_symlink(own, link);
+  const auto config = [&](bool registry, const std::filesystem::path &path) {
+    model::SharedImagesConfig result;
+    result.registry = registry ? path : base / "registry";
+    result.digestTables = registry ? setup.tables() : path;
+    result.writerIdentity = "shared-weights-test";
+    return result;
+  };
+  for (const bool registry : {true, false}) {
+    const std::string name = registry ? "registry" : "tables";
+    for (const std::filesystem::path &foreign :
+         {link, directory(name + "-0777", 0777), directory(name + "-0755", 0755), directory(name + "-0750", 0750)})
+      splash::test::rejects([&] { model::SharedImages shared(config(registry, foreign)); }, "refusing",
+                            (registry ? "a registry at " : "digest tables at ") + foreign.string() + " were used");
+    model::SharedImages accepted(config(registry, directory(name + "-0700", 0700)));
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -691,26 +721,44 @@ int main(int argc, char **argv) {
     }
     const std::string self = std::filesystem::canonical(argv[0]).string();
     signal(SIGPIPE, SIG_IGN);
-    // A test that waits for ever fails instead.
+    // A test that waits for ever fails instead; each test has its own limit.
     signal(SIGALRM, watchdog);
     alarm(120);
     testSecondProcessReceives(Setup(self, argv[1]));
+    alarm(120);
     testOtherBytesAreAnotherImage(Setup(self, argv[1]));
+    alarm(120);
     testSameBytesElsewhereAreOneImage(Setup(self, argv[1]));
+    alarm(120);
     testReleaseKeepsOtherHolders(Setup(self, argv[1]));
+    alarm(120);
     testKilledWriterKeepsReaders(Setup(self, argv[1]));
+    alarm(120);
     testRestoreReceivesOrRewrites(Setup(self, argv[1]));
+    alarm(120);
     testEnginesEndInAnyOrder(Setup(self, argv[1]));
+    alarm(120);
     testConcurrentLoadsWriteOnce(Setup(self, argv[1]));
+    alarm(120);
     testEndedProcessFilesAreRemoved(Setup(self, argv[1]));
+    alarm(120);
     testStoppedHolderIsPassedOver(Setup(self, argv[1]));
+    alarm(120);
     testStoppedWriterIsWaitedForBoundedly(Setup(self, argv[1]));
+    alarm(120);
     testImagesAreReadOnly(Setup(self, argv[1]));
+    alarm(120);
     testWriterIsTheRunningCode(Setup(self, argv[1]));
+    alarm(120);
     testRewrittenFileIsDigestedAgain(Setup(self, argv[1]));
+    alarm(120);
     testDamagedTableIsDigestedAgain(Setup(self, argv[1]));
+    alarm(120);
     testUnsharedCreatesNothing(Setup(self, argv[1]));
+    alarm(120);
     testPackedFilesAreShared(Setup(self, argv[1]));
+    alarm(120);
+    testForeignDirectoriesAreRefused(Setup(self, argv[1]));
     std::cout << "PASS SharedWeights\n";
   } catch (const std::exception &error) {
     std::cerr << "FAIL: " << error.what() << '\n';

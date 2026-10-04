@@ -1,4 +1,5 @@
 #include "model/ImageRegistry.hpp"
+#include "model/PrivateDirectory.hpp"
 #include "StderrLine.hpp"
 
 #include <fcntl.h>
@@ -277,16 +278,6 @@ public:
 private:
   Descriptor descriptor_;
 };
-
-void requirePrivateDirectory(const std::filesystem::path &directory) {
-  if (mkdir(directory.c_str(), 0700) == -1 && errno != EEXIST)
-    fail("cannot create the image registry " + directory.string());
-  struct stat state{};
-  if (lstat(directory.c_str(), &state) == -1) fail("cannot inspect the image registry " + directory.string());
-  if (!S_ISDIR(state.st_mode) || state.st_uid != geteuid() || (state.st_mode & 077))
-    throw std::runtime_error("refusing the image registry " + directory.string() +
-                             ": it must be a directory of this user's that no one else may use");
-}
 
 } // namespace
 

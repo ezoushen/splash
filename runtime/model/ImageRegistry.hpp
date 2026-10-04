@@ -23,10 +23,8 @@ namespace splash::model {
 
 class ImageRegistry final {
 public:
-  // Joins the registry at directory, which it creates 0700 and refuses when
-  // it is a symbolic link, belongs to another user or others may use it. An
-  // acquire waits up to writeWait for another process that writes the same
-  // image.
+  // Joins the registry at directory (requirePrivateDirectory). An acquire
+  // waits up to writeWait for another process that writes the same image.
   ImageRegistry(const std::filesystem::path &directory, std::chrono::milliseconds writeWait);
   // Stops serving and leaves the registry. Images stay mapped while their
   // buffers hold them, and in other processes.

@@ -31,7 +31,8 @@ inline constexpr uint64_t kDigestChunkBytes = 4 << 20;
 
 class TensorDigests final {
 public:
-  // Tables live in directory, created 0700. The files are those of the model
+  // Tables live in directory, which must be the user's own
+  // (requirePrivateDirectory). The files are those of the model
   // at root, each with its recorded digest by its path relative to root.
   TensorDigests(std::filesystem::path directory, std::filesystem::path root,
                 std::map<std::string, std::string, std::less<>> recordedDigests);

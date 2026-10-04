@@ -1,4 +1,5 @@
 #include "model/TensorDigests.hpp"
+#include "model/PrivateDirectory.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightStore.hpp"
 
@@ -10,8 +11,6 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
-#include <fstream>
-#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -87,8 +86,12 @@ Table readTable(const std::filesystem::path &path, std::string_view record, cons
   Table table;
   table.file = source;
   const uint64_t fileBytes = source.bytes;
-  std::ifstream file(path, std::ios::binary);
-  const std::string contents{std::istreambuf_iterator<char>(file), {}};
+  std::string contents;
+  const int file = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (file == -1) return table;
+  char buffer[1 << 16];
+  for (ssize_t count; (count = read(file, buffer, sizeof(buffer))) > 0;) contents.append(buffer, size_t(count));
+  close(file);
   const size_t trailer = contents.rfind('\n', contents.size() >= 2 ? contents.size() - 2 : 0);
   if (trailer == std::string::npos || !contents.ends_with('\n')) return table;
   const std::string_view body = std::string_view(contents).substr(0, trailer + 1);
@@ -133,14 +136,6 @@ void writeTable(const std::filesystem::path &path, std::string_view record, cons
   }
 }
 
-void requireTableDirectory(const std::filesystem::path &directory) {
-  std::error_code error;
-  std::filesystem::create_directories(directory.parent_path(), error);
-  if (error) throw std::system_error(error, "cannot create " + directory.parent_path().string());
-  if (mkdir(directory.c_str(), 0700) == -1 && errno != EEXIST)
-    throw std::system_error(errno, std::generic_category(), "cannot create " + directory.string());
-}
-
 // The digest of each extent of file, read uncached on a thread per core.
 std::vector<std::string> digestExtents(const WeightSource &file, const std::vector<Extent> &extents) {
   struct Chunk final {
@@ -181,7 +176,6 @@ struct TensorDigests::Impl {
   std::map<std::string, std::string, std::less<>> recorded;
   // The tables read or written so far, by record digest.
   std::map<std::string, Table, std::less<>> tables;
-  bool directoryReady = false;
 
   // The recorded digest of file, which names its table: a Git SHA-1 or a
   // SHA-256 in lowercase hex; empty for none.
@@ -207,8 +201,6 @@ struct TensorDigests::Impl {
     if (missing.empty()) return result;
     const std::vector<std::string> digests = digestExtents(file, missing);
     for (size_t index = 0; index < missing.size(); ++index) result.digests[missing[index]] = digests[index];
-    if (!directoryReady) requireTableDirectory(directory);
-    directoryReady = true;
     writeTable(path, record, result);
     return result;
   }
@@ -217,6 +209,11 @@ struct TensorDigests::Impl {
 TensorDigests::TensorDigests(std::filesystem::path directory, std::filesystem::path root,
                              std::map<std::string, std::string, std::less<>> recordedDigests)
     : impl_(std::make_unique<Impl>()) {
+  // Its parents are the user's caches; it is the user's alone.
+  std::error_code error;
+  std::filesystem::create_directories(directory.parent_path(), error);
+  if (error) throw std::system_error(error, "cannot create " + directory.parent_path().string());
+  requirePrivateDirectory(directory);
   impl_->directory = std::move(directory);
   impl_->root = std::move(root);
   impl_->recorded = std::move(recordedDigests);
