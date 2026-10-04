@@ -13,8 +13,16 @@ It adds two things to upstream Splash 1.2.0:
   code that writes it. Processes of one user and one build hand images to each other through unnamed shared
   memory, so a second process on the same model, or a fine-tune that leaves the experts unchanged, maps the
   first one's memory instead of writing another copy. `DEVELOPMENT.md` describes the mechanism, its waits
-  and its trust model. Proposed upstream in [incoai/splash#203](https://github.com/incoai/splash/issues/203),
-  which predates 1.2.0's in-memory loading.
+  and its trust model. Proposed upstream in [incoai/splash#203](https://github.com/incoai/splash/issues/203).
+
+  Measured on an M5 Max (128 GB) with Ornith, a second Ornith and Umpire, all with vision: the three servers
+  hold **20.28 GiB** of weights in total, where by construction each would otherwise hold its own 19.49 GiB;
+  only Umpire's 40 non-expert layer images (0.79 GiB) are its own. Umpire's `/v1/systemone` probabilities were
+  bit-identical with sharing on and off. A server that starts while another holds the images loads them in 0.3
+  s, and a restore after 10 idle minutes takes 0.25–0.55 s (up to 3.25 s for Umpire, which rewrites its own
+  layers). The cost is one pass that hashes a model's files the first time it is loaded (+2.5 s for Ornith
+  here); a single, noisy on/off comparison showed no regression in decode or time to first token. Details and
+  caveats are in #203.
 - **Images on `POST /v1/systemone`.** A request may carry `"images"`: 1 to 64 `data:` URLs, which every
   question's prompt shows before the evidence. A server started with `--language-only` rejects them. The
   model needs a vision tower; Umpire's MLX repository carries Ornith's.
