@@ -573,6 +573,26 @@ struct MetalBackend::Impl {
         return buffer;
     }
 
+    // A buffer over memory without a copy, which unmaps it when Metal lets
+    // the buffer go, or at once if Metal refuses it.
+    id<MTLBuffer> newBuffer(MappedMemory &memory, NSString *label) {
+        auto unmap = std::make_shared<std::function<void()>>(std::exchange(memory.unmap, {}));
+        id<MTLBuffer> buffer = nil;
+        if (memory.address && memory.bytes)
+            buffer = [device newBufferWithBytesNoCopy:memory.address
+                                               length:memory.bytes
+                                              options:MTLResourceStorageModeShared
+                                          deallocator:^(void *, NSUInteger) {
+                                              if (*unmap) std::exchange(*unmap, {})();
+                                          }];
+        if (!buffer) {
+            if (*unmap) std::exchange(*unmap, {})();
+            throw MetalAllocationError("Metal buffer over mapped memory failed");
+        }
+        if (label) buffer.label = label;
+        return buffer;
+    }
+
     // The base allocation of a buffer, which must be a whole buffer of this
     // backend.
     MetalAllocation &baseAllocation(const MetalBuffer &buffer) const {
@@ -1052,6 +1072,54 @@ void MetalBackend::restoreMemory(const MetalBuffer &buffer) {
         throw MetalBackendError("Metal buffer memory is not released");
     allocation.attach(impl_->newBuffer(allocation.length, allocation.storage,
                                        allocation.label));
+    impl_->sampleDeviceMemory();
+}
+
+MetalBuffer MetalBackend::mapBuffer(MappedMemory memory, std::string_view label) {
+    const auto unmap = [&] {
+        if (memory.unmap) std::exchange(memory.unmap, {})();
+    };
+    try {
+        checkOperation();
+        if (!memory.bytes) throw MetalBackendError("Metal buffer size must be positive");
+        if (memory.bytes > impl_->capabilities.maxBufferLengthBytes)
+            throw MetalBackendError("Metal buffer exceeds maxBufferLength");
+    } catch (...) {
+        unmap();
+        throw;
+    }
+    auto allocation = std::make_shared<MetalAllocation>();
+    allocation->accounting = impl_->accounting;
+    allocation->length = memory.bytes;
+    allocation->storage = BufferStorage::Shared;
+    allocation->residency = impl_->residency;
+    try {
+        if (!label.empty()) allocation->label = checkedNSString(label, "buffer label");
+    } catch (...) {
+        unmap();
+        throw;
+    }
+    allocation->attach(impl_->newBuffer(memory, allocation->label));
+    impl_->sampleDeviceMemory();
+    auto result = std::make_shared<MetalBuffer::Impl>();
+    result->lengthBytes = allocation->length;
+    result->allocation = std::move(allocation);
+    return MetalBuffer(std::move(result));
+}
+
+void MetalBackend::restoreMemory(const MetalBuffer &buffer, MappedMemory memory) {
+    try {
+        checkOperation();
+        MetalAllocation &allocation = impl_->baseAllocation(buffer);
+        if (allocation.buffer)
+            throw MetalBackendError("Metal buffer memory is not released");
+        if (memory.bytes != allocation.length)
+            throw MetalBackendError("mapped memory differs from the buffer's length");
+        allocation.attach(impl_->newBuffer(memory, allocation.label));
+    } catch (...) {
+        if (memory.unmap) std::exchange(memory.unmap, {})();
+        throw;
+    }
     impl_->sampleDeviceMemory();
 }
 
