@@ -149,6 +149,16 @@ int runEngine(char **argv) {
       if (!source) source = std::make_shared<model::WeightSource>(root / name);
       model::WeightFile file = images.load(copyImage(source, offset, bytes));
       payloads.push_back(file.section(bytes, "payload"));
+    } else if (verb == "packed") {
+      std::string name;
+      command >> name;
+      model::ImagePlan plan = model::packedImage(root / name, "test/" + name, kMagic, 0, 0);
+      plan.write = [write = std::move(plan.write)](std::span<uint8_t> image, const metal::MetalBuffer &buffer) {
+        ++gWrites;
+        write(image, buffer);
+      };
+      model::WeightFile file = images.load(std::move(plan));
+      payloads.push_back(file.section(model::kWeightFileAlignment, "payload"));
     } else if (verb == "writable") {
       unsigned count = 0;
       for (const auto &image : images.contents()) count += writable(image.bytes.data());
@@ -614,6 +624,19 @@ void testUnsharedCreatesNothing(const Setup &setup) {
           "a shared image holds other bytes than an unshared one");
 }
 
+// A package's packed file is shared as its loader plans it.
+void testPackedFilesAreShared(const Setup &setup) {
+  std::vector<uint8_t> file = pattern(2 * model::kWeightFileAlignment, 11);
+  std::fill(file.begin(), file.begin() + model::kWeightFileAlignment, 0);
+  std::copy(kMagic.begin(), kMagic.end(), file.begin());
+  setup.source("layer-0.bin", file);
+  auto first = setup.engine(), second = setup.engine();
+  const Reply written = parse(first->ask("packed layer-0.bin"));
+  const Reply received = parse(second->ask("packed layer-0.bin"));
+  require(written.writes == 1 && received.writes == 0, "a packed image another process holds was written");
+  require(received.contents == written.contents, "a received packed image holds other bytes");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -643,6 +666,7 @@ int main(int argc, char **argv) {
     testRewrittenFileIsDigestedAgain(Setup(self, argv[1]));
     testDamagedTableIsDigestedAgain(Setup(self, argv[1]));
     testUnsharedCreatesNothing(Setup(self, argv[1]));
+    testPackedFilesAreShared(Setup(self, argv[1]));
     std::cout << "PASS SharedWeights\n";
   } catch (const std::exception &error) {
     std::cerr << "FAIL: " << error.what() << '\n';

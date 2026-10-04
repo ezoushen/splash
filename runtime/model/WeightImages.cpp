@@ -87,7 +87,8 @@ ImagePlan packedImage(const std::filesystem::path &path, std::string component, 
               source->readData(at, destination.subspan(at, std::min<uint64_t>(kLoadStepBytes, destination.size() - at)));
             });
             source->checkUnchanged();
-          }};
+          },
+          "packed", {{source.get(), 0, source->bytes()}}};
 }
 
 unsigned loadThreads() noexcept { return std::max(1u, std::thread::hardware_concurrency()); }

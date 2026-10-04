@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -72,16 +73,46 @@ struct PlannedCheckpoint final {
   std::vector<Image> images;
 };
 
+// Describes a bound image for a shared image's key (ImagePlan): every field
+// of its sections and of the tensors they read, and those tensors' bytes in
+// section order.
+inline void describe(const Image &image, ImagePlan &plan) {
+  std::ostringstream text;
+  const auto input = [&](const Input &input) {
+    text << " input " << input.name << ' ' << input.tensor->dtype << " [";
+    for (const std::string &dtype : input.dtypes) text << ' ' << dtype;
+    text << " ] (";
+    for (uint64_t dimension : input.tensor->shape) text << ' ' << dimension;
+    text << " )\n";
+    plan.sources.push_back({input.tensor->file, input.tensor->offset, input.tensor->bytes});
+  };
+  text << "affine";
+  for (const auto &[module, bits] : image.quantized) text << " quantized " << module << ' ' << bits;
+  text << '\n';
+  for (const Section &section : image.sections) {
+    text << "section " << static_cast<int>(section.kind) << ' ' << section.offset << ' ' << section.bytes << ' '
+         << section.rows << ' ' << section.columns << ' ' << section.experts << ' ' << section.bits << '\n';
+    if (section.parts.empty()) input(section.input);
+    for (const ProjectionPart &part : section.parts) {
+      text << " part " << part.rows << '\n';
+      for (const Input &field : part.fields) input(field);
+    }
+  }
+  plan.description = text.str();
+}
+
 // Image `index` of planned, the component directory/name, written from the
 // checkpoint.
 [[nodiscard]] inline ImagePlan imagePlan(const std::shared_ptr<const PlannedCheckpoint> &planned, size_t index,
                                          std::string_view directory) {
   const Image &image = planned->images.at(index);
-  return {std::string(directory) + "/" + image.name, image.magic, image.layer, image.type, image.bytes,
-          [planned, index](std::span<uint8_t> bytes, const metal::MetalBuffer &) {
-            writeAffineImage(bytes, planned->images[index]);
-            planned->source.checkUnchanged();
-          }};
+  ImagePlan plan{std::string(directory) + "/" + image.name, image.magic, image.layer, image.type, image.bytes,
+                 [planned, index](std::span<uint8_t> bytes, const metal::MetalBuffer &) {
+                   writeAffineImage(bytes, planned->images[index]);
+                   planned->source.checkUnchanged();
+                 }};
+  describe(image, plan);
+  return plan;
 }
 
 } // namespace splash::model::affine

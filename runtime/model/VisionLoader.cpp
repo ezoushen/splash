@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <sstream>
 
 namespace splash::model {
 namespace {
@@ -182,11 +183,29 @@ VisionLoader::~VisionLoader() = default;
 const ops::VisionLayout &VisionLoader::layout() const noexcept { return planned_->layout; }
 
 ImagePlan VisionLoader::image() const {
-  return {"vision/model.bin", std::string(kVisionMagic), planned_->layout.depth, 0, planned_->plan.bytes,
-          [planned = planned_](std::span<uint8_t> bytes, const metal::MetalBuffer &) {
-            vision::writeVision(bytes, planned->plan);
-            planned->checkUnchanged();
-          }};
+  ImagePlan image{"vision/model.bin", std::string(kVisionMagic), planned_->layout.depth, 0, planned_->plan.bytes,
+                  [planned = planned_](std::span<uint8_t> bytes, const metal::MetalBuffer &) {
+                    vision::writeVision(bytes, planned->plan);
+                    planned->checkUnchanged();
+                  }};
+  // For a shared image's key (ImagePlan): every field of the sections and of
+  // the tensors they read, and those tensors' bytes in section order.
+  const Plan &plan = planned_->plan;
+  std::ostringstream text;
+  text << "vision " << plan.depth << ' ' << plan.patchSize << '\n';
+  for (const Section &section : plan.sections) {
+    text << "section " << section.mlx << ' ' << section.gguf << ' ' << section.rows << ' ' << section.columns << ' '
+         << section.storedRows << ' ' << section.storedColumns << ' ' << section.patch << ' ' << section.offset
+         << '\n';
+    for (const vision::Input &input : section.inputs) {
+      text << " input " << input.name << ' ' << input.tensor.dtype << " (";
+      for (uint64_t dimension : input.tensor.shape) text << ' ' << dimension;
+      text << " )\n";
+      image.sources.push_back({input.tensor.file, input.tensor.offset, input.tensor.bytes});
+    }
+  }
+  image.description = text.str();
+  return image;
 }
 
 uint64_t visionImageBytes(const ops::VisionLayout &layout) { return plan(layout).bytes; }
