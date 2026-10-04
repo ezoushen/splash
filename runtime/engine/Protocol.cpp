@@ -326,10 +326,6 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
                    "generation prompt must leave a prompt token");
   }
   if (scoring) {
-    if (!request.imageSpans.empty()) {
-      return invalid(IssueCode::InvalidCount,
-                     "score requests are text-only");
-    }
     if (request.scoreTokens.size() < ExecutionLimits::minimumScoreOptions ||
         request.scoreTokens.size() > ExecutionLimits::maximumScoreOptions) {
       return invalid(IssueCode::InvalidCount,

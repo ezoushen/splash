@@ -59,6 +59,7 @@ MAX_OPTIONS = 255
 # prompt tokens in total.
 MAX_SYSTEMONE_QUESTIONS = 64
 MAX_SYSTEMONE_TOTAL_TOKENS = 1 << 20
+MAX_SYSTEMONE_IMAGES = 64
 
 _MISSING = object()
 
@@ -415,10 +416,30 @@ def validate_systemone(body):
     return state, specs, details
 
 
-def systemone_messages(state, spec, slots):
+def systemone_images(body):
+    """The optional request images: (data URLs, details). Every question's
+    prompt shows them before the evidence."""
+    images = body.get("images")
+    if images is None:
+        return (), []
+    if (
+        not isinstance(images, list)
+        or not 1 <= len(images) <= MAX_SYSTEMONE_IMAGES
+        or any(
+            not isinstance(url, str) or not url.startswith("data:") for url in images
+        )
+    ):
+        return (), [
+            detail(["images"], f"images must be 1-{MAX_SYSTEMONE_IMAGES} data: URLs")
+        ]
+    return tuple(images), []
+
+
+def systemone_messages(state, spec, slots, image_urls=()):
     """Render one question in the direct-options-v1 shape. Structured
     instructions and descriptions stay JSON values; labels keep their
-    meaning alongside the answer slot."""
+    meaning alongside the answer slot. Images precede the evidence text in
+    the user turn; without them the user content stays one string."""
     options = [
         {"slot": slot, "label": label, "description": description}
         for slot, label, description in zip(slots, spec.labels, spec.descriptions)
@@ -427,9 +448,15 @@ def systemone_messages(state, spec, slots):
     if spec.instructions is not None:
         payload["criterion"] = spec.instructions
     payload["options"] = options
+    content = json.dumps(payload, ensure_ascii=False)
+    if image_urls:
+        content = [
+            *({"type": "image_url", "image_url": {"url": url}} for url in image_urls),
+            {"type": "text", "text": content},
+        ]
     return [
         {"role": "system", "content": SYSTEMONE_SYSTEM},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        {"role": "user", "content": content},
     ]
 
 

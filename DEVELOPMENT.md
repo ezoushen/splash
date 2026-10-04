@@ -1354,6 +1354,12 @@ Questions run sequentially within a request under one shared deadline, allowing
 prefix reuse without filling the admission queue; independent HTTP requests still
 share the scheduler. Disconnects and timeouts cancel the current question.
 
+An optional `images` list holds 1–64 `data:` URLs. They are decoded once per
+request, shown before the evidence in every question's user turn, and scored
+with each question; a model serving without vision rejects them with the other
+validation details. An image question's prompt is rendered a second time to
+find the template's image placeholders, as chat does.
+
 Preparation renders each prompt once, then enforces the context limit and the
 batch token budget before the per-slot boundary checks, which re-tokenize the
 prompt once per option. Those checks also observe the request deadline, so an
@@ -1374,12 +1380,12 @@ calibrate on representative held-out data before using decision thresholds.
 
 Requests carry the score-token IDs and Done events the selected f32 logits; the
 server and the engine must speak the same native wire version. Scoring requires
-2–255 distinct, in-vocabulary tokens, no images or generation constraints, and a
-zero output budget. It may use the full context window because no generated
-token needs a reserved position. The final prefill chunk runs the target head
-but no sampling policy or DFlash decode. Successful scoring emits no Tokens
-event, finishes with Stop, and reports zero decode time. Cancelled requests
-carry no logits.
+2–255 distinct, in-vocabulary tokens, a zero output budget, and no generation
+constraints; image spans are allowed. It may use the full context window because
+no generated token needs a reserved position. The final prefill chunk runs the
+target head but no sampling policy or DFlash decode. Successful scoring emits no
+Tokens event, finishes with Stop, and reports zero decode time. Cancelled
+requests carry no logits.
 
 A non-finite logit row is a per-request failure, not an engine fault: a score
 logit, or a token the sampling kernels could only select outside the

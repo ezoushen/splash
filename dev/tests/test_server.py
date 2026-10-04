@@ -1308,6 +1308,69 @@ class ServerTest(unittest.TestCase):
         def decode(self, token_ids, **kwargs):
             return "".join(chr(token) for token in token_ids)
 
+    class CharImageTokenizer(CharTokenizer):
+        """One token per character, and the image pad as one token. Each image
+        part renders as the pad the template source names, so the frontend's
+        render marker appears where it replaced the pad."""
+
+        PAD_ID = 0x110000
+        chat_template = FakeTokenizer.chat_template + "{#<|image_pad|>#}"
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.templates.append((messages, kwargs))
+            source = kwargs.get("chat_template", self.chat_template)
+            pad = (
+                api_shapes.IMAGE_PAD_TOKEN
+                if api_shapes.IMAGE_PAD_TOKEN in source
+                else request_frontend.IMAGE_RENDER_MARKER
+            )
+            rendered = ""
+            for message in messages:
+                content = message["content"]
+                if isinstance(content, list):
+                    content = "".join(
+                        pad if part["type"] == "image_url" else part["text"]
+                        for part in content
+                    )
+                rendered += f"<|im_start|>{message['role']}\n{content}<|im_end|>\n"
+            rendered += "<|im_start|>assistant\n"
+            return (
+                rendered if kwargs.get("tokenize") is False else self.encode(rendered)
+            )
+
+        def _pieces(self, text):
+            parts = text.split(api_shapes.IMAGE_PAD_TOKEN)
+            offset = 0
+            for index, part in enumerate(parts):
+                for char in part:
+                    yield ord(char), (offset, offset + 1)
+                    offset += 1
+                if index < len(parts) - 1:
+                    width = len(api_shapes.IMAGE_PAD_TOKEN)
+                    yield self.PAD_ID, (offset, offset + width)
+                    offset += width
+
+        def encode(self, text, **kwargs):
+            return [token for token, _ in self._pieces(text)]
+
+        def __call__(self, text, **kwargs):
+            pieces = list(self._pieces(text))
+            return {
+                "input_ids": [token for token, _ in pieces],
+                "offset_mapping": [span for _, span in pieces],
+            }
+
+        def decode(self, token_ids, **kwargs):
+            return "".join(
+                api_shapes.IMAGE_PAD_TOKEN if token == self.PAD_ID else chr(token)
+                for token in token_ids
+            )
+
+        def convert_tokens_to_ids(self, token):
+            if token == api_shapes.IMAGE_PAD_TOKEN:
+                return self.PAD_ID
+            return super().convert_tokens_to_ids(token)
+
     class BoundaryCountingTokenizer(CharTokenizer):
         """Counts whole-prompt tokenizations: one to prepare the prompt plus
         one per answer-slot boundary check. An optional clock advances on each
@@ -1749,6 +1812,140 @@ class ServerTest(unittest.TestCase):
         # Question a prepares and checks both slot boundaries; question b is
         # rejected on its prepare pass. Before the fix b also ran both checks.
         self.assertEqual(tokenizer.prompt_encodes, 4)
+
+    def systemone_image_harness(self, runtime, **options):
+        harness = self.harness(
+            runtime, tokenizer=self.CharImageTokenizer(), max_context=8192, **options
+        )
+        judgments.slot_labels(harness.tokenizer)
+        return harness
+
+    def test_systemone_images_reach_every_scored_question(self):
+        runtime = FakeRuntime(Plan(logits=(3.0, 1.0)), Plan(logits=(1.0, 3.0)))
+        harness = self.systemone_image_harness(runtime)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "test-model",
+                "state": "Is the square red?",
+                "images": [self._png_data_url()],
+                "questions": {"red": {"type": "noul"}, "blue": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        answers = json.loads(payload)["answers"]
+        self.assertGreater(answers["red"]["noul"], 0.5)
+        self.assertLess(answers["blue"]["noul"], 0.5)
+        self.assertEqual(len(runtime.requests), 2)
+        pad = self.CharImageTokenizer.PAD_ID
+        for request in (call.frame for call in runtime.requests):
+            (span,) = request.image_spans
+            self.assertGreater(span.tokens, 1)
+            self.assertEqual(
+                list(request.prompt_tokens[span.offset : span.offset + span.tokens]),
+                [pad] * span.tokens,
+            )
+            self.assertEqual(list(request.prompt_tokens).count(pad), span.tokens)
+            self.assertTrue(request.image_pixels)
+
+    def test_systemone_images_rejected_before_inference(self):
+        cases = (
+            ({"vision": False}, [self._png_data_url()], "--language-only"),
+            ({}, [], "data: URLs"),
+            ({}, "data:image/png;base64,AAAA", "data: URLs"),
+            ({}, ["https://example.com/a.png"], "data: URLs"),
+            ({}, [self._png_data_url()] * 65, "data: URLs"),
+        )
+        for options, urls, message in cases:
+            with self.subTest(options=options, images=str(urls)[:40]):
+                runtime = FakeRuntime()
+                harness = self.systemone_image_harness(runtime, **options)
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/systemone",
+                    {
+                        "model": "test-model",
+                        "state": "evidence",
+                        "images": urls,
+                        "questions": {"q": {"type": "noul"}},
+                    },
+                )
+                self.assertEqual(status, 422, payload)
+                (error,) = json.loads(payload)["detail"]
+                self.assertEqual(error["loc"], ["body", "images"])
+                self.assertIn(message, error["msg"])
+                self.assertEqual(runtime.requests, [])
+
+    def test_systemone_context_limit_counts_image_tokens(self):
+        body = {
+            "model": "test-model",
+            "state": "evidence",
+            "questions": {"q": {"type": "noul"}},
+        }
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)))
+        harness = self.systemone_image_harness(runtime)
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        text_tokens = len(runtime.requests[0].frame.prompt_tokens)
+
+        runtime = FakeRuntime()
+        harness = self.harness(
+            runtime,
+            tokenizer=self.CharImageTokenizer(),
+            max_context=text_tokens + 16,
+        )
+        body["images"] = [self._png_data_url()]
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(
+            json.loads(payload)["error"]["code"], "context_length_exceeded"
+        )
+        self.assertEqual(runtime.requests, [])
+
+    def test_systemone_questions_share_one_copy_of_the_pixels(self):
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)), Plan(logits=(1.0, 0.0)))
+        harness = self.systemone_image_harness(runtime)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "test-model",
+                "state": "evidence",
+                "images": [
+                    self._png_data_url((200, 30, 30)),
+                    self._png_data_url((30, 30, 200)),
+                ],
+                "questions": {"a": {"type": "noul"}, "b": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        first, second = (call.frame for call in runtime.requests)
+        self.assertEqual(len(first.image_spans), 2)
+        self.assertTrue(first.image_pixels is second.image_pixels)
+
+    def test_systemone_total_token_budget_counts_image_tokens(self):
+        body = {
+            "model": "test-model",
+            "state": "evidence",
+            "questions": {"q": {"type": "noul"}},
+        }
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)))
+        harness = self.systemone_image_harness(runtime)
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        text_tokens = len(runtime.requests[0].frame.prompt_tokens)
+
+        runtime = FakeRuntime()
+        harness = self.systemone_image_harness(runtime)
+        body["images"] = [self._png_data_url()]
+        with mock.patch.object(
+            judgments, "MAX_SYSTEMONE_TOTAL_TOKENS", text_tokens + 1
+        ):
+            status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 422, payload)
+        self.assertIn("total prepared", json.loads(payload)["detail"][0]["msg"])
+        self.assertEqual(runtime.requests, [])
 
     class ImagePadTokenizer(FakeTokenizer):
         """Renders one image placeholder per image part like the pinned
