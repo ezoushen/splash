@@ -91,6 +91,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--max-cache-disk 16G` | Offload KV cache and GDN states to SSD as needed. Off by default. |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
+| `--share-weights` | Share weight memory with other Splash servers of this build that load the same weights. Off by default. |
 
 Use `--max-memory` to leave room for other applications.
 The server listens on localhost without authentication by default. For LAN

@@ -138,6 +138,7 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files. |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
+| `--share-weights` | Off | Share weight memory with other Splash processes of this build that load the same weights; see [shared weights](#shared-weights). |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
@@ -591,6 +592,96 @@ adds the fp32 partials in split order, so the sums do not depend on
 scheduling. The split count depends on the grid per core, never on the batch
 width, so a request's sums are the same alone and batched. Every other
 projection keeps the sequential tiles (`dev/benchmarks/device-policy.md`).
+
+#### Shared weights
+
+Each process writes its own copy of its images, so two servers of one model
+hold the model twice. `--share-weights` makes processes of one user and one
+build hold one copy of each image they share: a second server of the same
+model, or of a fine-tune that leaves part of its base model unchanged, maps the
+images the first one holds instead of writing them again. Sharing is off by
+default; without it no shared memory, registry, lock or digest table is
+created, and the images and the speed are those above.
+
+An image is shared by content (`SharedImages`, `SharedImages.hpp`): its key is
+the SHA-256 of the writer's code, the image's plan as its loader describes it
+(component, header, size and sections; `ImagePlan::description`) and the
+digest of every source byte range its writer reads (`ImagePlan::sources`), not
+of a file or an offset, so the same tensors in another file or at another
+offset give the same image. The writer's code is the engine's code as the
+process runs it, the `__TEXT` segment of its executable as mapped, and the
+metallib bytes its kernels were loaded from, so an install that replaces
+either on disk while a server runs does not change that server's key. A
+range's digest is the SHA-256 of the SHA-256s of its 4 MiB chunks, which
+threads compute in parallel (`TensorDigests`). The digests are kept in a small
+table per source file, under `~/Library/Caches/Splash/tensor-digests`, named by
+the file's content digest as `model.json` or `manifest.json` records it, so
+only the first start after an installation reads the sources an extra time. A
+table records the file it was made from, its device, inode, size and times of
+modification and change, and ends in the SHA-256 of its text: a table of
+another record digest, of another file, of the file before it was written
+again, or damaged is not used and is made again. A file the record does not
+name loads unshared.
+
+The memory is an unnamed POSIX shared-memory object (`ImageRegistry`), unlinked
+as it is created, so it lasts exactly as long as a process maps it: a stopped,
+crashed or killed process leaves nothing behind, and the others keep their
+images. Each buffer is a no-copy Metal buffer of the image's exact length over
+the mapping, in the residency set like any other. The processes find each
+other in a registry, `/tmp/splash-<uid>`, which, like the digest table
+directory, must be a directory of the user's that no one else may use: each
+holds a lock on a file there for its lifetime and serves the images it holds
+on a Unix socket beside it, handing an image's descriptor over with
+`SCM_RIGHTS`. A process takes the lock of an ended one before it removes its
+files, and so removes a socket or a staged holder file that a process left
+when it ended while it joined; a socket that refuses a connection is not taken
+for an ended process, as a full backlog refuses too. Each process marks its
+holder file and socket as in use every hour, so that a cleaner of temporary
+files does not remove them from a long-running server; the per-image lock
+files stay in the registry, a few bytes each, and one that was removed is
+created again when it is next needed.
+
+A process that finds no holder of an image takes that image's lock file in
+the registry, asks again, and only then writes it, so two processes do not
+write one image at once; the second waits for the first, then maps its image.
+The writer's mapping is read-only once the image is written, and a process
+that received an image maps it read-only; the descriptor itself stays
+writable, which processes of one user can do to each other's memory anyway.
+
+Waits are bounded, so that a stopped process (SIGSTOP, a debugger) cannot
+stall the others. A holder that does not answer within 2 s is taken as not
+holding the image and is passed over for the rest of that load, or of that
+restore, and one lookup among all the holders takes at most 5 s, so a stopped
+holder delays a load or a restore by one such wait, not one per image. A
+process waits at most 10 s for another that writes an image it needs; then it
+writes a copy of its own, which it does not serve, as only an image written
+under its lock is served, and logs that it did so.
+
+Releasing the images after 10 idle minutes lets go of this process's
+mappings only; the memory goes back to macOS when the last process that maps
+it lets go. A restore maps an image another process holds and writes only
+those none holds. Admission and the memory plan still count every image in
+full in every process, so each process's `--max-memory` must cover its
+weights as without sharing. macOS charges a shared image's memory to the
+process that wrote it, not to those that map it, as `footprint` and Activity
+Monitor show.
+
+Trust: the processes that share images are those of one user, which trust
+one another: any of them could write the memory it serves, as it could write
+the others' memory anyway. They share an image only when their writer's code
+is the same, which holds for servers of one build; the identity does not
+cover the system's libraries and frameworks or the toolchain the build was
+made with.
+
+Costs: the first start after an installation reads the sources twice, once
+for the digests. A start, and a restore after the images were released (the
+first request after 10 idle minutes), that needs an image another process is
+writing waits for that write, and one that finds a stopped process waits as
+above. Kernels read a shared image through the same views as a private one.
+`weight-digests --share-weights` loads a model's images as a server of its
+build shares them, with the identity of the `splash` beside its metallib, and
+refuses one of another build, as it writes images with its own copy of the
+engine's code; its digests must equal those without it.
 
 ### GGUF targets
 
