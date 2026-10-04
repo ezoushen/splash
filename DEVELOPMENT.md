@@ -628,8 +628,10 @@ as it is created, so it lasts exactly as long as a process maps it: a stopped,
 crashed or killed process leaves nothing behind, and the others keep their
 images. Each buffer is a no-copy Metal buffer of the image's exact length over
 the mapping, in the residency set like any other. The processes find each
-other in a registry, `/tmp/splash-<uid>`, which, like the digest table
-directory, must be a directory of the user's that no one else may use: each
+other in a registry, `splash-images` in the user's own temporary directory
+(`getconf DARWIN_USER_TEMP_DIR`), which no other user can enter or create
+first. Like the digest table directory, it must be a directory of the user's
+that no one else may use: each
 holds a lock on a file there for its lifetime and serves the images it holds
 on a Unix socket beside it, handing an image's descriptor over with
 `SCM_RIGHTS`. A process takes the lock of an ended one before it removes its

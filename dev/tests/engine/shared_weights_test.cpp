@@ -684,6 +684,16 @@ void testPackedFilesAreShared(const Setup &setup) {
 // Sharing takes a registry or digest table directory only if it is this
 // user's own and no one else's: not a symbolic link, nor a directory others
 // may write, read or search.
+// No other user can create this user's registry directory before it: the
+// directory that holds it is this user's alone.
+void testRegistryIsOutOfOtherUsersReach() {
+  const std::filesystem::path parent = splash::model::userRegistryDirectory().parent_path();
+  struct stat state{};
+  require(lstat(parent.c_str(), &state) == 0 && S_ISDIR(state.st_mode) && state.st_uid == geteuid() &&
+              !(state.st_mode & 077),
+          "the image registry is in a directory other users can enter: " + parent.string());
+}
+
 void testForeignDirectoriesAreRefused(const Setup &setup) {
   const std::filesystem::path base = setup.registry().parent_path();
   const auto directory = [&](const std::string &name, mode_t mode) {
@@ -759,6 +769,7 @@ int main(int argc, char **argv) {
     testPackedFilesAreShared(Setup(self, argv[1]));
     alarm(120);
     testForeignDirectoriesAreRefused(Setup(self, argv[1]));
+    testRegistryIsOutOfOtherUsersReach();
     std::cout << "PASS SharedWeights\n";
   } catch (const std::exception &error) {
     std::cerr << "FAIL: " << error.what() << '\n';

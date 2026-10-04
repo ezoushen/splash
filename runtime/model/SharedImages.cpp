@@ -6,6 +6,7 @@
 
 #include <dlfcn.h>
 #include <mach-o/loader.h>
+#include <limits.h>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -117,11 +118,21 @@ std::string writerIdentity(const std::filesystem::path &engine, const metal::Met
   return identityOf(codeDigest(bytes.data(), bytes.size()), backend);
 }
 
+std::filesystem::path userRegistryDirectory() {
+  // macOS's per-user temporary directory, which only this user may enter;
+  // short enough for the registry's socket paths.
+  char directory[PATH_MAX];
+  const size_t length = confstr(_CS_DARWIN_USER_TEMP_DIR, directory, sizeof(directory));
+  if (length == 0 || length > sizeof(directory))
+    throw std::runtime_error("this user has no temporary directory for the image registry");
+  return std::filesystem::path(directory) / "splash-images";
+}
+
 SharedImagesConfig sharedImagesConfig(const std::filesystem::path &root, std::string writerIdentity) {
   const char *home = std::getenv("HOME");
   if (!home || !*home) throw std::runtime_error("HOME is not set: shared weights keep digests in its caches");
   SharedImagesConfig config;
-  config.registry = "/tmp/splash-" + std::to_string(geteuid());
+  config.registry = userRegistryDirectory();
   config.digestTables = std::filesystem::path(home) / "Library/Caches/Splash/tensor-digests";
   config.writerIdentity = std::move(writerIdentity);
   config.modelRoot = root;

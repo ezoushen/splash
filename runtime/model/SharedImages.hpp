@@ -72,8 +72,12 @@ private:
 // that loaded backend's metallib.
 [[nodiscard]] std::string writerIdentity(const std::filesystem::path &engine, const metal::MetalBackend &backend);
 
+// The directory of this user's image registry, inside a directory that only
+// this user may enter, so that no other user can create it first.
+[[nodiscard]] std::filesystem::path userRegistryDirectory();
+
 // Sharing for the model at root by writers of writerIdentity: the user's
-// registry, /tmp/splash-<uid>, and digest tables, under
+// registry (userRegistryDirectory), and digest tables, under
 // ~/Library/Caches/Splash/tensor-digests.
 [[nodiscard]] SharedImagesConfig sharedImagesConfig(const std::filesystem::path &root, std::string writerIdentity);
 
