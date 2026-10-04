@@ -1,3 +1,47 @@
+# About this fork
+
+This is [ezoushen](https://github.com/ezoushen)'s fork of [Inco AI's Splash](https://github.com/incoai/splash).
+It exists to serve a fine-tuned model beside its base model on one Mac without loading their shared weights
+twice, and to ask that fine-tune typed questions about images. We use it to run
+[Umpire](https://huggingface.co/ezoushen/umpire-35b-a3b-mlx-4bit), a decision fine-tune of Ornith 1.5
+35B-A3B, next to Ornith itself.
+
+It adds two things to upstream Splash 1.2.0:
+
+- **Shared weight images, behind `serve --share-weights` (off by default).** A MoE layer's routed experts
+  get an image of their own, and each image is keyed by the content of the source bytes it reads and the
+  code that writes it. Processes of one user and one build hand images to each other through unnamed shared
+  memory, so a second process on the same model, or a fine-tune that leaves the experts unchanged, maps the
+  first one's memory instead of writing another copy. `DEVELOPMENT.md` describes the mechanism, its waits
+  and its trust model. Proposed upstream in [incoai/splash#203](https://github.com/incoai/splash/issues/203),
+  which predates 1.2.0's in-memory loading.
+- **Images on `POST /v1/systemone`.** A request may carry `"images"`: 1 to 64 `data:` URLs, which every
+  question's prompt shows before the evidence. A server started with `--language-only` rejects them. The
+  model needs a vision tower; Umpire's MLX repository carries Ornith's.
+
+```bash
+git clone -b integration-1.2.0 https://github.com/ezoushen/splash.git && cd splash && make -j4
+./splash serve --model ezoushen/ornith-1.5-35b-a3b-mlx-4bit --share-weights --port 8000
+./splash serve --model ezoushen/umpire-35b-a3b-mlx-4bit --share-weights --port 8001 --max-context 16K
+```
+
+## Branches, changes from upstream, and credit
+
+`integration-1.2.0` merges two topic branches on upstream's `1.2.0` tag, each holding one feature:
+
+| Branch | Content | Author | Origin |
+| --- | --- | --- | --- |
+| `shared-weight-images` | Write a MoE layer's routed experts into an image of their own; share weight images between processes by content (`--share-weights`); let the release check allow a named, intended change of weight images | ezoushen | this fork ([#203](https://github.com/incoai/splash/issues/203)) |
+| `vision-systemone-1.2.0` | Allow score-only requests to carry images | [Audrey Tang](https://github.com/audreyt) | cherry-picked from [#159](https://github.com/incoai/splash/pull/159) and fitted to 1.2.0's protocol validation; the commit credits Devin as co-author, as the original does |
+| | Accept images on `/v1/systemone` | ezoushen, co-authored by Audrey Tang | adapted from the `images` field of [#159](https://github.com/incoai/splash/pull/159), keeping its request shape and limits; #159's other extensions are not included |
+
+Sampling penalties and `min_p`, which an earlier version of this fork carried from
+[#243](https://github.com/incoai/splash/pull/243), are part of upstream 1.2.0. Everything else is Splash by
+Inco AI, under the [Apache-2.0 licence](LICENSE), which also covers our changes. Nothing here is merged
+upstream yet. The original README follows.
+
+---
+
 # Splash
 
 [![CI](https://github.com/incoai/splash/actions/workflows/ci.yml/badge.svg)](https://github.com/incoai/splash/actions/workflows/ci.yml)
