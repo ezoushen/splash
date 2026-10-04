@@ -264,6 +264,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/DraftCheckpoint.cpp \
 	runtime/model/WeightSource.cpp \
 	runtime/model/WeightImages.cpp \
+	runtime/model/TensorDigests.cpp \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
