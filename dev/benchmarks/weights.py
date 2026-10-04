@@ -3,7 +3,9 @@
 A build's engine-tests/weight-digests loads a model as its engine does and
 prints the component, size and SHA-256 of every image it holds
 (dev/tools/weight_digests.mm). Both builds must load the same images with the
-same bytes.
+same bytes, except the images an intended change names by a pattern
+(--expect-image-change / EXPECT_IMAGE_CHANGE), whose differences are recorded
+without failing.
 
 Builds of earlier releases have no weight-digests and loaded a package's
 files as they are, so a package's are not compared with theirs. Those that
@@ -18,7 +20,9 @@ regression benchmarks pass it.
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -27,6 +31,28 @@ WEIGHT_DIGESTS = Path("engine-tests/weight-digests")
 IDENTITY_HEADER = Path("engine/WeightPreparationIdentity.hpp")
 PROVENANCE = "splash-prepared-weight-v1"
 DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def pattern(value: str) -> re.Pattern:
+    """value compiled, or the argument error of a malformed pattern."""
+    try:
+        return re.compile(value)
+    except re.error as error:
+        raise argparse.ArgumentTypeError(f"invalid pattern {value!r}: {error}")
+
+
+def add_expect_image_change(parser: argparse.ArgumentParser) -> None:
+    """The option, defaulting to EXPECT_IMAGE_CHANGE, of the pattern that
+    names the components whose bytes a change means to change; unset, none."""
+    parser.add_argument(
+        "--expect-image-change",
+        metavar="REGEX",
+        type=pattern,
+        default=os.environ.get("EXPECT_IMAGE_CHANGE") or None,
+        help="allow the weight images whose whole component name matches "
+        "REGEX to differ or appear in one build only, recorded "
+        "(EXPECT_IMAGE_CHANGE=REGEX)",
+    )
 
 
 def loads_in_memory(build: Path) -> bool:
@@ -82,9 +108,12 @@ def prepared(environment: dict, package: Path) -> dict:
     return images
 
 
-def compare(baseline: dict, candidate: dict) -> dict:
+def compare(
+    baseline: dict, candidate: dict, expected: re.Pattern | None = None
+) -> dict:
     """Whether the builds loaded the same images, by component, with the
-    same bytes."""
+    same bytes; a difference in a component whose whole name expected
+    matches is recorded in expected_changes instead of failing."""
     rows = [
         {
             "component": component,
@@ -93,27 +122,42 @@ def compare(baseline: dict, candidate: dict) -> dict:
         }
         for component in sorted(baseline.keys() | candidate.keys())
     ]
-    failures = [
-        f"{row['component']}: the baseline loaded {row['baseline_sha256'] or 'nothing'}, "
-        f"the candidate {row['candidate_sha256'] or 'nothing'}"
-        for row in rows
-        if row["baseline_sha256"] != row["candidate_sha256"]
-    ]
-    return {"images": rows, "failures": failures, "pass": not failures}
+    failures, changes = [], []
+    for row in rows:
+        if row["baseline_sha256"] == row["candidate_sha256"]:
+            continue
+        allowed = expected is not None and expected.fullmatch(row["component"])
+        (changes if allowed else failures).append(
+            f"{row['component']}: the baseline loaded {row['baseline_sha256'] or 'nothing'}, "
+            f"the candidate {row['candidate_sha256'] or 'nothing'}"
+        )
+    return {
+        "images": rows,
+        "failures": failures,
+        "expected_changes": changes,
+        "expect_image_change": expected.pattern if expected else None,
+        "pass": not failures,
+    }
 
 
 def compare_builds(
-    baseline: Path, candidate: Path, package: Path, environment: dict, assembly: bool
+    baseline: Path,
+    candidate: Path,
+    package: Path,
+    environment: dict,
+    assembly: bool,
+    expected: re.Pattern | None = None,
 ) -> dict:
     """Compares the images the build directories load from package, the
-    model root both were given; environment started the baseline, and
-    assembly says whether package is one."""
+    model root both were given; environment started the baseline, assembly
+    says whether package is one, and expected names the images that may
+    change (compare)."""
     if loads_in_memory(baseline):
         images = digests(baseline, package)
     elif not assembly:
-        return {"images": [], "failures": [], "pass": True}
+        return compare({}, {}, expected)
     elif (Path(baseline) / IDENTITY_HEADER).is_file():
         images = prepared(environment, package)
     else:
         raise RuntimeError(f"the baseline build has no {WEIGHT_DIGESTS}")
-    return compare(images, digests(candidate, package))
+    return compare(images, digests(candidate, package), expected)

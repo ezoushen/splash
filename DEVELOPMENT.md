@@ -1425,7 +1425,16 @@ family, so it runs once on each Mac. Per model, `release-check`:
   kept prepared copies writes them into a cache of its own, and a package's
   files are not compared with it); decode and prefill GPU time may regress by
   at most the larger of 2% and twice the run's own ABBA spread, and a spread
-  above 5% fails as inconclusive.
+  above 5% fails as inconclusive. A change that means new image bytes follows
+  the procedure of the goldens README ([Weight loading](#weight-loading)),
+  and for an MLX target the affine source oracle, which compares the images
+  with the packed package, carries the byte check. `EXPECT_IMAGE_CHANGE`
+  then names the images that change, a regular expression that must match a
+  component's whole name: those may differ or be loaded by one build only,
+  and are recorded in `backend-regression.json` and printed; any other
+  image must keep its bytes, and outputs and acceptance decide as before.
+  A MoE MLX target whose routed experts moved into `target/experts-N.bin`
+  is compared with `EXPECT_IMAGE_CHANGE='target/(layer|experts)-[0-9]+\.bin'`.
 
 Results go to `build/release/<owner>--<repo>[--VARIANT]/`. The weight images
 do not depend on the GPU, so each model's `weights.json` must be identical on
@@ -1487,7 +1496,8 @@ into memory, then run from the candidate checkout, after
 It takes any installed model and, for an upstream one, holds its assembly for
 the whole run, so every round serves the same model. It starts isolated servers
 in ABBA order, compares matched cold, exact-prefix and decode requests by the
-release check's speed rule and weight bytes (decode by
+release check's speed rule and weight bytes (`--expect-image-change REGEX`
+or `EXPECT_IMAGE_CHANGE`, as in the [Release check](#release-check); decode by
 `metrics.decode_cycle_ms` per output token, so host work between commands
 counts; against a baseline that does not report it, both versions by
 `metrics.decode_wall_ms` per output token, as each comparison's `metric`

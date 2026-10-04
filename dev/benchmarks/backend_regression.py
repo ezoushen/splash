@@ -18,7 +18,11 @@ otherwise idle:
 - weight bytes: after the rounds both builds load the model's weight images
   once more and must hold the same images with the same bytes
   (weights.compare_builds). A baseline of an earlier release prepares into a
-  cache of its own, <output dir>/baseline-weights.
+  cache of its own, <output dir>/baseline-weights. With
+  --expect-image-change REGEX (or EXPECT_IMAGE_CHANGE=REGEX), for a change
+  that means to change some images, the images whose component name REGEX
+  matches whole may differ or be loaded by one build only; they are recorded,
+  and any other difference still fails.
 
 The candidate's own benchmark invariants must hold too, and the baseline must
 be another build: one with the candidate's build_id compares nothing. The
@@ -328,6 +332,7 @@ def parse_args(argv=None):
         default=os.environ.get("EXPECT_OUTPUT_CHANGE", "") not in ("", "0"),
         help="allow changed outputs with acceptance within 0.02 (EXPECT_OUTPUT_CHANGE=1)",
     )
+    weights.add_expect_image_change(parser)
     args = parser.parse_args(argv)
     if args.samples < 1:
         parser.error("--samples must be positive")
@@ -388,6 +393,7 @@ def main(argv=None) -> int:
             args.package,
             environments["baseline"],
             args.kind == smoke.model_artifacts.ASSEMBLY,
+            args.expect_image_change,
         )
         document["pass"] = (
             document["comparison"]["pass"] and document["weights"]["pass"]
@@ -419,6 +425,11 @@ def report(document: dict) -> None:
         f"weight bytes: {len(images['images'])} images "
         + ("PASS" if images["pass"] else f"FAIL {images['failures']}")
     )
+    if images["expected_changes"]:
+        print(
+            f"expected changes (EXPECT_IMAGE_CHANGE={images['expect_image_change']}): "
+            f"{images['expected_changes']}"
+        )
     for failure in comparison["failures"]:
         print(f"FAIL: {failure}")
     print(f"backend regression: {'PASS' if document['pass'] else 'FAIL'}")
