@@ -26,15 +26,21 @@ public:
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Qwen3_6MoeLayout &layout);
   ~AffineTargetLoader();
   [[nodiscard]] WeightFile layer(uint32_t index);
+  // A sparse MoE layer's routed experts, which its layer image does not hold.
+  [[nodiscard]] WeightFile experts(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
 private:
+  // Image `part` of target layer `index`: the layer's, or its experts'.
+  [[nodiscard]] WeightFile openLayer(uint32_t index, size_t part);
   WeightImages &images_;
-  std::shared_ptr<affine::PlannedCheckpoint> planned_; // layers, head, embedding
+  std::shared_ptr<affine::PlannedCheckpoint> planned_; // as affineTargetImages plans them
+  size_t layerImages_; // images per layer: 2 for a sparse MoE layer, else 1
 };
 
-// Every planned image of a layout, its sections at their offsets: the layers,
-// the head, the embedding.
+// Every planned image of a layout, its sections at their offsets: each layer,
+// a sparse MoE layer followed by its routed experts, then the head and the
+// embedding.
 [[nodiscard]] std::vector<affine::Image> affineTargetImages(const Qwen3_8Layout &layout);
 [[nodiscard]] std::vector<affine::Image> affineTargetImages(const Qwen3_6MoeLayout &layout);
 

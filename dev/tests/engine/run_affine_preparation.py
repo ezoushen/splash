@@ -3,6 +3,7 @@ checkpoint, an independent byte-layout oracle of every prepared image and
 their golden hashes."""
 
 import argparse
+import hashlib
 import json
 import math
 import struct
@@ -66,9 +67,14 @@ def fixture(root, moe=False, rope_type_key="rope_type", rope_type="default"):
 
     expected = root / "expected"
     expected.mkdir()
+    # The MoE target as a package stores it, each layer's routed experts in
+    # the layer's file after the router, which the loader must read alike.
+    package = root / "package"
+    if moe:
+        package.mkdir()
 
-    def image(name, magic, index, kind, sections):
-        (expected / name).write_bytes(weight_file(magic, index, kind, sections))
+    def image(name, magic, index, kind, sections, directory=expected):
+        (directory / name).write_bytes(weight_file(magic, index, kind, sections))
 
     for layer in range(2):
         p = f"language_model.model.layers.{layer}."
@@ -108,13 +114,16 @@ def fixture(root, moe=False, rope_type_key="rope_type", rope_type="default"):
         sections.append(add(p + "post_attention_layernorm.weight", [256]))
         if moe:
             # The 8-bit router and shared-expert scalar gate; the gate's one row is
-            # padded to a 256-row tile.
+            # padded to a 256-row tile. The routed experts have an image of their
+            # own.
             projection(p + "mlp.gate", 256, 256, bits=8)
             sections.append(packed([p + "mlp.gate"], 256, 256, bits=8))
+            routed, experts = len(sections), []
             for name in ("gate_proj", "up_proj", "down_proj"):
                 name = p + "mlp.switch_mlp." + name
                 projection(name, 256, 256, experts=256)
-                sections.append(packed([name], 256, 256, experts=256))
+                experts.append(packed([name], 256, 256, experts=256))
+            image(f"experts-{layer}.bin", "MDFM0003", layer, 0, experts)
             for name in ("gate_proj", "up_proj", "down_proj"):
                 name = p + "mlp.shared_expert." + name
                 projection(name, 256, 256)
@@ -132,6 +141,9 @@ def fixture(root, moe=False, rope_type_key="rope_type", rope_type="default"):
                 sections.append(packed([name], rows, columns))
         magic = "MDFM0001" if moe else "MDFL0006"
         image(f"layer-{layer}.bin", magic, layer, layer, sections)
+        if moe:
+            sections[routed:routed] = experts
+            image(f"layer-{layer}.bin", magic, layer, layer, sections, package)
     norm = add("language_model.model.norm.weight", [256])
     projection("language_model.lm_head", 256, 256)
     image(
@@ -152,6 +164,9 @@ def fixture(root, moe=False, rope_type_key="rope_type", rope_type="default"):
             for field in ("weight", "scales", "biases")
         ],
     )
+    if moe:
+        for name in ("head.bin", "embedding.bin"):
+            (package / name).write_bytes((expected / name).read_bytes())
     config = {
         "model_type": "qwen3_5_text",
         "num_hidden_layers": 2,
@@ -344,6 +359,13 @@ def draft_fixture(root):
     write_safetensors(root / "model.safetensors", tensors)
 
 
+# The MoE layer images of 1.2.0, which held the routed experts.
+MOE_PACKAGE_LAYERS = {
+    "layer-0.bin": "5b9926e5cbd89f8c772ed8308abc1e4dae140a67e2c44cddbd4ce8e688dcda61",
+    "layer-1.bin": "76e65f55a4b9ed13103583bd44da12fe2dc4258584b82a7df3f0f7cb0aebae69",
+}
+
+
 def prepare(binary, metallib, root, kind, golden):
     command = [str(binary.resolve()), str(metallib.resolve()), str(root), kind]
     result = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -376,6 +398,13 @@ def main():
         root = Path(directory) / "moe"
         root.mkdir()
         fixture(root, moe=True)
+        # The package's layer files, each with its routed experts after the
+        # router, are the images of 1.2.0, whose goldens these are.
+        package = {
+            name: hashlib.sha256((root / "package" / name).read_bytes()).hexdigest()
+            for name in ("layer-0.bin", "layer-1.bin")
+        }
+        assert package == MOE_PACKAGE_LAYERS, package
         prepare(args.binary, args.metallib, root, "moe", goldens["moe"])
         root = Path(directory) / "dense"
         root.mkdir()

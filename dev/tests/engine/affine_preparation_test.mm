@@ -1,7 +1,8 @@
 // Loads a tiny dense or MoE affine checkpoint, or a DFlash2 draft
 // checkpoint, and prints each image's SHA-256. Every image must equal the
 // independently serialized file in FIXTURE/expected, and again once the
-// images are released and restored.
+// images are released and restored. The MoE target must read from its images
+// as from a package's files, FIXTURE/package.
 //
 //   affine-preparation METALLIB FIXTURE dense|moe|draft
 #include "model/AffinePlan.hpp"
@@ -93,12 +94,30 @@ void writeEveryByte(const std::filesystem::path &root, std::vector<model::affine
   }
 }
 
-// Every image of the target fixtures, in plan order.
-void openTarget(model::AffineTargetLoader &loader, const auto &check) {
-  check(loader.layer(0));
-  check(loader.layer(1));
+// Every image of the target fixtures, in plan order: a MoE layer's routed
+// experts follow it.
+void openTarget(model::AffineTargetLoader &loader, const auto &check, bool moe = false) {
+  for (uint32_t layer = 0; layer < 2; ++layer) {
+    check(loader.layer(layer));
+    if (moe) check(loader.experts(layer));
+  }
   check(loader.head());
   check(loader.embedding());
+}
+
+// The views of each layer's FFN: the router, the routed and shared experts
+// and the scalar gate.
+std::vector<metal::MetalBuffer> ffnViews(const model::Qwen3_6MoeWeights &weights) {
+  std::vector<metal::MetalBuffer> views;
+  for (const auto &layer : weights.layers) {
+    const ops::AffineMoeWeights &ffn = layer.ffn.affine();
+    for (const ops::Q8Projection *gate : {&ffn.router, &ffn.sharedScalarGate})
+      views.insert(views.end(), {gate->planes.weights, gate->planes.scales, gate->planes.biases});
+    for (const ops::ExpertProjection *slab : {&ffn.expertGate, &ffn.expertUp, &ffn.expertDown, &ffn.sharedGate,
+                                              &ffn.sharedUp, &ffn.sharedDown})
+      views.push_back(slab->packed);
+  }
+  return views;
 }
 
 // The draft fixture: two layers of width 256, one KV head.
@@ -161,11 +180,32 @@ int main(int argc, char **argv) {
         layout.expertsPerToken = 8;
         layout.expertIntermediateSize = 256;
         prepare<model::AffineTargetLoader>(backend, root, layout, [](auto &loader, const auto &check) {
-          openTarget(loader, check);
+          openTarget(loader, check, true);
         });
         writeEveryByte(root, model::affineTargetImages(layout));
+        // The target loader reads each layer's FFN from the layer's image and
+        // its experts' image as it reads it from a package's layer file, and
+        // records each image once, in load order.
+        model::WeightImages images(backend);
+        model::AffineTargetLoader files(images, root, layout);
+        const model::Qwen3_6MoeWeights loaded = model::loadQwen3_6MoeWeights(backend, layout, files);
+        model::WeightImages packageImages(backend);
+        const model::Qwen3_6MoeWeights packaged = model::loadQwen3_6MoeWeights(
+            backend, layout, model::PackedTargetFiles<model::Qwen3_6MoeLayout>{packageImages, root / "package", layout});
+        const auto views = ffnViews(loaded), packagedViews = ffnViews(packaged);
+        for (size_t i = 0; i < views.size(); ++i)
+          if (views[i].sizeBytes() != packagedViews[i].sizeBytes() ||
+              std::memcmp(views[i].contents(), packagedViews[i].contents(), views[i].sizeBytes()))
+            throw std::runtime_error("the target loader misread the MoE images");
+        const std::vector<std::string> components{"target/layer-0.bin", "target/experts-0.bin",
+                                                  "target/layer-1.bin", "target/experts-1.bin",
+                                                  "target/head.bin",    "target/embedding.bin"};
+        bool recorded = loaded.files.size() == components.size() && packaged.files.size() == layout.layers + 2;
+        for (size_t i = 0; recorded && i < components.size(); ++i)
+          recorded = loaded.files[i].relativePath == components[i];
+        if (!recorded) throw std::runtime_error("the target loader's records differ from its images");
         std::cout << "affine preparation: exact independent fixture, MoE experts, 8-bit router and shared-expert "
-                     "gate, restore PASS\n";
+                     "gate, restore, target read like a package's PASS\n";
         return 0;
       }
       auto layout = tinyLayout<model::Qwen3_8Layout>();

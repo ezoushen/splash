@@ -463,7 +463,11 @@ biases into 256-row tiles without requantization, quantizes the draft's BF16
 projections into the same tiles ([Drafts](#drafts)) and computes GDN decay as
 `float(-exp(double(A_log)))`, which may differ by one float ULP in this small
 vector from packages produced with MLX's float exponential. `GgufPreparation`
-repacks GGUF blocks ([GGUF targets](#gguf-targets)).
+repacks GGUF blocks ([GGUF targets](#gguf-targets)). `AffineTargetLoader`
+writes a sparse MoE layer's routed experts, most of its bytes, into an image of
+their own, `target/experts-N.bin` beside `target/layer-N.bin`, so a fine-tune
+that leaves them unchanged leaves that image's bytes unchanged; packages and
+GGUF images keep them in the layer's image.
 
 Loading never rounds a target or vision weight, and rounds the draft's
 projections only as the packages' drafts are rounded. A tensor it converts to
@@ -559,7 +563,10 @@ the loop shows in `loop.max_tick_ms`.
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's images
 (`QwenTargetFiles`: a package's packed files, or the images
 `AffineTargetLoader` or `GgufTargetLoader` plans) through the format that
-stores them. `AffineTargetFormat`, for packed and MLX images, reads every
+stores them. A sparse MoE layer's FFN is read from the layer's image and its
+routed experts' image, which for packed files and GGUF images is the layer's
+image again, in file order: router, routed experts, shared expert, scalar
+gate. `AffineTargetFormat`, for packed and MLX images, reads every
 projection, a fused one too, as one affine Q4 tensor and the norms as bf16.
 `BlockTargetFormat`, for GGUF images, reads each GGUF tensor as one
 block-quantized `QuantizedSegment` (a fused projection's tensors in output
