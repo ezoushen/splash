@@ -9,6 +9,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <CommonCrypto/CommonDigest.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
 
@@ -84,6 +85,19 @@ std::string errorDescription(NSError *error) {
     if (!error) return "unknown Metal error";
     std::string result = stringFromNSString(error.localizedDescription);
     return result.empty() ? "unknown Metal error" : result;
+}
+
+std::string sha256Hex(const void *bytes, size_t count) {
+    // A metallib is far below CommonCrypto's 32-bit lengths.
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(bytes, static_cast<CC_LONG>(count), digest);
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    for (unsigned char byte : digest) {
+        result += digits[byte >> 4];
+        result += digits[byte & 15];
+    }
+    return result;
 }
 
 void readMacosVersion(DeviceCapabilities &capabilities) {
@@ -543,6 +557,11 @@ struct MetalBackend::Impl {
         pipelines;
 
     DeviceCapabilities capabilities;
+    // The metallib bytes the library was loaded from, hashed only when
+    // libraryDigest() is first asked for (shared weights).
+    NSData *libraryBytes = nil;
+    std::once_flag libraryDigestOnce;
+    std::string libraryDigest;
     std::shared_ptr<AllocationAccounting> accounting =
         std::make_shared<AllocationAccounting>();
     std::shared_ptr<BackendAsyncState> asyncState =
@@ -569,6 +588,26 @@ struct MetalBackend::Impl {
                                                    options:options];
         if (!buffer)
             throw MetalAllocationError("Metal buffer allocation failed");
+        if (label) buffer.label = label;
+        return buffer;
+    }
+
+    // A buffer over memory without a copy, which unmaps it when Metal lets
+    // the buffer go, or at once if Metal refuses it.
+    id<MTLBuffer> newBuffer(MappedMemory &memory, NSString *label) {
+        auto unmap = std::make_shared<std::function<void()>>(std::exchange(memory.unmap, {}));
+        id<MTLBuffer> buffer = nil;
+        if (memory.address && memory.bytes)
+            buffer = [device newBufferWithBytesNoCopy:memory.address
+                                               length:memory.bytes
+                                              options:MTLResourceStorageModeShared
+                                          deallocator:^(void *, NSUInteger) {
+                                              if (*unmap) std::exchange(*unmap, {})();
+                                          }];
+        if (!buffer) {
+            if (*unmap) std::exchange(*unmap, {})();
+            throw MetalAllocationError("Metal buffer over mapped memory failed");
+        }
         if (label) buffer.label = label;
         return buffer;
     }
@@ -952,6 +991,7 @@ MetalBackend::MetalBackend(std::string metallibPath)
                 "unable to read metallib " + metallibPath + ": " +
                 errorDescription(error));
         }
+        impl_->libraryBytes = fileData;
         // The library keeps the bytes read here, whatever later replaces the
         // path; the dispatch data retains them rather than copying them.
         dispatch_data_t data = dispatch_data_create(
@@ -986,6 +1026,14 @@ void MetalBackend::stop() noexcept {
 
 const DeviceCapabilities &MetalBackend::capabilities() const noexcept {
     return impl_->capabilities;
+}
+
+const std::string &MetalBackend::libraryDigest() const {
+    std::call_once(impl_->libraryDigestOnce, [this] {
+        impl_->libraryDigest =
+            sha256Hex(impl_->libraryBytes.bytes, impl_->libraryBytes.length);
+    });
+    return impl_->libraryDigest;
 }
 
 DeviceCapabilities probeDeviceCapabilities() {
@@ -1052,6 +1100,54 @@ void MetalBackend::restoreMemory(const MetalBuffer &buffer) {
         throw MetalBackendError("Metal buffer memory is not released");
     allocation.attach(impl_->newBuffer(allocation.length, allocation.storage,
                                        allocation.label));
+    impl_->sampleDeviceMemory();
+}
+
+MetalBuffer MetalBackend::mapBuffer(MappedMemory memory, std::string_view label) {
+    const auto unmap = [&] {
+        if (memory.unmap) std::exchange(memory.unmap, {})();
+    };
+    try {
+        checkOperation();
+        if (!memory.bytes) throw MetalBackendError("Metal buffer size must be positive");
+        if (memory.bytes > impl_->capabilities.maxBufferLengthBytes)
+            throw MetalBackendError("Metal buffer exceeds maxBufferLength");
+    } catch (...) {
+        unmap();
+        throw;
+    }
+    auto allocation = std::make_shared<MetalAllocation>();
+    allocation->accounting = impl_->accounting;
+    allocation->length = memory.bytes;
+    allocation->storage = BufferStorage::Shared;
+    allocation->residency = impl_->residency;
+    try {
+        if (!label.empty()) allocation->label = checkedNSString(label, "buffer label");
+    } catch (...) {
+        unmap();
+        throw;
+    }
+    allocation->attach(impl_->newBuffer(memory, allocation->label));
+    impl_->sampleDeviceMemory();
+    auto result = std::make_shared<MetalBuffer::Impl>();
+    result->lengthBytes = allocation->length;
+    result->allocation = std::move(allocation);
+    return MetalBuffer(std::move(result));
+}
+
+void MetalBackend::restoreMemory(const MetalBuffer &buffer, MappedMemory memory) {
+    try {
+        checkOperation();
+        MetalAllocation &allocation = impl_->baseAllocation(buffer);
+        if (allocation.buffer)
+            throw MetalBackendError("Metal buffer memory is not released");
+        if (memory.bytes != allocation.length)
+            throw MetalBackendError("mapped memory differs from the buffer's length");
+        allocation.attach(impl_->newBuffer(memory, allocation.label));
+    } catch (...) {
+        if (memory.unmap) std::exchange(memory.unmap, {})();
+        throw;
+    }
     impl_->sampleDeviceMemory();
 }
 

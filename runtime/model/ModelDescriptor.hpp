@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <map>
 #include <string>
 #include <variant>
 
@@ -62,5 +64,10 @@ struct ModelDescriptor final {
                                                   ops::VisionLayout vision);
 [[nodiscard]] ModelDescriptor
 inspectModelPackage(const std::filesystem::path &root);
+// The content digest the installation's record gives each of its files, by
+// path relative to root: model.json's files, or a package's manifest.json
+// artifacts.
+[[nodiscard]] std::map<std::string, std::string, std::less<>>
+recordedSourceDigests(const std::filesystem::path &root);
 
 } // namespace splash::model

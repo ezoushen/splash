@@ -50,12 +50,13 @@ template <class Image> uint64_t imageBytes(const std::vector<Image> &images) {
 
 ModelPackage loadModelPackage(metal::MetalBackend &backend,
                               const std::filesystem::path &root,
-                              const ModelDescriptor &descriptor) {
+                              const ModelDescriptor &descriptor,
+                              std::shared_ptr<SharedImages> shared) {
   ModelPackage result;
   result.descriptor = descriptor;
   if (!result.descriptor.valid())
     throw std::invalid_argument("model descriptor is invalid");
-  result.images = std::make_shared<WeightImages>(backend, result.descriptor.sourceIdentity);
+  result.images = std::make_shared<WeightImages>(backend, result.descriptor.sourceIdentity, std::move(shared));
   WeightImages &images = *result.images;
   // Every source's metadata is checked before the first image is written:
   // the vision tower's and the draft's here, the target's by its loader.

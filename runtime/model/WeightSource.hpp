@@ -51,4 +51,11 @@ struct SourceTensor final {
   void read(uint64_t at, std::span<uint8_t> destination) const;
 };
 
+// Bytes [offset, offset + bytes) of a source file's tensor data.
+struct SourceBytes final {
+  const WeightSource *file = nullptr;
+  uint64_t offset = 0;
+  uint64_t bytes = 0;
+};
+
 } // namespace splash::model

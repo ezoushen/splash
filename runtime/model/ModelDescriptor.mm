@@ -470,4 +470,28 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
   }
 }
 
+std::map<std::string, std::string, std::less<>>
+recordedSourceDigests(const std::filesystem::path &root) {
+  @autoreleasepool {
+    std::map<std::string, std::string, std::less<>> result;
+    const auto add = [&](id path, id digest) {
+      if ([path isKindOfClass:[NSString class]] && [digest isKindOfClass:[NSString class]])
+        result[[path UTF8String]] = [digest UTF8String];
+    };
+    if (std::filesystem::exists(root / "model.json")) {
+      NSDictionary *files = requireObject(readObject(root / "model.json", "resolved model"), @"files",
+                                          "resolved model files");
+      for (NSString *path in files) {
+        id entry = files[path];
+        if ([entry isKindOfClass:[NSDictionary class]]) add(path, entry[@"digest"]);
+      }
+    } else {
+      for (id artifact : requireArray(readObject(root / "manifest.json", "model manifest"), @"artifacts",
+                                      "model manifest artifacts"))
+        if ([artifact isKindOfClass:[NSDictionary class]]) add(artifact[@"path"], artifact[@"sha256"]);
+    }
+    return result;
+  }
+}
+
 } // namespace splash::model

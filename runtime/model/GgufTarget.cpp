@@ -1,7 +1,37 @@
 #include "model/GgufTarget.hpp"
 #include "model/GgufPreparation.hpp"
 
+#include <sstream>
+
 namespace splash::model {
+namespace {
+
+// Describes a planned image for a shared image's key (ImagePlan): its fills'
+// bytes, every field of its copies and repacks, and the rows they read, in
+// plan order.
+void describe(const WeightSource &source, const gguf::Image &image, ImagePlan &plan) {
+  std::ostringstream text;
+  const auto rows = [&](const gguf::TensorRows &rows) {
+    text << " rows " << rows.name << ' ' << rows.type << ' ' << rows.rows << ' ' << rows.rowBytes << ' '
+         << rows.order.from << ' ' << rows.order.headRows << ' ' << rows.order.keyHeads << ' '
+         << rows.order.valueHeadsPerKey << '\n';
+    plan.sources.push_back({&source, rows.offset, rows.rows * rows.rowBytes});
+  };
+  text << "gguf\n";
+  for (const gguf::Fill &fill : image.fills) text << "fill " << fill.offset << ' ' << weightDigest(fill.bytes) << '\n';
+  for (const gguf::Copy &copy : image.copies) {
+    text << "copy " << copy.destination << ' ' << static_cast<int>(copy.conversion) << '\n';
+    rows(copy.source);
+  }
+  for (const gguf::Repack &repack : image.repacks) {
+    text << "repack " << repack.format << ' ' << repack.rows << ' ' << repack.columns << ' ' << repack.plane0 << ' '
+         << repack.plane1 << ' ' << repack.meta << '\n';
+    for (const gguf::TensorRows &source : repack.sources) rows(source);
+  }
+  plan.description = text.str();
+}
+
+} // namespace
 std::filesystem::path findTargetGguf(const std::filesystem::path &directory) {
   std::filesystem::path found;
   std::error_code error;
@@ -25,12 +55,14 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &i
 
 WeightFile GgufTargetLoader::open(size_t index) {
   const gguf::Image &plan = planned_->images[index];
-  return images_.load({"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
-                       [&backend = backend_, planned = planned_, index](std::span<uint8_t>,
-                                                                         const metal::MetalBuffer &buffer) {
-                         writeGgufImage(backend, planned->source, buffer, planned->images[index]);
-                         planned->source.checkUnchanged();
-                       }});
+  ImagePlan image{"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
+                  [&backend = backend_, planned = planned_, index](std::span<uint8_t>,
+                                                                    const metal::MetalBuffer &buffer) {
+                    writeGgufImage(backend, planned->source, buffer, planned->images[index]);
+                    planned->source.checkUnchanged();
+                  }};
+  describe(planned_->source, plan, image);
+  return images_.load(std::move(image));
 }
 
 WeightFile GgufTargetLoader::layer(uint32_t index) {

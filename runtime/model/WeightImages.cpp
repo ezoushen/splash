@@ -1,4 +1,5 @@
 #include "model/WeightImages.hpp"
+#include "model/SharedImages.hpp"
 #include "model/WeightSource.hpp"
 
 #include <dispatch/dispatch.h>
@@ -14,18 +15,35 @@
 
 namespace splash::model {
 
+WeightImages::WeightImages(metal::MetalBackend &backend, std::string contentIdentity,
+                           std::shared_ptr<SharedImages> shared) noexcept
+    : backend_(&backend), contentIdentity_(std::move(contentIdentity)), shared_(std::move(shared)) {}
+
+WeightImages::~WeightImages() = default;
+
 WeightFile WeightImages::load(ImagePlan image) {
   if (released_) throw std::logic_error("weights load while their memory is released");
-  metal::MetalBuffer buffer = backend_->allocateBuffer(image.bytes, metal::BufferStorage::Shared, image.component);
-  image.write(contentsOf(buffer), buffer);
+  metal::MetalBuffer buffer;
+  std::string key = shared_ ? shared_->key(image) : std::string();
+  if (key.empty()) {
+    buffer = backend_->allocateBuffer(image.bytes, metal::BufferStorage::Shared, image.component);
+    image.write(contentsOf(buffer), buffer);
+  } else {
+    shared_->acquire(
+        key, image.bytes,
+        [&](metal::MappedMemory memory) { buffer = backend_->mapBuffer(std::move(memory), image.component); },
+        [&] { image.write(contentsOf(buffer), buffer); });
+  }
   WeightFile file(*backend_, buffer, image.component, image.magic, image.layer, image.type, contentIdentity_);
-  images_.push_back({std::move(image.component), std::move(buffer), std::move(image.write)});
+  images_.push_back({std::move(image.component), std::move(buffer), std::move(image.write), std::move(key)});
   return file;
 }
 
 void WeightImages::release() {
   if (released_) throw std::logic_error("weights are already released");
   for (Image &image : images_) backend_->releaseMemory(image.buffer);
+  // The restores that follow are a new pass among the shared images.
+  if (shared_) shared_->newPass();
   released_ = true;
   restored_ = 0;
 }
@@ -34,8 +52,15 @@ bool WeightImages::restore() {
   if (!released_) throw std::logic_error("weights are not released");
   if (restored_ < images_.size()) {
     Image &image = images_[restored_];
-    backend_->restoreMemory(image.buffer);
-    image.write(contentsOf(image.buffer), image.buffer);
+    const auto write = [&] { image.write(contentsOf(image.buffer), image.buffer); };
+    if (image.key.empty()) {
+      backend_->restoreMemory(image.buffer);
+      write();
+    } else {
+      shared_->acquire(
+          image.key, image.buffer.sizeBytes(),
+          [&](metal::MappedMemory memory) { backend_->restoreMemory(image.buffer, std::move(memory)); }, write);
+    }
     ++restored_;
   }
   released_ = restored_ < images_.size();
@@ -62,7 +87,8 @@ ImagePlan packedImage(const std::filesystem::path &path, std::string component, 
               source->readData(at, destination.subspan(at, std::min<uint64_t>(kLoadStepBytes, destination.size() - at)));
             });
             source->checkUnchanged();
-          }};
+          },
+          "packed", {{source.get(), 0, source->bytes()}}};
 }
 
 unsigned loadThreads() noexcept { return std::max(1u, std::thread::hardware_concurrency()); }

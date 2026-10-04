@@ -58,6 +58,16 @@ enum class BufferStorage {
 class MetalBackend;
 class CommandTicket;
 
+// Memory its owner mapped, which a buffer is made over without a copy
+// (MetalBackend::mapBuffer): bytes at address, which is page-aligned and
+// mapped for bytes rounded up to a page. The backend calls unmap once, when
+// Metal lets the buffer go: its memory is released or its last view is gone.
+struct MappedMemory final {
+  void *address = nullptr;
+  uint64_t bytes = 0;
+  std::function<void()> unmap;
+};
+
 // A cheap, copyable reference to a backend-owned Metal allocation. Views keep
 // the base allocation alive and do not increase the tracked allocation count.
 class MetalBuffer final {
@@ -234,6 +244,9 @@ public:
   MetalBackend &operator=(MetalBackend &&) = delete;
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
+  // The SHA-256, in lowercase hex, of the metallib bytes the kernels were
+  // loaded from, whatever later replaced the file.
+  [[nodiscard]] const std::string &libraryDigest() const;
 
   // Every buffer the backend allocates belongs to one residency set, attached
   // to the command queue, until its memory is released or its last view is
@@ -261,6 +274,13 @@ public:
   // until written.
   void releaseMemory(const MetalBuffer &buffer);
   void restoreMemory(const MetalBuffer &buffer);
+
+  // A Shared buffer over memory, of exactly memory.bytes, in the residency
+  // set and the accounting as allocateBuffer's are; its memory is released
+  // and restored as theirs is. On failure memory is unmapped.
+  [[nodiscard]] MetalBuffer mapBuffer(MappedMemory memory, std::string_view label);
+  // Restores a buffer's released memory as memory, which must be its length.
+  void restoreMemory(const MetalBuffer &buffer, MappedMemory memory);
 
   // Encodes exactly one compute dispatch, commits it, waits for completion,
   // and reports both GPU and end-to-end wall time.

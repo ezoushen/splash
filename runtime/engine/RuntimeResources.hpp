@@ -94,6 +94,10 @@ struct RuntimeResourcesConfig {
   // to it when the model loaded vision and none otherwise. The wire parser
   // keeps the protocol ceiling.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
+  // --share-weights: the weight images are shared with the other processes
+  // of this user that load the same images (model::SharedImages) with the
+  // same writers: this engine's code and the metallib.
+  bool shareWeights = false;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.

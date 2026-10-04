@@ -1,8 +1,14 @@
+import argparse
+import contextlib
+import io
 import json
+import os
+import re
 import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from dev.benchmarks import weights
 
@@ -72,6 +78,81 @@ class WeightBytesTests(unittest.TestCase):
             weights.compare({"x": A, "y": B}, {"x": A})["failures"],
         )
 
+    def test_an_expected_change_names_the_images_it_may_change(self):
+        expected = re.compile(r"target/(layer|experts)-[0-9]+\.bin")
+        baseline = {
+            "target/layer-0.bin": A,
+            "target/head.bin": A,
+            "vision/model.bin": A,
+        }
+        result = weights.compare(
+            baseline,
+            {
+                "target/layer-0.bin": B,
+                "target/experts-0.bin": B,
+                "target/head.bin": A,
+                "vision/model.bin": A,
+            },
+            expected,
+        )
+        self.assertTrue(result["pass"], result["failures"])
+        self.assertEqual(result["expect_image_change"], expected.pattern)
+        # The allowed changes are still recorded, a new image among them.
+        self.assertEqual(
+            result["expected_changes"],
+            [
+                f"target/experts-0.bin: the baseline loaded nothing, the candidate {B}",
+                f"target/layer-0.bin: the baseline loaded {A}, the candidate {B}",
+            ],
+        )
+        # Any other image must keep its bytes and stay loaded; the pattern
+        # matches a whole component name, not a part of one.
+        for candidate, failure in (
+            (
+                baseline | {"target/head.bin": B},
+                f"target/head.bin: the baseline loaded {A}, the candidate {B}",
+            ),
+            (
+                {"target/layer-0.bin": A, "target/head.bin": A},
+                f"vision/model.bin: the baseline loaded {A}, the candidate nothing",
+            ),
+            (
+                baseline | {"draft/target/layer-0.bin": B},
+                f"draft/target/layer-0.bin: the baseline loaded nothing, the candidate {B}",
+            ),
+        ):
+            with self.subTest(failure=failure):
+                result = weights.compare(baseline, candidate, expected)
+                self.assertFalse(result["pass"])
+                self.assertEqual(result["failures"], [failure])
+        # Without a pattern every difference fails.
+        result = weights.compare(baseline, baseline | {"target/layer-0.bin": B})
+        self.assertFalse(result["pass"])
+        self.assertEqual(
+            (result["expected_changes"], result["expect_image_change"]), ([], None)
+        )
+
+    def test_the_expected_change_is_an_option_or_a_variable(self):
+        def parse(arguments, environment):
+            with (
+                mock.patch.dict(os.environ, environment),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                parser = argparse.ArgumentParser()
+                weights.add_expect_image_change(parser)
+                return parser.parse_args(arguments).expect_image_change
+
+        pattern = r"target/(layer|experts)-[0-9]+\.bin"
+        self.assertIsNone(parse([], {"EXPECT_IMAGE_CHANGE": ""}))
+        self.assertEqual(parse(["--expect-image-change", pattern], {}).pattern, pattern)
+        self.assertEqual(parse([], {"EXPECT_IMAGE_CHANGE": pattern}).pattern, pattern)
+        for arguments, environment in (
+            (["--expect-image-change", "("], {}),
+            ([], {"EXPECT_IMAGE_CHANGE": "("}),
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                parse(arguments, environment)
+
     def test_digests_runs_the_build_tool(self):
         with TemporaryDirectory() as directory:
             build = Path(directory)
@@ -124,7 +205,13 @@ class WeightBytesTests(unittest.TestCase):
                 weights.compare_builds(
                     baseline, candidate, PACKAGE, environment, False
                 ),
-                {"images": [], "failures": [], "pass": True},
+                {
+                    "images": [],
+                    "failures": [],
+                    "expected_changes": [],
+                    "expect_image_change": None,
+                    "pass": True,
+                },
             )
             self.assertFalse((candidate / "roots").exists())
             # An assembly it prepared into its cache, which its build names.

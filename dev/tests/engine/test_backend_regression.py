@@ -251,19 +251,34 @@ class BackendRegressionTests(unittest.TestCase):
             regression.round_record("baseline", [benchmark_document(("decode",))])
 
     def fake_checkout(
-        self, root: Path, name: str, digest: str | None, list_support: bool
+        self,
+        root: Path,
+        name: str,
+        digest: str | dict | None,
+        list_support: bool,
+        sample: dict | None = None,
     ):
         """A checkout whose backend-benchmark prints canned output and logs
         its invocations. With digest its weight-digests prints one image of
-        that digest; without, it has none, as a build of an earlier release."""
+        that digest, or with {component: digest} those images; without, it
+        has none, as a build of an earlier release. sample updates the fields
+        of every decode sample."""
         checkout = root / name
         (checkout / "build/engine-tests").mkdir(parents=True)
         (checkout / "build/splash.metallib").write_text("")
         if digest:
+            if isinstance(digest, str):
+                digest = {"target/layer-0.bin": digest}
             tool = checkout / "build" / weights.WEIGHT_DIGESTS
-            image = {"component": "target/layer-0.bin", "bytes": 1, "sha256": digest}
-            tool.write_text(f"#!/bin/sh\necho '{json.dumps([image])}'\n")
+            images = [
+                {"component": component, "bytes": 1, "sha256": sha256}
+                for component, sha256 in digest.items()
+            ]
+            tool.write_text(f"#!/bin/sh\necho '{json.dumps(images)}'\n")
             tool.chmod(0o755)
+        document = benchmark_document(build=name)
+        for row in document["decode_throughput"]["samples"]:
+            row.update(sample or {})
         usage = (
             "[--scenario NAME[,NAME...]]"
             if list_support
@@ -279,7 +294,7 @@ class BackendRegressionTests(unittest.TestCase):
             "scenarios = sys.argv[sys.argv.index('--scenario') + 1].split(',')\n"
             f"with open({str(root / 'calls.jsonl')!r}, 'a') as log:\n"
             f"    log.write(json.dumps([{name!r}, scenarios, os.environ.get('SPLASH_WEIGHT_CACHE')]) + '\\n')\n"
-            f"document = json.loads({json.dumps(json.dumps(benchmark_document(build=name)))})\n"
+            f"document = json.loads({json.dumps(json.dumps(document))})\n"
             "if 'decode' not in scenarios: document['decode_throughput']['samples'] = []\n"
             "if 'partial' not in scenarios: document['measurements'] = []\n"
             "print(json.dumps(document))\n"
@@ -288,8 +303,9 @@ class BackendRegressionTests(unittest.TestCase):
         return checkout
 
     @staticmethod
-    def run_main(root: Path) -> int:
-        """main on the fake checkouts under root and a legacy package."""
+    def run_main(root: Path, *options: str, environment=None) -> int:
+        """main on the fake checkouts under root and a legacy package, with
+        options and the variables of environment."""
         models = root / "models"
         package = models / "incoai/Qwen3.8-27B-Splash"
         package.mkdir(parents=True)
@@ -303,10 +319,12 @@ class BackendRegressionTests(unittest.TestCase):
             str(package),
             "--output-dir",
             str(root / "release"),
+            *options,
         ]
+        variables = {"SPLASH_WEIGHT_CACHE": str(root / "cache")} | (environment or {})
         with (
             mock.patch.object(smoke.model_artifacts, "MODELS", models),
-            mock.patch.dict(os.environ, {"SPLASH_WEIGHT_CACHE": str(root / "cache")}),
+            mock.patch.dict(os.environ, variables),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
@@ -405,6 +423,89 @@ class BackendRegressionTests(unittest.TestCase):
             self.fake_checkout(root, "candidate", None, True)
             with self.assertRaises(SystemExit):
                 self.run_main(root)
+
+    def test_only_the_images_an_expected_change_names_may_change(self):
+        a, b = "a" * 64, "b" * 64
+        moe = r"target/(layer|experts)-[0-9]+\.bin"
+        baseline = {"target/layer-0.bin": a, "target/head.bin": a}
+        moved = {"target/layer-0.bin": b, "target/experts-0.bin": b}
+        for options, environment, candidate, expected in (
+            # Unset, every difference fails.
+            ((), {"EXPECT_IMAGE_CHANGE": ""}, baseline | moved, False),
+            (("--expect-image-change", moe), {}, baseline | moved, True),
+            ((), {"EXPECT_IMAGE_CHANGE": moe}, baseline | moved, True),
+            # The head is not named, so it must keep its bytes and stay loaded.
+            (
+                ("--expect-image-change", moe),
+                {},
+                baseline | moved | {"target/head.bin": b},
+                False,
+            ),
+            (("--expect-image-change", moe), {}, moved, False),
+        ):
+            with (
+                self.subTest(options=options, environment=environment),
+                TemporaryDirectory() as directory,
+            ):
+                root = Path(directory).resolve()
+                self.fake_checkout(root, "baseline", baseline, True)
+                self.fake_checkout(root, "candidate", candidate, True)
+                self.assertEqual(
+                    self.run_main(root, *options, environment=environment),
+                    0 if expected else 1,
+                )
+                document = json.loads(
+                    (root / "release/backend-regression.json").read_text()
+                )
+                self.assertEqual(document["pass"], expected)
+                result = document["weights"]
+                self.assertEqual(result["pass"], expected)
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    regression.report(document)
+                if not options and not environment["EXPECT_IMAGE_CHANGE"]:
+                    self.assertEqual(result["expected_changes"], [])
+                    self.assertIn("weight bytes: 3 images FAIL", output.getvalue())
+                    continue
+                # The allowed changes are recorded and printed either way.
+                self.assertEqual(result["expect_image_change"], moe)
+                self.assertEqual(
+                    result["expected_changes"],
+                    [
+                        f"target/experts-0.bin: the baseline loaded nothing, the candidate {b}",
+                        f"target/layer-0.bin: the baseline loaded {a}, the candidate {b}",
+                    ],
+                )
+                self.assertIn(
+                    f"expected changes (EXPECT_IMAGE_CHANGE={moe}): "
+                    f"{result['expected_changes']}",
+                    output.getvalue(),
+                )
+                if not expected:
+                    self.assertEqual(len(result["failures"]), 1)
+                    self.assertIn("target/head.bin", result["failures"][0])
+
+    def test_an_expected_image_change_never_excuses_changed_outputs(self):
+        a, b = "a" * 64, "b" * 64
+        moe = r"target/(layer|experts)-[0-9]+\.bin"
+        changed = {"output_token_hash": "changed"}
+        for options, sample in (
+            ((), changed),
+            # Changed outputs may pass only with acceptance within 0.02.
+            (("--expect-output-change",), changed | {"accepted_draft_tokens": 30}),
+        ):
+            with self.subTest(options=options), TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                self.fake_checkout(root, "baseline", a, True)
+                self.fake_checkout(root, "candidate", b, True, sample=sample)
+                self.assertEqual(
+                    self.run_main(root, "--expect-image-change", moe, *options), 1
+                )
+                document = json.loads(
+                    (root / "release/backend-regression.json").read_text()
+                )
+                self.assertTrue(document["weights"]["pass"])
+                self.assertFalse(document["comparison"]["pass"])
+                self.assertFalse(document["pass"])
 
     def test_package_slug_names_results_by_selection(self):
         models = Path("/install/models")

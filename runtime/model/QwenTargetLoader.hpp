@@ -105,6 +105,9 @@ template <class Layout> struct PackedTargetFiles final {
 // an upstream source, in their format: per layer the input norm, mixer,
 // post-attention norm and the architecture's FFN through readFfn, then the
 // head and the token embedding. Weights is the architecture's weight struct.
+// A sparse MoE layer's routed experts are read from the image files.experts
+// gives, when files has one, else from the layer's file in file order; each
+// file is recorded once, in load order.
 template <class Weights, class Layout, class Files, class Format, class ReadFfn>
 [[nodiscard]] Weights
 readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files &&files,
@@ -113,6 +116,10 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
   Weights result;
   result.layout = layout;
   result.layers.reserve(layout.layers);
+  const auto record = [&](WeightFile &file) {
+    file.finish();
+    result.files.push_back(file.record());
+  };
 
   for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex) {
     const bool fullAttention = layout.isFullAttentionLayer(layerIndex);
@@ -121,9 +128,18 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
     layer.mixer = readQwenMixer(file, format, layout.mixerGeometry(), fullAttention);
     layer.postAttentionNorm = format.norm(file, layout.hiddenSize, "post-attention-norm");
-    readFfn(file, layer, format);
-    file.finish();
-    result.files.push_back(file.record());
+    if constexpr (Layout::ffnKind == QwenFfnKind::Dense) {
+      readFfn(file, layer, format);
+      record(file);
+    } else if constexpr (requires { files.experts(layerIndex); }) {
+      WeightFile experts = files.experts(layerIndex);
+      readFfn(file, experts, layer, format);
+      record(file);
+      record(experts);
+    } else {
+      readFfn(file, file, layer, format);
+      record(file);
+    }
   }
 
   {
@@ -191,8 +207,9 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
 }
 
 // Checks the layout and loads a target from its files. The architecture
-// reads its FFN through readFfn, called with the file, the layer and the
-// format.
+// reads its FFN through readFfn, called with the layer's file, for a sparse
+// MoE then the file of its routed experts (the layer's file again unless they
+// have an image of their own), the layer and the format.
 template <class Weights, class Layout, class ReadFfn>
 [[nodiscard]] Weights
 loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles<Layout> &files,

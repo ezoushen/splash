@@ -1,6 +1,8 @@
 import contextlib
 import copy
 import io
+import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -379,6 +381,135 @@ class HttpRegressionTests(unittest.TestCase):
         self.assertEqual(
             (summary["baseline_median"], summary["candidate_median"]), (1.5, 1.5)
         )
+
+    def run_main(self, root: Path, images: dict, *options: str) -> dict:
+        """main against fake servers of a baseline and a candidate build
+        under root whose weight-digests print images[version], {component:
+        sha256}; the saved document."""
+        builds = {}
+        for version, loaded in images.items():
+            build = root / version
+            (build / weights.WEIGHT_DIGESTS).parent.mkdir(parents=True)
+            (build / "splash").touch()
+            (build / "splash.metallib").touch()
+            rows = [
+                {"component": component, "bytes": 1, "sha256": sha256}
+                for component, sha256 in loaded.items()
+            ]
+            tool = build / weights.WEIGHT_DIGESTS
+            tool.write_text(f"#!/bin/sh\necho '{json.dumps(rows)}'\n")
+            tool.chmod(0o755)
+            builds[build / "splash"] = version
+        models = root / "models"
+        package = models / "incoai/Qwen3.8-27B-Splash"
+        (package / "tokenizer").mkdir(parents=True)
+        (package / "manifest.json").write_text("{}")
+
+        class Server:
+            def __init__(self, arguments, _environment):
+                self.version = builds[arguments.binary]
+
+            def wait_ready(self, _timeout):
+                return {
+                    "identity": {
+                        "cache": {
+                            "build_id": self.version,
+                            "loaded_model_layout_sha256": self.version,
+                        },
+                        "kv": {"format": "int8"},
+                    }
+                }
+
+            def close(self):
+                pass
+
+            def tail(self):
+                return ""
+
+        def measure(_server, _model, content, _tokens, scenario, context, _timeout):
+            return {
+                "scenario": scenario,
+                "context": context,
+                "prompt_sha256": benchmark.digest(content),
+                "response_sha256": "answer",
+                "usage": {"completion_tokens": 1},
+                "metrics": {"request_latency": {"ttft_ms": 10}},
+                "native_delta": {"decode_wall_ms": 10, "decode_output_tokens": 1},
+            }
+
+        output = root / "http-regression.json"
+        with (
+            mock.patch.object(smoke.model_artifacts, "MODELS", models),
+            mock.patch.object(smoke, "RealServer", Server),
+            mock.patch.object(smoke, "validate_status"),
+            mock.patch.object(benchmark, "measure", measure),
+            mock.patch("transformers.AutoTokenizer.from_pretrained"),
+            mock.patch.object(
+                benchmark,
+                "prompts",
+                lambda _tokenizer, contexts, samples, _nonce: {
+                    (sample, context): f"prompt {sample} {context}"
+                    for sample in range(samples)
+                    for context in contexts
+                },
+            ),
+            mock.patch.dict(os.environ, {"EXPECT_IMAGE_CHANGE": ""}),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            arguments = [
+                "--model",
+                "incoai/Qwen3.8-27B-Splash",
+                "--binary",
+                str(root / "candidate/splash"),
+                "--baseline-binary",
+                str(root / "baseline/splash"),
+                "--contexts",
+                "256",
+                "--samples",
+                "2",
+                "--output",
+                str(output),
+                *options,
+            ]
+            try:
+                benchmark.main(arguments)
+            except smoke.SmokeFailure:
+                pass
+        return json.loads(output.read_text())
+
+    def test_only_the_images_an_expected_change_names_may_change(self):
+        a, b = "a" * 64, "b" * 64
+        moe = r"target/(layer|experts)-[0-9]+\.bin"
+        baseline = {"target/layer-0.bin": a, "target/head.bin": a}
+        moved = baseline | {"target/layer-0.bin": b, "target/experts-0.bin": b}
+        for options, candidate, expected in (
+            ((), moved, False),
+            (("--expect-image-change", moe), moved, True),
+            (("--expect-image-change", moe), moved | {"target/head.bin": b}, False),
+        ):
+            with (
+                self.subTest(options=options, candidate=candidate),
+                TemporaryDirectory() as directory,
+            ):
+                document = self.run_main(
+                    Path(directory).resolve(),
+                    {"baseline": baseline, "candidate": candidate},
+                    *options,
+                )
+                self.assertEqual(document["correctness_pass"], expected)
+                self.assertEqual(document["weights"]["pass"], expected)
+                if expected:
+                    self.assertTrue(document["performance_pass"])
+                    self.assertEqual(
+                        document["weights"]["expected_changes"],
+                        [
+                            f"target/experts-0.bin: the baseline loaded nothing, the candidate {b}",
+                            f"target/layer-0.bin: the baseline loaded {a}, the candidate {b}",
+                        ],
+                    )
+                else:
+                    self.assertIn("weight bytes differ", document["error"])
 
 
 if __name__ == "__main__":

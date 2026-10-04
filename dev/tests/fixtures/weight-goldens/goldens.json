@@ -41,8 +41,10 @@
       "target/embedding.bin": "5bfea1223081c0b006d617ee0fc044517937a4cd9fe9503421537e8d8c459211"
     },
     "moe": {
-      "target/layer-0.bin": "5b9926e5cbd89f8c772ed8308abc1e4dae140a67e2c44cddbd4ce8e688dcda61",
-      "target/layer-1.bin": "76e65f55a4b9ed13103583bd44da12fe2dc4258584b82a7df3f0f7cb0aebae69",
+      "target/layer-0.bin": "167e05f4bf37eb48c2ad9d9cb547ca991e970e27cbd1ce0ddb7e87986b16333d",
+      "target/experts-0.bin": "6570bb78dfaba1e5fad4386b03508ad04d295298665f4eff3b3bb12f747f9776",
+      "target/layer-1.bin": "b28adf245c4505672d67909cc1039f64a7e1c16010abd2c998fcc21eb1d58045",
+      "target/experts-1.bin": "b74924460845444ac489a22c7ba47673668c3e622f82ff2766b583ec4ae28136",
       "target/head.bin": "25556e9c9b5c9629e2707cd4f90f82008a722cf82a64ec0dc97665ae242aefc6",
       "target/embedding.bin": "3623464c3b923b290f556b1a66612f9012c0e249d3d49982b13300003dd81edf"
     },

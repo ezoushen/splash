@@ -526,6 +526,7 @@ def main_args(**overrides):
             "persistent_cache": False,
             "cache_dir": None,
             "decode_share": None,
+            "share_weights": False,
             "max_image_pixels": images.MAX_PIXELS,
             "request_timeout": None,
             "queue_size": 1,
