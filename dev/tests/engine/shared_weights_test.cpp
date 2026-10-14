@@ -324,12 +324,14 @@ public:
 
   // The engine's reply to command.
   std::string ask(const std::string &command) {
-    std::fprintf(commands_, "%s\n", command.c_str());
-    std::fflush(commands_);
+    send(command);
     return reply();
   }
-
-private:
+  void send(const std::string &command) {
+    std::fprintf(commands_, "%s\n", command.c_str());
+    std::fflush(commands_);
+  }
+  // The engine's reply to the oldest command it has not answered.
   std::string reply() {
     char *line = nullptr;
     size_t capacity = 0;
@@ -341,6 +343,7 @@ private:
     return reply;
   }
 
+private:
   pid_t pid_ = -1;
   size_t slot_ = std::size(gEngines);
   FILE *commands_ = nullptr;
@@ -436,6 +439,21 @@ void testSecondProcessReceivesEveryImage(const Setup &setup) {
     require(written.at(component).digest == image.digest, component + " written beside others differs from alone");
     require(received.at(component).digest == image.digest, "a received " + component + " differs from alone");
   }
+}
+
+// Two processes that load one checkpoint at the same time hold one copy of
+// each image: one writes it and the other receives it.
+void testConcurrentLoadsWriteEachImageOnce(const Setup &setup) {
+  setup.checkpoint("base", targetTensors());
+  auto first = setup.engine(), second = setup.engine();
+  first->send("load base");
+  second->send("load base");
+  const Images one = targetImages(parseImages(first->reply())), other = targetImages(parseImages(second->reply()));
+  for (const auto &[component, image] : one)
+    require((image.origin == "written") != (other.at(component).origin == "written") &&
+                image.digest == other.at(component).digest,
+            "two processes that loaded " + component + " at once did not write it once: " + image.origin + " and " +
+                other.at(component).origin);
 }
 
 // A fine-tune that changes attention only receives the base's routed experts
@@ -829,6 +847,8 @@ int main(int argc, char **argv) {
     signal(SIGALRM, watchdog);
     alarm(120);
     testSecondProcessReceivesEveryImage(Setup(self, argv[1]));
+    alarm(120);
+    testConcurrentLoadsWriteEachImageOnce(Setup(self, argv[1]));
     alarm(120);
     testFineTuneSharesWhatMatches(Setup(self, argv[1]));
     alarm(120);
