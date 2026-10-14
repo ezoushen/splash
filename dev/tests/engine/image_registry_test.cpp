@@ -5,6 +5,7 @@
 // images are tested in shared_weights_test.cpp.
 #include "TestChecks.hpp"
 #include "model/ImageRegistry.hpp"
+#include "model/ImageRegistryInstrumentation.hpp"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -30,6 +31,7 @@ namespace {
 
 using splash::metal::MappedMemory;
 using splash::model::ImageRegistry;
+using splash::model::ImageRegistryInstrumentation;
 using splash::test::require;
 
 constexpr uint64_t kImageBytes = 3 * 16384 + 123;
@@ -337,16 +339,16 @@ void testLookupKeepsAJoinersPublishedHolder() {
   w.staging = open(w.staged.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
   require(w.staging != -1, "cannot create a joining process's staged file");
   window = &w;
-  ImageRegistry::setRemovalHook(joinerInTheWindow);
+  ImageRegistryInstrumentation::setRemovalHook(joinerInTheWindow);
   try {
     require(!lister.heldByAnother(keyOf('a'), kImageBytes), "an image was found in an empty registry");
   } catch (...) {
-    ImageRegistry::setRemovalHook(nullptr);
+    ImageRegistryInstrumentation::setRemovalHook(nullptr);
     if (w.joiner.joinable()) w.joiner.join();
     close(w.staging);
     throw;
   }
-  ImageRegistry::setRemovalHook(nullptr);
+  ImageRegistryInstrumentation::setRemovalHook(nullptr);
   w.joiner.join();
   close(w.staging);
   require(!std::filesystem::exists(stale), "a lookup left an ended process's holder file");
