@@ -98,6 +98,7 @@ access.
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
+| `--share-weights` | Off | Share weight memory with other Splash processes of this build, of this user, that load the same weights. See [shared weight images](#shared-weight-images). |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume's free space up to 32 GiB, a size such as `16G` sets the quota, `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--max-cache-disk-writes` | `0` (no limit) | The most the SSD cache writes a day, e.g. `200G`. See [SSD cache](#ssd-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts. See [persistent cache](#persistent-cache). |
@@ -1132,7 +1133,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
 | `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
-| `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
+| `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures`, `held_elsewhere_bytes` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, the restores that gave up for want of memory, and with `--share-weights` the bytes of the released images that other processes still hold (`0` while the weights are held; [shared weight images](#shared-weight-images)) |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |
@@ -1783,9 +1784,12 @@ images, and the restore loads it again in one tick more, after the last image
 
 #### Shared weight images
 
-`serve-native --share-weights on` (`off` by default, which creates no shared
-memory, registry, lock or digest table) lets the processes of one user that
-load the same images hold one copy of each (`SharedImages.hpp`). An image is
+`splash serve --share-weights` (a switch, off by default) passes
+`--share-weights on` to `serve-native`, which lets the processes of one user
+that load the same images hold one copy of each (`SharedImages.hpp`). Without
+it the engine is passed no option, loads exactly as before and creates no shared
+memory, registry, lock or digest table, and its status document has no field
+that only sharing adds. An image is
 keyed by the SHA-256 of the code that writes it, its plan, and the SHA-256 of
 every source byte it reads:
 
@@ -1848,6 +1852,45 @@ restore gives back only the images that came back. A holder that does not
 answer is passed over for the rest of a pass, a load or a restore, and asked
 again in the next.
 
+The registry directory and the digest tables' directory must be the user's own:
+a directory of this user's that is not a symbolic link and that no one else may
+read, write or search (`requirePrivateDirectory`, which creates a missing one
+with mode 0700). Sharing refuses any other (`refusing <path>: it must be a
+directory of this user's that no one else may use`) and never falls back to
+another place, so the engine does not start and `splash serve` reports that
+error with the engine's other start-up failures.
+
+After a release, the weights count the images that another process still
+holds, and `weights.held_elsewhere_bytes` in the status document (with
+`POST /v1/memory/release`'s answer) reports their bytes, as the registry
+answered when the release let go of them and less the images a restore has
+since mapped again. That is memory a release did not give back to macOS: the
+other process keeps it, and the figure shows no change if that process ends
+afterwards, until the next release. A process that shares nothing reports no
+such field.
+
+Trust: the processes that share images are those of one user, which trust one
+another: any of them could write the memory it serves, as it could write the
+others' memory anyway, and a receiver's descriptor stays writable although it
+maps the image read-only. They share an image only when their writers' code is
+the same, which holds for servers of one build; that identity does not cover the
+system's libraries and frameworks or the toolchain the build was made with. The
+files in the registry and the digest tables decide which bytes an image holds,
+which is why their directories are checked as above.
+
+Costs: the first start after an installation reads each source file once more,
+for its digests. A start, and a restore after a release, that needs an image
+another process is writing waits for that write, and one that finds a stopped
+process waits as above. Admission and the memory plan count every image in full
+in every process, so each process's `--max-memory` must cover its weights as
+without sharing; macOS charges a shared image's memory to the process that wrote
+it, not to those that map it, as `footprint` and Activity Monitor show. A release asks the
+holders for each image to count what they hold, a lookup per image on the
+engine's tick. The registry's files stay in the user's temporary directory,
+which each process marks as in use every hour so that a cleaner of temporary
+files leaves them; the per-image lock files, a few bytes each, stay and are
+created again when one is missing.
+
 #### Explicit weights release
 
 `POST /v1/memory/release` asks the engine for the same release without waiting
@@ -1862,7 +1905,9 @@ take the weights' memory back on demand instead of on a timer. The server
 answers `200` when the document says the weights are released and not being
 restored (`weights.released` and not `weights.restoring`, as a restore leaves
 them released until its last image is back), whether this request released
-them or they already were. An engine serving a request or restoring its weights
+them or they already were; with `--share-weights` its `weights` also say how
+many bytes of what was released other processes still hold
+(`held_elsewhere_bytes`), which macOS did not get back. An engine serving a request or restoring its weights
 keeps them, and the server answers `409 engine_busy`. An engine that does not
 answer within 5 s, as while it runs a long command, gets `503 engine_busy`, and
 while the engine restarts or the server stops the release gets
