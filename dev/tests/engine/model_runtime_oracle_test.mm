@@ -2663,7 +2663,7 @@ void requireCapturedStateKeepsItsImageRows(model::Runtime &executor,
 void requireImageScoreReadsItsImage(model::Runtime &executor) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
-  std::vector<uint32_t> prompt(128);
+  std::vector<uint32_t> prompt(120);
   for (uint32_t index = 0; index < prompt.size(); ++index)
     prompt[index] = 1 + index;
   const std::vector<uint32_t> pages = pageRange(120, 4);
