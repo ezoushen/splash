@@ -741,6 +741,20 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
   }
 }
 
+std::map<std::string, std::string, std::less<>> recordedSourceDigests(const std::filesystem::path &root) {
+  @autoreleasepool {
+    std::map<std::string, std::string, std::less<>> result;
+    NSDictionary *files = requireObject(readObject(root / "model.json", "resolved model"), @"files",
+                                        "resolved model files");
+    for (NSString *path in files) {
+      id entry = files[path];
+      id digest = [entry isKindOfClass:[NSDictionary class]] ? entry[@"digest"] : nil;
+      if ([digest isKindOfClass:[NSString class]]) result[path.UTF8String] = static_cast<NSString *>(digest).UTF8String;
+    }
+    return result;
+  }
+}
+
 std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
                                             const std::filesystem::path &config,
                                             const std::optional<std::filesystem::path> &ggufMetadata,

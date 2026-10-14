@@ -24,6 +24,7 @@ class AneFfn;
 namespace splash::model {
 
 class QwenStateStorage;
+class SharedImages;
 class VisionLoader;
 
 using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
@@ -100,10 +101,13 @@ void requireCompatibleModel(const LoadedModel &model);
 
 // Production loading is selected by the validated descriptor. There
 // is one shared engine and DFlash controller; only model execution differs.
+// With shared, the images a loader describes are shared with the other
+// processes that share them (WeightImages).
 [[nodiscard]] LoadedModel
 loadModel(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor);
+                 const ModelDescriptor &descriptor,
+                 std::shared_ptr<SharedImages> shared = nullptr);
 
 // The FFN layers of a dense target, which the prefill FFN's Neural Engine
 // split (ops::AneFfn) may take; none for another target.

@@ -1,6 +1,7 @@
 #include "model/WeightImages.hpp"
 
 #include "model/Bfloat16.hpp"
+#include "model/SharedImages.hpp"
 
 #include <dispatch/dispatch.h>
 
@@ -16,12 +17,29 @@
 
 namespace splash::model {
 
+WeightImages::WeightImages(metal::MetalBackend &backend, std::string contentIdentity,
+                           std::shared_ptr<SharedImages> shared) noexcept
+    : backend_(&backend), contentIdentity_(std::move(contentIdentity)), shared_(std::move(shared)) {}
+
+WeightImages::~WeightImages() = default;
+
 WeightFile WeightImages::load(ImagePlan image) {
   if (released_) throw std::logic_error("weights load while their memory is released");
-  metal::MetalBuffer buffer = backend_->allocateBuffer(image.bytes, metal::BufferStorage::Shared, image.component);
-  image.write(contentsOf(buffer), buffer);
+  metal::MetalBuffer buffer;
+  ImageOrigin origin = ImageOrigin::Private;
+  const std::string key = shared_ ? shared_->key(image) : std::string();
+  if (key.empty()) {
+    buffer = backend_->allocateBuffer(image.bytes, metal::BufferStorage::Shared, image.component);
+    image.write(contentsOf(buffer), buffer);
+  } else {
+    const bool written = shared_->acquire(
+        key, image.bytes,
+        [&](metal::MappedMemory memory) { buffer = backend_->mapBuffer(std::move(memory), image.component); },
+        [&] { image.write(contentsOf(buffer), buffer); });
+    origin = written ? ImageOrigin::Written : ImageOrigin::Received;
+  }
   WeightFile file(*backend_, buffer, image.component, image.magic, image.layer, image.type, contentIdentity_);
-  images_.push_back({std::move(image.component), std::move(buffer), std::move(image.write)});
+  images_.push_back({std::move(image.component), std::move(buffer), std::move(image.write), origin});
   return file;
 }
 
@@ -46,6 +64,8 @@ bool WeightImages::restore(const metal::AllocationAdmission &admit) {
         backend_->releaseMemory(image.buffer);
         throw;
       }
+      // Memory of this process alone, whatever the image was before.
+      image.origin = ImageOrigin::Private;
     });
     if (!admitted)
       throw metal::MetalAllocationError("unable to restore " + image.component + ": " +
@@ -61,7 +81,7 @@ std::vector<WeightImages::Contents> WeightImages::contents() const {
   std::vector<Contents> result;
   for (const Image &image : images_) {
     const auto *bytes = static_cast<const uint8_t *>(image.buffer.contents());
-    result.push_back({image.component, {bytes, bytes ? image.buffer.sizeBytes() : 0}});
+    result.push_back({image.component, {bytes, bytes ? image.buffer.sizeBytes() : 0}, image.origin});
   }
   return result;
 }

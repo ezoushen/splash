@@ -163,6 +163,17 @@ private:
   uint64_t cursor_ = 0;
 };
 
+// What an image's key covers beside the code that writes it (SharedImages):
+// the text that states each plan field writeGgufImage's output depends on,
+// and the source bytes it reads, in the order the text names them. Names and
+// offsets in the source files are in neither, so the same bytes in another
+// file are the same image.
+struct Description {
+  std::string text;
+  std::vector<SourceBytes> sources;
+};
+[[nodiscard]] Description describe(const Image &image);
+
 // The target geometry a GGUF's metadata declares, its architecture included,
 // with the rotary embedding and norms the kernels compute: the RoPE base and
 // rotated dimensions, the RMS epsilon and no RoPE scaling. planImages checks

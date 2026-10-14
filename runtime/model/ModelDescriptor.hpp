@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -65,6 +67,12 @@ struct ModelDescriptor final {
                                                   VisionSource visionSource);
 [[nodiscard]] ModelDescriptor
 inspectModelRoot(const std::filesystem::path &root);
+
+// The content digest the installation's record (model.json) gives each of
+// its files, by path relative to root; a file whose entry has none is left
+// out.
+[[nodiscard]] std::map<std::string, std::string, std::less<>>
+recordedSourceDigests(const std::filesystem::path &root);
 
 // The family of an upstream model's configuration, checked by the rules
 // inspectModelRoot holds its assembly to: config, the target's config.json

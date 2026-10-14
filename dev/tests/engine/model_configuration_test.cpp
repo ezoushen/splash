@@ -139,6 +139,26 @@ void testSources() {
           "a descriptor without a source was valid");
 }
 
+// The content digest the record gives each file of the model, by its path
+// below the model's directory, is what shared weights name a source file's
+// digest table by: a file whose entry has no digest has none.
+void testRecordedSourceDigests() {
+  const test::TemporaryDirectory root("splash-recorded-digests");
+  const std::string digest(40, 'a'), other(64, 'b');
+  test::writeFile(root.path() / "model.json",
+                  R"({"version":1,"model":"community/fine-tune","target_format":"mlx-affine",)"
+                  R"("vision_format":"none","files":{"target/model.safetensors":{"path":"/hub/x","bytes":1,)"
+                  R"("digest":")" + digest + R"("},"draft/model.safetensors":{"digest":")" + other +
+                      R"("},"config.json":{"path":"/hub/c"},"draft/config.json":"/hub/d"}})");
+  const auto recorded = model::recordedSourceDigests(root.path());
+  require(recorded.size() == 2 && recorded.at("target/model.safetensors") == digest &&
+              recorded.at("draft/model.safetensors") == other,
+          "the digests a model's record gives its files were not read as recorded");
+  test::writeFile(root.path() / "model.json", R"({"version":1,"model":"community/fine-tune"})");
+  rejects([&] { static_cast<void>(model::recordedSourceDigests(root.path())); }, "files",
+          "a record without files gave digests");
+}
+
 // Each config is checked where the descriptor is made, once, and each number
 // by one rule: a JSON number, never a boolean, of the model's value, which a
 // whole number may also spell as a float.
@@ -573,11 +593,12 @@ int main(int argc, char **argv) {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
     testFamilies(argv[1]);
     testSources();
+    testRecordedSourceDigests();
     testOneRulePerValue(argv[1]);
     testQuantization(argv[1]);
     testVisionConfig(argv[1]);
     testConfigurationCheck(argv[1]);
-    std::cout << "model configuration: both families, sources, one rule per value, quantization, vision, the "
+    std::cout << "model configuration: both families, sources, recorded digests, one rule per value, quantization, vision, the "
                  "installer's check PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
