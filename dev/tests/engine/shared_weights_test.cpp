@@ -1460,6 +1460,37 @@ void testUnsharedCreatesNothing(const Setup &setup) {
 }
 
 
+// Sharing takes a registry or digest table directory only if it is this
+// user's own and no one else's: not a symbolic link, nor a directory others
+// may write, read or search. It refuses any other with an error that names
+// it, rather than sharing through it or through another place.
+void testForeignDirectoriesAreRefused(const Setup &setup) {
+  const std::filesystem::path base = setup.registry().parent_path();
+  const auto directory = [&](const std::string &name, mode_t mode) {
+    const std::filesystem::path path = base / name;
+    require(mkdir(path.c_str(), 0700) == 0 && chmod(path.c_str(), mode) == 0, "cannot create a directory");
+    return path;
+  };
+  const std::filesystem::path own = directory("own", 0700), link = base / "link";
+  std::filesystem::create_directory_symlink(own, link);
+  const auto config = [&](bool registry, const std::filesystem::path &path) {
+    model::SharedImagesConfig result;
+    result.registry = registry ? path : base / "registry";
+    result.digestTables = registry ? setup.tables() : path;
+    result.writerIdentity = "shared-weights-test";
+    return result;
+  };
+  for (const bool registry : {true, false}) {
+    const std::string name = registry ? "registry" : "tables";
+    for (const std::filesystem::path &foreign :
+         {link, directory(name + "-0777", 0777), directory(name + "-0755", 0755), directory(name + "-0750", 0750)})
+      splash::test::rejects([&] { model::SharedImages shared(config(registry, foreign)); },
+                            "refusing " + foreign.string(),
+                            (registry ? "a registry at " : "digest tables at ") + foreign.string() + " were used");
+    model::SharedImages accepted(config(registry, directory(name + "-0700", 0700)));
+  }
+}
+
 // An image written from a file whose digest the installation did not record
 // cannot be keyed: it is the process's own, as without sharing, though the
 // process shares the images that it can key.
@@ -1955,6 +1986,7 @@ int main(int argc, char **argv) {
     if (selected("stopped writer", 120)) testStoppedWriterIsWaitedForBoundedly(Setup(self, argv[1]));
     if (selected("killed holder", 120)) testKilledHolderLeavesOthersServing(Setup(self, argv[1]));
     if (selected("stopped holder", 180)) testStoppedHolderIsPassedOverOncePerPass(Setup(self, argv[1]));
+    if (selected("foreign directories", 120)) testForeignDirectoriesAreRefused(Setup(self, argv[1]));
     if (selected("unrecorded", 120)) testUnrecordedSourcesAreNotShared(Setup(self, argv[1]));
     if (selected("running code", 120)) testWriterIsTheRunningCode(Setup(self, argv[1]));
     if (selected("plan keys", 120)) testKeyCoversThePlan(Setup(self, argv[1]));
