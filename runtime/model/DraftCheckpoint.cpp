@@ -114,15 +114,16 @@ DraftCheckpointLoader::DraftCheckpointLoader(metal::MetalBackend &backend, Weigh
   planned_->images = planDraftImages(planned_->checkpoint, layout);
 }
 
-WeightFile DraftCheckpointLoader::open(size_t index) {
-  const gguf::Image &plan = planned_->images[index];
-  return images_.load({"draft/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
-                       [&backend = backend_, planned = planned_, index](std::span<uint8_t>,
-                                                                         const metal::MetalBuffer &buffer) {
-                         writeGgufImage(backend, buffer, planned->images[index]);
-                         planned->checkpoint.checkUnchanged();
-                       }});
+ImagePlan DraftCheckpointLoader::image(size_t index) const {
+  const gguf::Image &plan = planned_->images.at(index);
+  return {"draft/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
+          [&backend = backend_, planned = planned_, index](std::span<uint8_t>, const metal::MetalBuffer &buffer) {
+            writeGgufImage(backend, buffer, planned->images[index]);
+            planned->checkpoint.checkUnchanged();
+          }};
 }
+
+WeightFile DraftCheckpointLoader::open(size_t index) { return images_.load(image(index)); }
 
 WeightFile DraftCheckpointLoader::layer(uint32_t index) {
   if (index >= planned_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
