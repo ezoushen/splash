@@ -1793,10 +1793,14 @@ every source byte it reads:
   of its executable, as mapped) and the metallib bytes it loaded, which write
   every image of the `MDGG0001` layout on the GPU. Files that replace them on
   disk after the start change nothing.
-- The plan is `gguf::describe(image)`: every field of the image's fills,
-  copies and repacks that decides what `writeGgufImage` writes, and which
-  tensors, rows and scales it reads. Names and offsets in the source files are
-  not in it.
+- The plan is `gguf::describe(image)` for the images of a target, a GGUF's
+  and a safetensors checkpoint's (MLX, Model Optimizer or compressed-tensors),
+  and of a draft: every field of the image's fills, copies and repacks that
+  decides what `writeGgufImage` writes, and which tensors, rows and scales it
+  reads. The vision tower's (`VisionLoader::image`) is its sections' sizes,
+  padding and offsets, whether its patch embedding is reordered, and the dtype
+  of each tensor it converts. Names and offsets in the source files are not in
+  either.
 - A source byte range's digest is the SHA-256 of the SHA-256s of its 4 MiB
   chunks (`TensorDigests`). A table per source file, named by the digest the
   installation's `model.json` records for it and kept under
@@ -1806,10 +1810,10 @@ every source byte it reads:
 
 The same tensors in another file or at other offsets are the same image, so a
 fine-tune's unchanged routed experts (`experts-N`), embedding and head are its
-base model's, and its changed layers are its own. Only the images of
-safetensors targets are shared so far; an image whose loader does not describe
-it, or that reads a file without a recorded digest, is written into memory of
-the process alone.
+base model's, and its changed layers are its own. Every loader's images are
+shared: a safetensors or a GGUF target's, a draft's and a vision tower's, from
+an MLX checkpoint or a GGUF mmproj. An image that reads a file without a
+recorded digest is written into memory of the process alone.
 
 A shared image lives in a POSIX shared-memory object whose name is removed as
 it is created, so it lasts as long as some process maps it or holds its
