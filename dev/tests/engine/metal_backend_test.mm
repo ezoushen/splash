@@ -9,6 +9,7 @@
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -49,6 +50,7 @@ using splash::metal::EventStep;
 using splash::metal::HostStepGpu;
 using splash::metal::HostStepTiming;
 using splash::metal::IndirectGrid;
+using splash::metal::MappedMemory;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
 using splash::metal::SharedEvent;
@@ -1315,6 +1317,92 @@ void wrappedMemory(const std::string &metallibPath) {
     std::cout << "PASS wrapped memory\n";
 }
 
+// Pages mapped for the test, which count their own unmapping.
+struct TestMapping {
+    void *address = nullptr;
+    uint64_t pages = 0;
+};
+
+TestMapping mapPages(uint64_t pages, uint32_t first) {
+    const uint64_t page = static_cast<uint64_t>(getpagesize());
+    void *address = mmap(nullptr, pages * page, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    require(address != MAP_FAILED, "could not map pages");
+    *static_cast<uint32_t *>(address) = first;
+    return {address, pages};
+}
+
+// Memory its owner mapped, made a buffer without a copy: kernels and the CPU
+// see the same bytes and the accounting counts them. Releasing the buffer's
+// memory unmaps it, a restore over a new mapping gives the buffer that
+// mapping's bytes, and the last release of the buffer unmaps what it holds.
+// Memory the backend refuses is unmapped at once. Only the owner of memory
+// wrapped from elsewhere (wrappedMemory) can release it.
+void mappedMemory(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    const uint64_t page = static_cast<uint64_t>(getpagesize());
+    std::atomic<unsigned> unmaps{0};
+    const auto memory = [&](const TestMapping &mapping, uint64_t bytes) {
+        return MappedMemory{mapping.address, bytes, [&unmaps, mapping, page] {
+            ++unmaps;
+            munmap(mapping.address, mapping.pages * page);
+        }};
+    };
+    const auto waitFor = [&](unsigned count) {
+        for (int tries = 0; tries < 200 && unmaps != count; ++tries)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        return unmaps == count;
+    };
+    const uint32_t count = 1, increment = 7;
+    const auto add = [&](const MetalBuffer &buffer) {
+        (void)backend.submit({"test_add_u32", {{0, backend.view(buffer, 0, sizeof(uint32_t))}},
+                              {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+                              {1, 1, 1}, {1, 1, 1}});
+    };
+
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    const TestMapping first = mapPages(2, 5);
+    const uint64_t bytes = 2 * page - 16;
+    MetalBuffer buffer = backend.mapBuffer(memory(first, bytes), "mapped pages");
+    require(buffer.contents() == first.address && buffer.sizeBytes() == bytes &&
+                backend.memoryStats().allocatedBytes > before,
+            "a buffer over mapped memory is not that memory or is not counted");
+    const uint64_t counted = backend.memoryStats().allocatedBytes - before;
+    add(buffer);
+    require(*static_cast<uint32_t *>(first.address) == 12, "a kernel did not write the mapped memory");
+    require(unmaps == 0, "mapped memory was unmapped while its buffer holds it");
+
+    backend.releaseMemory(buffer);
+    require(!buffer.contents() && backend.memoryStats().allocatedBytes == before,
+            "released mapped memory kept its contents or its accounting");
+    require(waitFor(1), "released mapped memory was not unmapped");
+
+    const TestMapping second = mapPages(2, 40);
+    rejects([&] { backend.restoreMemory(buffer, memory(second, bytes - 16)); }, "buffer's length",
+            "memory of another length was restored");
+    require(waitFor(2), "memory refused for its length was not unmapped");
+    const TestMapping third = mapPages(2, 40);
+    backend.restoreMemory(buffer, memory(third, bytes));
+    require(buffer.contents() == third.address && *static_cast<uint32_t *>(third.address) == 40 &&
+                backend.memoryStats().allocatedBytes == before + counted,
+            "a restored buffer does not read its new mapping or is not counted");
+    add(buffer);
+    require(*static_cast<uint32_t *>(third.address) == 47, "a kernel did not write the restored mapping");
+
+    const TestMapping fourth = mapPages(2, 0);
+    rejects([&] { backend.restoreMemory(buffer, memory(fourth, bytes)); }, "not released",
+            "memory was restored over memory that was not released");
+    require(waitFor(3), "memory refused for a buffer that holds memory was not unmapped");
+    buffer = {};
+    require(waitFor(4), "the last release of a buffer did not unmap its memory");
+    require(backend.memoryStats().allocatedBytes == before, "a released buffer left its accounting");
+
+    const TestMapping empty = mapPages(1, 0);
+    rejects([&] { (void)backend.mapBuffer(memory(empty, 0), ""); }, "must be positive",
+            "an empty mapping was made a buffer");
+    require(waitFor(5), "an empty mapping was not unmapped");
+    std::cout << "PASS mapped memory\n";
+}
+
 // notify() calls back once, when the event reaches its value, and promptly
 // for a value already reached, never on the thread that asked; a signal below
 // the event's value leaves it as it is.
@@ -2422,6 +2510,7 @@ int main(int argc, const char *argv[]) {
             infiniteKeepAliveHoldsResidency(argv[1]);
             releasedMemory(argv[1]);
             wrappedMemory(argv[1]);
+            mappedMemory(argv[1]);
             sharedEventNotifies(argv[1]);
             eventSteps(argv[1]);
             eventPairsRunInOrder(argv[1]);
