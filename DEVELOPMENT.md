@@ -3545,9 +3545,19 @@ the other. Per model, `release-check`:
   twice the run's own ABBA spread, a spread above 5% fails as inconclusive,
   and this build's
   memory plan must hold, without the Neural Engine split, at least the
-  context the baseline's holds without it. `ANE_FFN_SHARE=SHARE` runs
-  every round at that share instead, in each build whose benchmark takes one
-  (0: the GPU alone); a baseline whose benchmark takes none must report none.
+  context the baseline's holds without it. A change that means new image bytes
+  follows the procedure of the goldens README ([Weight loading](#weight-loading)),
+  and `EXPECT_IMAGE_CHANGE` then names the images that change, a regular
+  expression that must match a component's whole name: those may differ or be
+  loaded by one build only, and are recorded in `backend-regression.json` and
+  printed; any other image must keep its bytes, and outputs and acceptance
+  decide as before (`EXPECT_IMAGE_CHANGE=1` instead reports every image that
+  differs and fails on none, for a change of the image layout). A MoE target
+  whose routed experts moved into `target/experts-N.bin` is compared with
+  `EXPECT_IMAGE_CHANGE='target/(layer|experts)-[0-9]+\.bin'`.
+  `ANE_FFN_SHARE=SHARE` runs every round at that share instead, in each build
+  whose benchmark takes one (0: the GPU alone); a baseline whose benchmark
+  takes none must report none.
 
 Where the Mac's memory cannot hold a model's weight images, or its largest
 Metal buffer cannot hold one of them, as for Qwen3.8-Flash-Next,
@@ -3674,8 +3684,10 @@ times, so its greedy output can differ between runs (see [drafts](#drafts)).
 Both rounds pass the option to their engine, so a MoE comparison needs a
 baseline built from a checkout that takes it; an older baseline cannot run one.
 It starts isolated servers in ABBA order, compares matched cold, exact-prefix
-and decode requests by the release check's speed rule and weight bytes (decode
-by `metrics.decode_cycle_ms` per output token, so host work between commands
+and decode requests by the release check's speed rule and weight bytes
+(`--expect-image-change [REGEX]` or `EXPECT_IMAGE_CHANGE`, as in the
+[Release check](#release-check); decode by `metrics.decode_cycle_ms` per output
+token, so host work between commands
 counts), and saves
 `build/release/http-regression.json`. With `--burst N` it sends N requests of
 each context at once instead, 16 output tokens each, and reports each build's

@@ -335,7 +335,7 @@ class BackendRegressionTests(unittest.TestCase):
         self,
         root: Path,
         name: str,
-        digest: str,
+        digest: str | dict,
         list_support: bool,
         share=None,
         honours_share=True,
@@ -345,15 +345,18 @@ class BackendRegressionTests(unittest.TestCase):
         minimum_rows=832,
         earlier=False,
         streams=True,
+        sample: dict | None = None,
     ):
         """A checkout whose backend-benchmark prints canned output and logs
-        its invocations. Its weight-digests prints one image of digest, logs
-        the arguments after its library in digests.log, and names
-        --expert-memory and --ple-memory in its usage with streams; a
-        build of an earlier release (earlier) has none, and its benchmark
-        prepares that image into its weight cache instead. Its benchmark takes a list of scenarios with list_support, the short
-        and transcripts scenarios among them with short and transcripts too,
-        and serves context tokens. With a
+        its invocations. Its weight-digests prints one image of digest, or
+        with {component: digest} those images, logs the arguments after its
+        library in digests.log, and names --expert-memory and --ple-memory in
+        its usage with streams; a build of an earlier release (earlier) has
+        none, and its benchmark prepares that image into its weight cache
+        instead. sample updates the fields of every decode sample. Its
+        benchmark takes a list of scenarios with list_support, the short and
+        transcripts scenarios among them with short and transcripts too, and
+        serves context tokens. With a
         share it has the Neural Engine split: it reports that share and
         minimum_rows as calibrated, or runs the share --ane-ffn-share gives
         and the rows --ane-ffn-minimum-rows gives, else 512, unless
@@ -366,14 +369,20 @@ class BackendRegressionTests(unittest.TestCase):
             (checkout / "build" / weights.IDENTITY_HEADER).write_text("")
         else:
             tool = checkout / "build" / weights.WEIGHT_DIGESTS
-            image = {"component": "target/layer-0.bin", "bytes": 1, "sha256": digest}
+            loaded = (
+                digest if isinstance(digest, dict) else {"target/layer-0.bin": digest}
+            )
+            images = [
+                {"component": component, "bytes": 1, "sha256": sha256}
+                for component, sha256 in loaded.items()
+            ]
             options = " [--expert-memory SIZE] [--ple-memory SIZE]" if streams else ""
             tool.write_text(
                 "#!/bin/sh\n"
                 "test $# -gt 0 || { echo 'usage: weight-digests METALLIB "
                 f"MODEL_DIRECTORY{options}' >&2; exit 2; }}\n"
                 f"shift; echo {name} \"$@\" >> '{root / 'digests.log'}'\n"
-                f"echo '{json.dumps([image])}'\n"
+                f"echo '{json.dumps(images)}'\n"
             )
             tool.chmod(0o755)
         usage = (
@@ -391,6 +400,8 @@ class BackendRegressionTests(unittest.TestCase):
             )
             usage += f"\n  NAME: {names}, context or exact"
         document = benchmark_document(build=name)
+        for row in document["decode_throughput"]["samples"]:
+            row.update(sample or {})
         document["max_context_tokens"] = document["no_ane_context_tokens"] = context
         given = (
             "option = lambda name: sys.argv[sys.argv.index(name) + 1] "
@@ -442,9 +453,9 @@ class BackendRegressionTests(unittest.TestCase):
         return checkout
 
     @staticmethod
-    def run_main(root: Path, *options: str) -> int:
-        """main with these options on the fake checkouts under root and an
-        installed model."""
+    def run_main(root: Path, *options: str, environment=None) -> int:
+        """main with these options and the variables of environment on the
+        fake checkouts under root and an installed model."""
         models = root / "models"
         assembly = models / ".resolved/assembly"
         assembly.mkdir(parents=True)
@@ -463,9 +474,10 @@ class BackendRegressionTests(unittest.TestCase):
             str(root / "release"),
             *options,
         ]
+        variables = {"SPLASH_WEIGHT_CACHE": str(root / "cache")} | (environment or {})
         with (
             mock.patch.object(smoke.model_artifacts, "MODELS", models),
-            mock.patch.dict(os.environ, {"SPLASH_WEIGHT_CACHE": str(root / "cache")}),
+            mock.patch.dict(os.environ, variables),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
@@ -671,6 +683,89 @@ class BackendRegressionTests(unittest.TestCase):
                     errors.getvalue(),
                 )
                 self.assertEqual(self.run_main(root), 0)
+
+    def test_only_the_images_an_expected_change_names_may_change(self):
+        a, b = "a" * 64, "b" * 64
+        moe = r"target/(layer|experts)-[0-9]+\.bin"
+        baseline = {"target/layer-0.bin": a, "target/head.bin": a}
+        moved = {"target/layer-0.bin": b, "target/experts-0.bin": b}
+        for options, environment, candidate, expected in (
+            # Unset, every difference fails.
+            ((), {"EXPECT_IMAGE_CHANGE": ""}, baseline | moved, False),
+            (("--expect-image-change", moe), {}, baseline | moved, True),
+            ((), {"EXPECT_IMAGE_CHANGE": moe}, baseline | moved, True),
+            # The head is not named, so it must keep its bytes and stay loaded.
+            (
+                ("--expect-image-change", moe),
+                {},
+                baseline | moved | {"target/head.bin": b},
+                False,
+            ),
+            (("--expect-image-change", moe), {}, moved, False),
+        ):
+            with (
+                self.subTest(options=options, environment=environment),
+                TemporaryDirectory() as directory,
+            ):
+                root = Path(directory).resolve()
+                self.fake_checkout(root, "baseline", baseline, True)
+                self.fake_checkout(root, "candidate", candidate, True)
+                self.assertEqual(
+                    self.run_main(root, *options, environment=environment),
+                    0 if expected else 1,
+                )
+                document = json.loads(
+                    (root / "release/backend-regression.json").read_text()
+                )
+                self.assertEqual(document["pass"], expected)
+                result = document["weights"]
+                self.assertEqual(result["pass"], expected)
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    regression.report(document)
+                if not options and not environment["EXPECT_IMAGE_CHANGE"]:
+                    self.assertEqual(result["expected_changes"], [])
+                    self.assertIn("weight bytes: 3 images FAIL", output.getvalue())
+                    continue
+                # The allowed changes are recorded and printed either way.
+                self.assertEqual(result["expect_image_change"], moe)
+                self.assertEqual(
+                    result["expected_changes"],
+                    [
+                        f"target/experts-0.bin: the baseline loaded nothing, the candidate {b}",
+                        f"target/layer-0.bin: the baseline loaded {a}, the candidate {b}",
+                    ],
+                )
+                self.assertIn(
+                    f"expected changes (EXPECT_IMAGE_CHANGE={moe}): "
+                    f"{result['expected_changes']}",
+                    output.getvalue(),
+                )
+                if not expected:
+                    self.assertEqual(len(result["failures"]), 1)
+                    self.assertIn("target/head.bin", result["failures"][0])
+
+    def test_an_expected_image_change_never_excuses_changed_outputs(self):
+        a, b = "a" * 64, "b" * 64
+        moe = r"target/(layer|experts)-[0-9]+\.bin"
+        changed = {"output_token_hash": "changed"}
+        for options, sample in (
+            ((), changed),
+            # Changed outputs may pass only with acceptance within 0.02.
+            (("--expect-output-change",), changed | {"accepted_draft_tokens": 30}),
+        ):
+            with self.subTest(options=options), TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                self.fake_checkout(root, "baseline", a, True)
+                self.fake_checkout(root, "candidate", b, True, sample=sample)
+                self.assertEqual(
+                    self.run_main(root, "--expect-image-change", moe, *options), 1
+                )
+                document = json.loads(
+                    (root / "release/backend-regression.json").read_text()
+                )
+                self.assertTrue(document["weights"]["pass"])
+                self.assertFalse(document["comparison"]["pass"])
+                self.assertFalse(document["pass"])
 
     def test_later_rounds_run_the_first_reported_ane_ffn_split(self):
         calibrated = 1 - 24 / 34
