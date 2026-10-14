@@ -291,6 +291,69 @@ void testWriterLocksAreKeptApart() {
   close(taken);
 }
 
+// A lookup that finds a process ended removes only what that process left. A
+// joining process's staged file that the lookup locked in the moment between
+// the file's creation and its lock is such a file, and the joiner then waits
+// for the lock: it gets it as soon as the lookup lets it go. The joiner here
+// is the test, which takes that part at the file level, and the hook holds
+// the lookup, at the first process it finds ended (the lookup visits the
+// names in order), between finding it ended and removing its files, the
+// window in which the joiner could publish. A joiner that published must
+// still be in the registry afterwards: either it did not get past the
+// lookup's removal, and joins again, or the lookup left its file.
+struct JoinerInTheWindow final {
+  std::filesystem::path staged;
+  std::filesystem::path published;
+  std::thread joiner;
+  std::atomic<bool> renamed{false};
+  std::atomic<bool> didPublish{false};
+  int staging = -1;
+};
+JoinerInTheWindow *window = nullptr;
+
+void joinerInTheWindow() {
+  JoinerInTheWindow &w = *window;
+  if (w.joiner.joinable()) return;
+  w.joiner = std::thread([&w] {
+    if (flock(w.staging, LOCK_EX) != 0) return;
+    w.didPublish = rename(w.staged.c_str(), w.published.c_str()) == 0;
+    w.renamed = true;
+  });
+  // The joiner gets the lock at once if the lookup let it go; otherwise it
+  // is still waiting when the wait ends.
+  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+  while (!w.renamed && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
+void testLookupKeepsAJoinersPublishedHolder() {
+  const Directory directory;
+  ImageRegistry lister(directory.registry(), std::chrono::seconds(10));
+  const std::filesystem::path stale = directory.registry() / "9-ended.holder";
+  require(close(open(stale.c_str(), O_RDWR | O_CREAT, 0600)) == 0, "cannot create an ended process's holder file");
+  JoinerInTheWindow w;
+  w.staged = directory.registry() / "2-joining.new";
+  w.published = directory.registry() / "2-joining.holder";
+  // The system created the staged file and has not locked it yet.
+  w.staging = open(w.staged.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+  require(w.staging != -1, "cannot create a joining process's staged file");
+  window = &w;
+  ImageRegistry::setRemovalHook(joinerInTheWindow);
+  try {
+    require(!lister.heldByAnother(keyOf('a'), kImageBytes), "an image was found in an empty registry");
+  } catch (...) {
+    ImageRegistry::setRemovalHook(nullptr);
+    if (w.joiner.joinable()) w.joiner.join();
+    close(w.staging);
+    throw;
+  }
+  ImageRegistry::setRemovalHook(nullptr);
+  w.joiner.join();
+  close(w.staging);
+  require(!std::filesystem::exists(stale), "a lookup left an ended process's holder file");
+  require(!w.didPublish || std::filesystem::exists(w.published),
+          "a lookup removed the holder file of a joiner that had published it");
+}
+
 } // namespace
 
 int main() {
@@ -298,6 +361,7 @@ int main() {
     testJoinWhileAnotherProcessLooksUp();
     testJoinWhileAnotherRegistryLooksUp();
     testWriterLocksAreKeptApart();
+    testLookupKeepsAJoinersPublishedHolder();
     testConcurrentAcquiresWriteOnce();
     testImageLivesWhileAnyoneMapsIt();
     testFailedWriterLeavesNoLock();

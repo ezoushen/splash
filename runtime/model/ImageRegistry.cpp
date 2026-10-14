@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -288,6 +289,10 @@ private:
 
 } // namespace
 
+namespace {
+std::atomic<void (*)()> removalHook{nullptr};
+} // namespace
+
 struct ImageRegistry::Impl {
   std::filesystem::path directory;
   std::chrono::milliseconds writeWait{};
@@ -321,14 +326,37 @@ struct ImageRegistry::Impl {
   // staged name is tried first, as the rename only moves it to the other.
   // The system creates a file and locks it in two steps, so a process that
   // looks between them finds a joining process's staged file unlocked and
-  // takes it for an ended process's (join).
-  [[nodiscard]] bool ended(std::string_view other) const {
+  // takes it for an ended process's (join). When it has ended and left a
+  // file, keep receives that file's descriptor, which holds the lock: the
+  // caller removes the process's files before it lets go (removeEnded), as
+  // a joiner waiting for that lock would otherwise publish in between.
+  [[nodiscard]] bool ended(std::string_view other, Descriptor *keep = nullptr) const {
     for (const std::filesystem::path &path : {stagedPath(other), holderPath(other)}) {
       Descriptor file(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
       if (!file && errno == ENOENT) continue;
-      return file && flock(file.get(), LOCK_EX | LOCK_NB) == 0;
+      const bool locked = file && flock(file.get(), LOCK_EX | LOCK_NB) == 0;
+      if (locked && keep) *keep = std::move(file);
+      return locked;
     }
     return true;
+  }
+
+  // Removes the files of the process of that name, which ended (ended) and
+  // whose file locked is held. The socket is removed whatever its file is:
+  // a joiner cannot bind it before it has the lock. A holder file and a
+  // staged file are removed only if they are still locked's file: a joiner
+  // that waited for the lock may have published its own under the name, and
+  // that is not removed. One that waits still gets the lock after this, finds
+  // its staged file removed, and joins again (join).
+  void removeEnded(std::string_view other, const Descriptor &locked) const {
+    unlink(socketPath(other).c_str());
+    struct stat held{};
+    if (!locked || fstat(locked.get(), &held) == -1) return;
+    for (const std::filesystem::path &path : {holderPath(other), stagedPath(other)}) {
+      struct stat found{};
+      if (lstat(path.c_str(), &found) == 0 && found.st_dev == held.st_dev && found.st_ino == held.st_ino)
+        unlink(path.c_str());
+    }
   }
 
   // Creates this process's holder file and socket under a new name and
@@ -336,9 +364,10 @@ struct ImageRegistry::Impl {
   // name, before the socket is bound, so that no process takes either for an
   // ended process's (ended) once it has locked it; it is renamed to its name
   // once the socket listens. A process that looks at the registry in the
-  // moment between the file's creation and its lock may remove the staged
-  // file, and the socket with it: then nothing is published and the caller
-  // joins again under another name.
+  // moment between the file's creation and its lock may lock the staged file
+  // first, and remove it with the socket: this process then gets the lock
+  // once the files are removed, its rename finds no staged file, nothing is
+  // published and the caller joins again under another name.
   [[nodiscard]] bool join() {
     name = std::to_string(getpid()) + "-" + randomHex(4);
     const std::filesystem::path staged = stagedPath(name);
@@ -422,7 +451,9 @@ struct ImageRegistry::Impl {
   // process that has ended are removed (ended): a socket may refuse a live
   // holder too (a full backlog). That includes a socket or a staged holder
   // file a process left when it ended while it joined, and, rarely, those
-  // of a process that is joining (join).
+  // of a process that is joining (join), which then joins again. The files
+  // are removed while the lock is held (removeEnded), so that a process
+  // joining does not publish between the lock's release and the removal.
   std::shared_ptr<Region> askHolders(const std::string &key, uint64_t bytes) {
     const auto deadline = AwakeClock::now() + kLookupTimeout;
     std::error_code error;
@@ -438,10 +469,10 @@ struct ImageRegistry::Impl {
     }
     if (error) throw std::system_error(error, "cannot list the image registry " + directory.string());
     for (const std::string &other : names) {
-      if (ended(other)) {
-        unlink(socketPath(other).c_str());
-        unlink(holderPath(other).c_str());
-        unlink(stagedPath(other).c_str());
+      Descriptor locked;
+      if (ended(other, &locked)) {
+        if (const auto hook = removalHook.load()) hook();
+        removeEnded(other, locked);
         continue;
       }
       if (!holders.contains(other) || unanswered.contains(other)) continue;
@@ -535,6 +566,8 @@ bool ImageRegistry::heldByAnother(const std::string &key, uint64_t bytes) {
 }
 
 void ImageRegistry::newPass() { impl_->unanswered.clear(); }
+
+void ImageRegistry::setRemovalHook(void (*hook)()) { removalHook = hook; }
 
 bool ImageRegistry::acquire(const std::string &key, uint64_t bytes,
                             const std::function<void(metal::MappedMemory)> &attach,
