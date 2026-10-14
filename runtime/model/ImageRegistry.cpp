@@ -1,5 +1,6 @@
 #include "model/ImageRegistry.hpp"
 #include "model/PrivateDirectory.hpp"
+#include "AwakeClock.hpp"
 #include "StderrLine.hpp"
 
 #include <fcntl.h>
@@ -262,11 +263,11 @@ public:
   FileLock(const std::filesystem::path &path, std::chrono::milliseconds timeout)
       : descriptor_(open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600)) {
     if (!descriptor_) fail("cannot open the image lock " + path.string());
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto deadline = AwakeClock::now() + timeout;
     while (flock(descriptor_.get(), LOCK_EX | LOCK_NB) == -1) {
       if (errno == EINTR) continue;
       if (errno != EWOULDBLOCK) fail("cannot lock the image lock " + path.string());
-      if (std::chrono::steady_clock::now() >= deadline) {
+      if (AwakeClock::now() >= deadline) {
         descriptor_.reset();
         return;
       }
@@ -372,7 +373,7 @@ struct ImageRegistry::Impl {
   // holder too (a full backlog). That includes a socket or a staged holder
   // file a process left when it ended while it joined.
   std::shared_ptr<Region> askHolders(const std::string &key, uint64_t bytes) {
-    const auto deadline = std::chrono::steady_clock::now() + kLookupTimeout;
+    const auto deadline = AwakeClock::now() + kLookupTimeout;
     std::error_code error;
     std::set<std::string> names;
     std::set<std::string> holders;
@@ -394,7 +395,7 @@ struct ImageRegistry::Impl {
       }
       if (!holders.contains(other) || unanswered.contains(other)) continue;
       const auto left =
-          std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now());
+          std::chrono::duration_cast<std::chrono::microseconds>(deadline - AwakeClock::now());
       if (left <= std::chrono::microseconds::zero()) break;
       if (auto region = askHolder(other, key, bytes, std::min<std::chrono::microseconds>(left, kHolderTimeout)))
         return region;
@@ -419,9 +420,9 @@ struct ImageRegistry::Impl {
   }
 
   void serve() {
-    auto touched = std::chrono::steady_clock::now();
+    auto touched = AwakeClock::now();
     for (;;) {
-      const auto now = std::chrono::steady_clock::now();
+      const auto now = AwakeClock::now();
       if (now - touched >= kTouchInterval) {
         touch();
         touched = now;
