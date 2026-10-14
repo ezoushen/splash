@@ -258,12 +258,46 @@ void testJoinWhileAnotherProcessLooksUp() {
   stop();
 }
 
+// A lookup lists the registry for holders and sockets only: the lock files
+// of the images' writers are in a directory of their own, so that their
+// number, which grows with the images ever written, does not slow a lookup.
+// A lock file a process of an earlier layout left at the top is not used.
+void testWriterLocksAreKeptApart() {
+  const Directory directory;
+  ImageRegistry registry(directory.registry(), std::chrono::seconds(10));
+  const std::filesystem::path old = directory.registry() / (keyOf('6') + ".lock");
+  const int taken = open(old.c_str(), O_RDWR | O_CREAT, 0600);
+  require(taken != -1 && flock(taken, LOCK_EX) == 0, "cannot hold a lock file at the top of the registry");
+  std::atomic<unsigned> writes{0};
+  std::vector<Held> held;
+  const auto started = std::chrono::steady_clock::now();
+  for (const char digit : {'6', '7', '8', '9'}) held.push_back(acquire(registry, keyOf(digit), writes));
+  const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  require(writes == 4 && waited < 5, "a lock file at the top of the registry was waited for");
+  size_t locks = 0;
+  for (const auto &entry : std::filesystem::directory_iterator(directory.registry())) {
+    const std::string name = entry.path().filename().string();
+    if (entry.path() == old) continue;
+    if (entry.path().extension() == ".lock") ++locks;
+    else if (entry.path().extension() == ".holder" || entry.path().extension() == ".socket") continue;
+    else require(name == "locks", "the registry holds an unexpected entry " + name);
+  }
+  require(!locks, "a lock file was written at the top of the registry");
+  struct stat state{};
+  require(stat((directory.registry() / "locks").c_str(), &state) == 0 && S_ISDIR(state.st_mode) &&
+              (state.st_mode & 0777) == 0700 && state.st_uid == getuid(),
+          "the writer locks are not in a private directory of the registry");
+  for (Held &image : held) image.letGo();
+  close(taken);
+}
+
 } // namespace
 
 int main() {
   try {
     testJoinWhileAnotherProcessLooksUp();
     testJoinWhileAnotherRegistryLooksUp();
+    testWriterLocksAreKeptApart();
     testConcurrentAcquiresWriteOnce();
     testImageLivesWhileAnyoneMapsIt();
     testFailedWriterLeavesNoLock();

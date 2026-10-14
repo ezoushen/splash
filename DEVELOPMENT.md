@@ -2437,7 +2437,9 @@ holders for each image to count what they hold, a lookup per image on the
 engine's tick. The registry's files stay in the user's temporary directory,
 which each process marks as in use every hour so that a cleaner of temporary
 files leaves them; the per-image lock files, a few bytes each, stay and are
-created again when one is missing.
+created again when one is missing. They are in a `locks` subdirectory, so that a
+lookup lists only the holders and sockets; lock files that a build without it
+left at the top of the directory are not used.
 
 #### Explicit weights release
 
