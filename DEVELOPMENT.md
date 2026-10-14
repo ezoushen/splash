@@ -2361,7 +2361,10 @@ fine-tune's unchanged routed experts (`experts-N`), embedding and head are its
 base model's, and its changed layers are its own. Every loader's images are
 shared: a safetensors or a GGUF target's, a draft's and a vision tower's, from
 an MLX checkpoint or a GGUF mmproj. An image that reads a file without a
-recorded digest is written into memory of the process alone.
+recorded digest is written into memory of the process alone. A start logs
+`Weight images shared with other processes: N received, M written, K private.`
+once its weights are loaded, so that a second start of one model reads as
+`0 written`.
 
 A shared image lives in a POSIX shared-memory object whose name is removed as
 it is created, so it lasts as long as some process maps it or holds its

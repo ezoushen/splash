@@ -800,9 +800,8 @@ void testFailedStepIsNamed(const char *metallibPath) {
 // draft and its vision tower are then written into shared memory this process
 // serves, a second start receives them, and each start logs how many it
 // received and wrote; otherwise every image is its own. The place is the
-// test's, so that no
-// registry of a running engine is touched; its registry is short, under /tmp,
-// as socket paths are.
+// test's, so that no registry of a running engine is touched; its registry is
+// short, under /tmp, as socket paths are.
 void testWeightsAreSharedOnlyOnRequest(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-share-model"), place("splash-share-place");
   char registry[] = "/tmp/splash-rr-XXXXXX";
