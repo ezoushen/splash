@@ -53,6 +53,8 @@ public:
   // process wrote it (ImageRegistry::acquire).
   bool acquire(const std::string &key, uint64_t bytes, const std::function<void(metal::MappedMemory)> &attach,
                const std::function<void()> &write);
+  // Begins a pass of acquires, a load or a restore (ImageRegistry::newPass).
+  void newPass();
 
 private:
   struct Impl;

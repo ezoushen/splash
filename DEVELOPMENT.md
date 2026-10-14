@@ -1833,8 +1833,20 @@ refused connection, which a full backlog causes too. A holder that does not
 answer within 2 s is passed over, and a process waits at most 10 s for another's
 write before it writes a copy of its own. Every process maps an image
 read-only; its buffer is a no-copy buffer over the mapping. Admission and the
-memory plan still count each process's images in full. After an idle release,
-the restore writes each image again into memory of its own process.
+memory plan still count each process's images in full.
+
+An idle release lets go of the process's mapping of each image
+(`WeightImages::release`); the memory stays while another process holds it and
+goes back to macOS when the last holder lets go. The restore asks the live
+holders for each image and maps what one holds, writing it only when none does,
+as a process that starts does. It does so inside the governor's admission of
+the image, which charges the image's full size whether it is mapped or written,
+so that a refusal asks no one and leaves nothing mapped. A writer the driver
+refuses memory for gives back its image's mapping and its lock of the key, so
+that the next process that needs the image writes it, and a release during a
+restore gives back only the images that came back. A holder that does not
+answer is passed over for the rest of a pass, a load or a restore, and asked
+again in the next.
 
 #### Explicit weights release
 
