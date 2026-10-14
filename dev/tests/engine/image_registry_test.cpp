@@ -162,6 +162,26 @@ void testFailedWriterLeavesNoLock() {
   received.letGo();
 }
 
+// Whether another registry holds an image: not this registry's own mapping,
+// not an image no one maps, and not one of another key or length, and the
+// asking leaves no mapping that keeps an image alive.
+void testHeldByAnotherCountsOtherRegistriesOnly() {
+  const Directory directory;
+  ImageRegistry first(directory.registry(), std::chrono::seconds(10)), second(directory.registry(), std::chrono::seconds(10));
+  std::atomic<unsigned> writes{0};
+  require(!first.heldByAnother(keyOf('4'), kImageBytes), "an image no one holds was reported held");
+  Held written = acquire(first, keyOf('4'), writes);
+  require(!first.heldByAnother(keyOf('4'), kImageBytes), "a registry reported its own image as held by another");
+  require(second.heldByAnother(keyOf('4'), kImageBytes), "another registry's image was not reported held");
+  require(!second.heldByAnother(keyOf('5'), kImageBytes) && !second.heldByAnother(keyOf('4'), kImageBytes + 1),
+          "an image of another key or length was reported held");
+  written.letGo();
+  require(!second.heldByAnother(keyOf('4'), kImageBytes), "an image no one maps any more was reported held");
+  Held rewritten = acquire(second, keyOf('4'), writes);
+  require(writes == 2 && rewritten.written, "asking whether an image was held kept it alive");
+  rewritten.letGo();
+}
+
 } // namespace
 
 int main() {
@@ -169,6 +189,7 @@ int main() {
     testConcurrentAcquiresWriteOnce();
     testImageLivesWhileAnyoneMapsIt();
     testFailedWriterLeavesNoLock();
+    testHeldByAnotherCountsOtherRegistriesOnly();
     std::cout << "PASS image-registry\n";
   } catch (const std::exception &error) {
     std::cerr << "FAIL: " << error.what() << '\n';
