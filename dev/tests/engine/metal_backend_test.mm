@@ -9,6 +9,7 @@
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 
+#include <CommonCrypto/CommonDigest.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -2269,6 +2270,19 @@ void run(const std::string &metallibPath) {
                 probed.macosVersion() == capabilities.macosVersion() &&
                 !probed.validationMessage(),
             "the device check read the device differently from the backend");
+    // The digest is of the bytes the library was loaded from, whatever
+    // replaced the file after that.
+    unsigned char loaded[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(libraryData.bytes, static_cast<CC_LONG>(libraryData.length), loaded);
+    std::string expectedDigest;
+    for (unsigned char byte : loaded) {
+        constexpr char digits[] = "0123456789abcdef";
+        expectedDigest += digits[byte >> 4];
+        expectedDigest += digits[byte & 15];
+    }
+    require(backend.libraryDigest() == expectedDigest,
+            "the library digest is not the SHA-256 of the metallib bytes the backend loaded: " +
+                backend.libraryDigest());
     require(backend.healthy(), "new backend is unhealthy");
     require(BackendInstrumentation::submittedCommands(backend) == 0,
             "new backend has submissions");
