@@ -864,6 +864,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       const std::chrono::duration<double> loading = AwakeClock::now() - started;
       logLine("Weights loaded ", again ? "again " : "", "in ", std::fixed, std::setprecision(2), loading.count(),
               " s.");
+      if (config.shareWeights) {
+        size_t received = 0, written = 0, held = 0;
+        for (const auto &image : loaded.images->contents()) {
+          ++held;
+          received += image.origin == model::ImageOrigin::Received;
+          written += image.origin == model::ImageOrigin::Written;
+        }
+        logLine("Weight images shared with other processes: ", received, " received, ", written, " written, ",
+                held - received - written, " private.");
+      }
     } catch (const metal::MetalAllocationError &error) {
       throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                   error.what(), {},
