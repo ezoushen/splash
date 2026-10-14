@@ -463,9 +463,11 @@ void testFailedStepIsNamed(const char *metallibPath) {
 }
 
 // The weight images are shared with other processes only where the start is
-// given a place to share them (--share-weights): the images its loaders
-// describe are then written into shared memory this process serves, and
-// otherwise every image is its own. The place is the test's, so that no
+// given a place to share them (--share-weights): the images of its target, its
+// draft and its vision tower are then written into shared memory this process
+// serves, a second start receives them, and each start logs how many it
+// received and wrote; otherwise every image is its own. The place is the
+// test's, so that no
 // registry of a running engine is touched; its registry is short, under /tmp,
 // as socket paths are.
 void testWeightsAreSharedOnlyOnRequest(const char *metallibPath) {
@@ -488,27 +490,45 @@ void testWeightsAreSharedOnlyOnRequest(const char *metallibPath) {
                entry.path().lexically_relative(root.path()).generic_string() + R"(":{"digest":")" +
                model::weightDigest(test::readFile(entry.path())) + "\"}";
   test::writeFile(root.path() / "model.json", R"({"files":{)" + files + "}}");
-  const auto origins = [&] {
-    std::vector<model::ImageOrigin> result;
-    static_cast<void>(test::capturedStderr([&] {
-      const auto resources = RuntimeResources::create(config, 0);
-      for (const auto &image : resources->modelContext().model.images->contents())
-        if (image.component.starts_with("target/")) result.push_back(image.origin);
-    }));
+  // The origin of each image a start loads, every role's, and what it logs of
+  // them; `held` keeps the start's resources, whose images other starts then
+  // receive.
+  struct Start final {
+    std::vector<model::ImageOrigin> origins;
+    std::string log;
+  };
+  const auto start = [&](std::vector<std::unique_ptr<RuntimeResources>> &held) {
+    Start result;
+    result.log = test::capturedStderr([&] {
+      held.push_back(RuntimeResources::create(config, 0));
+      for (const auto &image : held.back()->modelContext().model.images->contents())
+        result.origins.push_back(image.origin);
+    });
     return result;
   };
-  const std::vector<model::ImageOrigin> alone = origins();
-  require(!alone.empty() && std::all_of(alone.begin(), alone.end(),
-                                        [](model::ImageOrigin origin) { return origin == model::ImageOrigin::Private; }),
-          "a start without --share-weights shared an image");
+  const auto all = [](const Start &start, model::ImageOrigin origin) {
+    return !start.origins.empty() &&
+           std::all_of(start.origins.begin(), start.origins.end(), [&](model::ImageOrigin each) { return each == origin; });
+  };
+  const std::string logged = "Weight images shared with other processes: ";
+  std::vector<std::unique_ptr<RuntimeResources>> held;
+  const Start alone = start(held);
+  held.clear();
+  require(all(alone, model::ImageOrigin::Private) && alone.log.find(logged) == std::string::npos,
+          "a start without --share-weights shared an image or reported sharing");
   require(std::filesystem::is_empty(registry) && std::filesystem::is_empty(place.path()),
           "a start without --share-weights created a registry or a digest table");
   config.shareWeights = model::SharedImagesPlace{std::filesystem::path(registry) / "images", place.path() / "tables"};
-  const std::vector<model::ImageOrigin> shared = origins();
-  require(shared.size() == alone.size() &&
-              std::all_of(shared.begin(), shared.end(),
-                          [](model::ImageOrigin origin) { return origin == model::ImageOrigin::Written; }),
-          "a start with --share-weights did not write its target's images as shared ones");
+  const Start written = start(held);
+  const std::string count = std::to_string(alone.origins.size());
+  require(written.origins.size() == alone.origins.size() && all(written, model::ImageOrigin::Written) &&
+              written.log.find(logged + "0 received, " + count + " written, 0 private.") != std::string::npos,
+          "a start with --share-weights did not write the images of its target, its draft and its vision tower "
+          "as shared ones");
+  const Start received = start(held);
+  require(all(received, model::ImageOrigin::Received) &&
+              received.log.find(logged + count + " received, 0 written, 0 private.") != std::string::npos,
+          "a second start with --share-weights did not receive every image of the first");
 }
 
 // What a start allocates, the KV runway and then the arenas and the warmup as
