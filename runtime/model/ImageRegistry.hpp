@@ -53,11 +53,6 @@ public:
   // 5 s, each holder at most 2 s.
   void newPass();
 
-  // For tests: hook runs on the thread of a lookup that has found a process
-  // ended, before the lookup removes that process's files; a null hook
-  // clears it. It applies to every registry of the process.
-  static void setRemovalHook(void (*hook)());
-
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

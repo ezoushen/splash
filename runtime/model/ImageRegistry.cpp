@@ -1,4 +1,7 @@
 #include "model/ImageRegistry.hpp"
+#ifdef SPLASH_REGISTRY_INSTRUMENTATION
+#include "model/ImageRegistryInstrumentation.hpp"
+#endif
 #include "model/PrivateDirectory.hpp"
 #include "AwakeClock.hpp"
 #include "StderrLine.hpp"
@@ -289,9 +292,11 @@ private:
 
 } // namespace
 
+#ifdef SPLASH_REGISTRY_INSTRUMENTATION
 namespace {
 std::atomic<void (*)()> removalHook{nullptr};
 } // namespace
+#endif
 
 struct ImageRegistry::Impl {
   std::filesystem::path directory;
@@ -471,7 +476,9 @@ struct ImageRegistry::Impl {
     for (const std::string &other : names) {
       Descriptor locked;
       if (ended(other, &locked)) {
+#ifdef SPLASH_REGISTRY_INSTRUMENTATION
         if (const auto hook = removalHook.load()) hook();
+#endif
         removeEnded(other, locked);
         continue;
       }
@@ -567,7 +574,9 @@ bool ImageRegistry::heldByAnother(const std::string &key, uint64_t bytes) {
 
 void ImageRegistry::newPass() { impl_->unanswered.clear(); }
 
-void ImageRegistry::setRemovalHook(void (*hook)()) { removalHook = hook; }
+#ifdef SPLASH_REGISTRY_INSTRUMENTATION
+void ImageRegistryInstrumentation::setRemovalHook(void (*hook)()) { removalHook = hook; }
+#endif
 
 bool ImageRegistry::acquire(const std::string &key, uint64_t bytes,
                             const std::function<void(metal::MappedMemory)> &attach,
