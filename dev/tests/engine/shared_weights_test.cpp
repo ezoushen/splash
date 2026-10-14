@@ -1209,6 +1209,24 @@ void testReleaseReportsWhatOthersStillHold(const Setup &setup) {
   require(held(*alone) == "held none", "a process that shares nothing reported " + held(*alone));
 }
 
+// A holder that did not answer while this process loaded, and answers when it
+// releases, is counted: the release asks every holder again, as it does for
+// the restore that follows.
+void testReleaseCountsHolderThatAnsweredLate(const Setup &setup) {
+  setup.checkpoint("base", targetTensors());
+  auto holder = setup.engine(), other = setup.engine();
+  static_cast<void>(parseImages(holder->ask("load base mlx")));
+  holder->stop();
+  static_cast<void>(parseImages(other->ask("load base mlx")));
+  holder->resume();
+  const std::vector<uint64_t> sizes = numbersOf(other->ask("sizes"), "sizes");
+  const uint64_t total = std::accumulate(sizes.begin(), sizes.end(), uint64_t{0});
+  require(sizes.size() > 2 && total > 0, "the model has too few images for the test");
+  static_cast<void>(other->ask("release"));
+  require(other->ask("held") == "held " + std::to_string(total),
+          "a release counted a holder that answers now as " + other->ask("held") + " of " + std::to_string(total));
+}
+
 // A restore asks its admission for each image's full size, an image another
 // process holds as one it writes: the memory is this process's own to account
 // for, whoever else maps it.
@@ -1974,6 +1992,7 @@ int main(int argc, char **argv) {
     if (selected("unshared", 120)) testUnsharedCreatesNothing(Setup(self, argv[1]));
     if (selected("release and restore", 120)) testReleaseAndRestoreKeepOtherHolders(Setup(self, argv[1]));
     if (selected("held elsewhere", 120)) testReleaseReportsWhatOthersStillHold(Setup(self, argv[1]));
+    if (selected("late holder", 180)) testReleaseCountsHolderThatAnsweredLate(Setup(self, argv[1]));
     if (selected("restore admission", 120)) testRestoreAdmitsReceivedImagesInFull(Setup(self, argv[1]));
     if (selected("restore refused", 120)) testRestoreRefusedPartWay(Setup(self, argv[1]));
     if (selected("writer out of memory", 120)) testWriterOutOfMemoryLeavesNoLockOrMapping(Setup(self, argv[1]));

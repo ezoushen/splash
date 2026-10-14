@@ -48,12 +48,15 @@ void WeightImages::release() {
   const size_t held = released_ ? restored_ : images_.size();
   for (size_t index = 0; index < held; ++index) backend_->releaseMemory(images_[index].buffer);
   if (shared_) {
+    // A holder that did not answer during the loads or restores before this
+    // release is asked again, so that the count does not miss one that
+    // answers now; so is a holder that does not answer the count, by the
+    // restores that follow.
+    shared_->newPass();
     // What the processes still holding an image keep of it, which the system
     // does not get back.
     for (Image &image : images_)
       image.heldElsewhere = !image.key.empty() && shared_->heldByAnother(image.key, image.buffer.sizeBytes());
-    // The restores that follow are a new pass among the holders: one that did
-    // not answer in time is asked again.
     shared_->newPass();
   }
   released_ = true;
