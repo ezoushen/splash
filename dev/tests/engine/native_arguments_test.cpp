@@ -156,6 +156,7 @@ void testServerCommandLines(const char *path) {
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // Auto is the engine's default, which the server leaves out.
       {"verify_rows_auto", [](NativeArguments &) {}},
+      {"share_weights", [](NativeArguments &read) { read.shareWeights = true; }},
       // A relaunch keeps the first engine's context; with --max-context,
       // which every start holds, its command is the first one's.
       {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
@@ -202,7 +203,8 @@ void testServerCommandLines(const char *path) {
            read.preventIdleSleep == meant.preventIdleSleep &&
            read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
-           read.kvSpillAlways == meant.kvSpillAlways && read.verifyRows == meant.verifyRows;
+           read.kvSpillAlways == meant.kvSpillAlways && read.verifyRows == meant.verifyRows &&
+           read.shareWeights == meant.shareWeights;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
