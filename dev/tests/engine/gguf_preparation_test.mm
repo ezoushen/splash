@@ -425,6 +425,177 @@ void checkMlxMoe(MetalBackend &backend, const std::filesystem::path &directory, 
   }
 }
 
+// The routed experts of a MoE target in every format family that has them: each layer's image with its experts'
+// put together against the layer image 1.4.0 wrote (goldens recorded from an unmodified 1.4.0 build running these
+// fixtures). checkMoe and checkMlxMoe hold llama.cpp's separate gate and up and MLX's 4-bit affine.
+using Bits = std::pair<uint32_t, uint32_t>;
+
+model::Qwen3_6MoeLayout smallMoeLayout() {
+  model::Qwen3_6MoeLayout target;
+  target.layers = 4;
+  target.hiddenSize = 256;
+  target.vocabularySize = 256;
+  target.convolutionDimension = 512;
+  target.gdnKeyHeads = 2;
+  target.gdnValueHeads = 4;
+  target.gdnHeadDimension = 64;
+  target.attentionWidth = 256;
+  target.packedGdnWidth = 1024;
+  target.attentionQueryHeads = 4;
+  target.attentionKvHeads = 4;
+  target.attentionHeadDimension = 64;
+  target.packedFullWidth = 1024;
+  target.expertIntermediateSize = 256;
+  target.fullAttentionPeriod = 4;
+  return target;
+}
+
+// Every tensor without data random: uint8 for the 8-bit and U32 types, finite F32 scales, bf16 for the rest.
+void randomizeSynthetic(std::vector<splash::test::SyntheticTensor> &tensors, uint32_t seed) {
+  std::mt19937 rng(seed);
+  for (auto &tensor : tensors) {
+    if (!tensor.data.empty()) continue;
+    uint64_t elements = 1;
+    for (const uint64_t dimension : tensor.shape) elements *= dimension;
+    if (tensor.dtype == "U32") {
+      tensor.data.resize(elements * 4);
+      for (uint8_t &byte : tensor.data) byte = uint8_t(rng());
+    } else if (tensor.dtype == "U8" || tensor.dtype == "F8_E4M3") {
+      tensor.data.resize(elements);
+      for (uint8_t &byte : tensor.data) byte = uint8_t(rng());
+    } else if (tensor.dtype == "F32") {
+      for (uint64_t i = 0; i < elements; ++i) {
+        const float value = std::uniform_real_distribution<float>(0.5f, 2.0f)(rng);
+        const auto *bytes = reinterpret_cast<const uint8_t *>(&value);
+        tensor.data.insert(tensor.data.end(), bytes, bytes + 4);
+      }
+    } else {
+      for (uint64_t i = 0; i < elements; ++i) {
+        const uint16_t value = f2bf(std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng));
+        tensor.data.push_back(uint8_t(value));
+        tensor.data.push_back(uint8_t(value >> 8));
+      }
+    }
+  }
+}
+
+// MLX tensors with the routed experts' quantization chosen per projection; `u8` turns their scales into uint8
+// (mxfp4 at group 32, nvfp4 at group 16) and drops their biases.
+std::vector<splash::test::SyntheticTensor> mlxExpertTensors(Bits gate, Bits up, Bits down, bool u8) {
+  auto tensors = splash::test::mlxTargetTensors(smallMoeLayout(), [&](const std::string &module) -> Bits {
+    if (module.ends_with(".gate") || module.ends_with("shared_expert_gate")) return {8, 64};
+    if (module.find("switch_mlp.gate_proj") != std::string::npos) return gate;
+    if (module.find("switch_mlp.up_proj") != std::string::npos) return up;
+    if (module.find("switch_mlp.down_proj") != std::string::npos) return down;
+    return {4, 64};
+  });
+  if (u8) {
+    std::erase_if(tensors, [](const auto &tensor) {
+      return tensor.name.find("switch_mlp.") != std::string::npos && tensor.name.ends_with(".biases");
+    });
+    for (auto &tensor : tensors)
+      if (tensor.name.find("switch_mlp.") != std::string::npos && tensor.name.ends_with(".scales")) tensor.dtype = "U8";
+  }
+  return tensors;
+}
+
+// A GGUF tensor of NVFP4 block_nvfp4 rows, its .scale tensor holding `scales` values.
+void setNvfp4Tensor(std::vector<Tensor> &tensors, const std::string &name, uint32_t rows, uint32_t columns,
+                    uint32_t scales, std::mt19937 &rng) {
+  auto native = makeNative(NVFP4, rows, columns, rng);
+  std::vector<float> values(scales);
+  for (float &scale : values) scale = std::uniform_real_distribution<float>(0.5f, 2.0f)(rng);
+  setTensorScales(native, NVFP4, columns, [&](uint32_t r) { return values[r / (rows / scales)]; });
+  Tensor &tensor = tensorNamed(tensors, name);
+  tensor.type = model::ggml::kNVFP4;
+  tensor.data = blockNvfp4Rows(native);
+  std::vector<uint8_t> bytes(values.size() * 4);
+  std::memcpy(bytes.data(), values.data(), bytes.size());
+  tensors.push_back({name.substr(0, name.size() - 7) + ".scale", {scales}, 0, bytes});
+}
+
+// Each layer of `plan` (a layer's image and its experts', then the head's and the embedding's) with its experts put
+// together against the goldens of `name`.
+void checkUnsplitLayers(MetalBackend &backend, const Goldens &unsplit, const std::string &name,
+                        const std::vector<model::gguf::Image> &plan, uint32_t layers,
+                        const std::function<std::string(uint32_t)> &router) {
+  check(plan.size() == 2 * size_t(layers) + 2, "the plan of " + name + " is a layer's and its experts' images each");
+  if (plan.size() != 2 * size_t(layers) + 2) return;
+  const auto write = [&](const model::gguf::Image &image) {
+    const auto buffer = backend.allocateBuffer(image.bytes, splash::metal::BufferStorage::Shared, image.name);
+    model::writeGgufImage(backend, buffer, image);
+    const std::span<uint8_t> bytes = model::contentsOf(buffer);
+    return std::vector<uint8_t>(bytes.begin(), bytes.end());
+  };
+  for (uint32_t layer = 0; layer < layers; ++layer)
+    checkGolden(unsplit, name + "/target/layer-" + std::to_string(layer) + ".bin",
+                withRoutedExperts(plan[2 * layer], write(plan[2 * layer]), plan[2 * layer + 1],
+                                  write(plan[2 * layer + 1]), router(layer)),
+                "the layer's and its experts' images put together are the layer image 1.4.0 wrote: " + name + " " +
+                    std::to_string(layer));
+}
+
+void checkUnsplitFormats(MetalBackend &backend, const std::filesystem::path &directory, const Goldens &unsplit) {
+  const auto gguf = [&](const std::string &name, const std::vector<Tensor> &tensors,
+                        const model::QwenTargetDimensions &g) {
+    const auto path = directory / (name + ".gguf");
+    writeGguf(path, tensors, g);
+    // The images read their tensors from the source while they are written.
+    model::WeightSource source(path);
+    const model::GgufFile file(source);
+    checkUnsplitLayers(backend, unsplit, name, model::gguf::planImages(file, architecture(g), g), g.layers, [](uint32_t layer) {
+      return "blk." + std::to_string(layer) + ".ffn_gate_inp.weight";
+    });
+  };
+  {
+    const SmallTarget target = smallTarget(true);
+    const model::QwenTargetDimensions &g = target.geometry;
+    const uint32_t width = g.expertIntermediateSize, hidden = g.hiddenSize, experts = g.experts;
+    gguf("gguf-fused", withFusedGateUp(target.tensors, 0, experts), g);
+    std::mt19937 rng(77);
+    std::vector<Tensor> separate = target.tensors;
+    setNvfp4Tensor(separate, "blk.0.ffn_gate_exps.weight", experts * width, hidden, experts, rng);
+    setNvfp4Tensor(separate, "blk.0.ffn_up_exps.weight", experts * width, hidden, experts, rng);
+    setNvfp4Tensor(separate, "blk.0.ffn_down_exps.weight", experts * hidden, width, experts, rng);
+    gguf("gguf-nvfp4-separate", separate, g);
+    rng.seed(78);
+    std::vector<Tensor> fused = withFusedGateUp(target.tensors, 0, experts);
+    setNvfp4Tensor(fused, "blk.0.ffn_gate_up_exps.weight", 2 * experts * width, hidden, experts, rng);
+    setNvfp4Tensor(fused, "blk.0.ffn_down_exps.weight", experts * hidden, width, experts, rng);
+    gguf("gguf-nvfp4-fused", fused, g);
+  }
+  const auto safetensors = [&](const std::string &name, std::vector<splash::test::SyntheticTensor> tensors,
+                               bool transformers) {
+    const model::Qwen3_6MoeLayout target = smallMoeLayout();
+    randomizeSynthetic(tensors, 4242);
+    const auto root = directory / name;
+    splash::test::writeSyntheticShard(root / "model.safetensors", tensors);
+    const model::SafetensorsCheckpoint checkpoint(root);
+    checkUnsplitLayers(backend, unsplit, name, model::safetensors::planImages(checkpoint, target), target.layers,
+                       [&](uint32_t layer) {
+                         return std::string(transformers ? "model.language_model.layers."
+                                                         : "language_model.model.layers.") +
+                                std::to_string(layer) + ".mlp.gate";
+                       });
+  };
+  safetensors("mlx-affine-mixed", mlxExpertTensors({2, 32}, {3, 64}, {6, 128}, false), false);
+  safetensors("mlx-affine-other", mlxExpertTensors({5, 128}, {8, 32}, {4, 64}, false), false);
+  safetensors("mlx-mxfp4", mlxExpertTensors({4, 32}, {4, 32}, {4, 32}, true), false);
+  safetensors("mlx-nvfp4", mlxExpertTensors({4, 16}, {4, 16}, {4, 16}, true), false);
+  const model::Qwen3_6MoeLayout target = smallMoeLayout();
+  using splash::test::FloatCheckpoint;
+  const auto nvfp4 = [](const std::string &) -> uint32_t { return GGUF_FMT_NVFP4; };
+  const auto fp8Experts = [](const std::string &module) -> uint32_t {
+    return module.find(".experts.") != std::string::npos ? GGUF_FMT_FP8 : GGUF_FMT_NVFP4;
+  };
+  safetensors("modelopt-nvfp4", splash::test::floatTargetTensors(target, nvfp4, FloatCheckpoint::ModelOptimizer), true);
+  safetensors("modelopt-fp8-experts",
+              splash::test::floatTargetTensors(target, fp8Experts, FloatCheckpoint::ModelOptimizer), true);
+  safetensors("ct-nvfp4", splash::test::floatTargetTensors(target, nvfp4, FloatCheckpoint::CompressedTensors), true);
+  safetensors("ct-fp8-experts",
+              splash::test::floatTargetTensors(target, fp8Experts, FloatCheckpoint::CompressedTensors), true);
+}
+
 // The MoE layer with its router, shared-expert scalar gate and norms in 16-bit
 // floats, as some GGUFs store them, but the scalar gate in `gate`, BF16 or
 // Q8_0: the BF16 router's rows as stored, which the float projection runs, and
@@ -1065,6 +1236,7 @@ int main(int argc, char **argv) {
     guarded("preparation of the dense target", [&] { checkDense(backend, directory.path(), hashes); });
     guarded("preparation of the MoE target", [&] { checkMoe(backend, directory.path(), hashes, unsplit); });
     guarded("preparation of an MLX MoE target", [&] { checkMlxMoe(backend, directory.path(), mlxHashes, unsplit); });
+    guarded("the routed experts of every format", [&] { checkUnsplitFormats(backend, directory.path(), unsplit); });
     guarded("preparation of BF16 and F16 alpha/beta", [&] { checkFloatAlphaBeta(backend, directory.path()); });
     guarded("preparation of 16-bit float routers, gates and norms",
             [&] {
