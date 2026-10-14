@@ -55,13 +55,15 @@ class SharedImages;
 
 // Where an image's memory came from.
 enum class ImageOrigin : uint8_t {
-  // This process's alone: sharing is off, or the loader does not describe
-  // the image.
+  // This process's alone: sharing is off, the loader does not describe the
+  // image, or a file it reads has no recorded digest, so that it has no key.
   Private,
   // Memory another process holds for the same contents.
   Received,
-  // Memory this process wrote because no other process held the image, and
-  // serves to the others.
+  // Shared memory this process wrote because no other process held the image
+  // (ImageRegistry::acquire). It is served to the others, except a copy
+  // written after the wait for another process's write ran out, which only
+  // this process maps.
   Written,
 };
 
