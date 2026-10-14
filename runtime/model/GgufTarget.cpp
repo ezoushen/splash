@@ -76,16 +76,17 @@ std::optional<GgufTargetLoader::StreamedTable> GgufTargetLoader::streamTable() c
       {"target/" + plan->name, plan->magic, plan->layer, plan->type, plan->bytes, images_.contentIdentity()}};
 }
 
-WeightFile GgufTargetLoader::open(size_t index) {
-  const gguf::Image &plan = planned_->images[index];
-  return images_.load({"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
-                       [&backend = backend_, planned = planned_, index](std::span<uint8_t>,
-                                                                         const metal::MetalBuffer &buffer) {
-                         writeGgufImage(backend, buffer, planned->images[index]);
-                         planned->source.checkUnchanged();
-                       },
-                       plan.residentBytes});
+ImagePlan GgufTargetLoader::image(size_t index) const {
+  const gguf::Image &plan = planned_->images.at(index);
+  return {"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
+          [&backend = backend_, planned = planned_, index](std::span<uint8_t>, const metal::MetalBuffer &buffer) {
+            writeGgufImage(backend, buffer, planned->images[index]);
+            planned->source.checkUnchanged();
+          },
+          plan.residentBytes};
 }
+
+WeightFile GgufTargetLoader::open(size_t index) { return images_.load(image(index)); }
 
 WeightFile GgufTargetLoader::openLayer(uint32_t index, size_t part) {
   if (index >= planned_->layers) throw GgufError("target layer is out of range");

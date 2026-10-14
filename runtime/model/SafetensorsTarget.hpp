@@ -32,6 +32,11 @@ public:
   [[nodiscard]] WeightFile experts(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
+  // The plan of the image at `index` among those planned, in load order: each
+  // layer's, followed by its routed experts' for a sparse MoE, then the head's
+  // and the embedding's.
+  [[nodiscard]] ImagePlan image(size_t index) const;
+  [[nodiscard]] size_t imageCount() const noexcept { return planned_->images.size(); }
   // Whether its images hold F32 norms (safetensors::float32Norms).
   [[nodiscard]] bool float32Norms() const noexcept { return float32Norms_; }
   // Whether the routed experts stream, then the store's options and every

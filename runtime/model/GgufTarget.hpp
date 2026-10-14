@@ -63,6 +63,11 @@ public:
   // The GGUF's header, for what a family reads beside its images (Flash-Next's
   // PLE hash).
   [[nodiscard]] const GgufFile &file() const noexcept { return planned_->source.file(); }
+  // The plan of the image at `index` among those planned, in load order: each
+  // layer's, followed by its routed experts' for a sparse MoE, then the head's,
+  // the embedding's and a table's (gguf::planImages).
+  [[nodiscard]] ImagePlan image(size_t index) const;
+  [[nodiscard]] size_t imageCount() const noexcept { return planned_->images.size(); }
   // The input rotation of a Prism ML GGUF, which planImages checked names
   // every quantized tensor of the target and its token table.
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return file().rotation(); }

@@ -19,17 +19,18 @@ StreamedBlocks SafetensorsTargetLoader::streamedExperts() const {
           {[planned = planned_] { planned->checkpoint.checkUnchanged(); }}};
 }
 
-WeightFile SafetensorsTargetLoader::open(size_t index) {
-  const gguf::Image &plan = planned_->images[index];
+ImagePlan SafetensorsTargetLoader::image(size_t index) const {
+  const gguf::Image &plan = planned_->images.at(index);
   gguf::Description description = gguf::describe(plan);
-  return images_.load({"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
-                       [&backend = backend_, planned = planned_, index](std::span<uint8_t>,
-                                                                         const metal::MetalBuffer &buffer) {
-                         writeGgufImage(backend, buffer, planned->images[index]);
-                         planned->checkpoint.checkUnchanged();
-                       },
-                       plan.residentBytes, std::move(description.text), std::move(description.sources)});
+  return {"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
+          [&backend = backend_, planned = planned_, index](std::span<uint8_t>, const metal::MetalBuffer &buffer) {
+            writeGgufImage(backend, buffer, planned->images[index]);
+            planned->checkpoint.checkUnchanged();
+          },
+          plan.residentBytes, std::move(description.text), std::move(description.sources)};
 }
+
+WeightFile SafetensorsTargetLoader::open(size_t index) { return images_.load(image(index)); }
 
 WeightFile SafetensorsTargetLoader::openLayer(uint32_t index, size_t part) {
   if (index >= (planned_->images.size() - 2) / layerImages_) throw WeightStoreError("target layer is out of range");
