@@ -7,7 +7,8 @@ namespace splash::model {
 SafetensorsTargetLoader::SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                                                  const std::filesystem::path &directory,
                                                  const QwenTargetDimensions &geometry)
-    : backend_(backend), images_(images), planned_(std::make_shared<Planned>(directory)) {
+    : backend_(backend), images_(images), planned_(std::make_shared<Planned>(directory)),
+      layerImages_(gguf::imagesPerLayer(geometry)) {
   planned_->images = safetensors::planImages(planned_->checkpoint, geometry);
   float32Norms_ = safetensors::float32Norms(safetensors::moduleNames(planned_->checkpoint));
 }
@@ -22,9 +23,16 @@ WeightFile SafetensorsTargetLoader::open(size_t index) {
                        }});
 }
 
-WeightFile SafetensorsTargetLoader::layer(uint32_t index) {
-  if (index >= planned_->images.size() - 2) throw WeightStoreError("target layer is out of range");
-  return open(index);
+WeightFile SafetensorsTargetLoader::openLayer(uint32_t index, size_t part) {
+  if (index >= (planned_->images.size() - 2) / layerImages_) throw WeightStoreError("target layer is out of range");
+  return open(index * layerImages_ + part);
+}
+
+WeightFile SafetensorsTargetLoader::layer(uint32_t index) { return openLayer(index, 0); }
+
+WeightFile SafetensorsTargetLoader::experts(uint32_t index) {
+  if (layerImages_ != 2) throw WeightStoreError("a dense target has no experts image");
+  return openLayer(index, 1);
 }
 
 WeightFile SafetensorsTargetLoader::head() { return open(planned_->images.size() - 2); }

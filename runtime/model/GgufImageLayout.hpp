@@ -23,6 +23,11 @@ namespace splash::model {
 
 inline constexpr std::string_view kGgufImageMagic = "MDGG0001";
 
+// The header type of an image holding a sparse MoE layer's routed experts
+// alone. A layer's image takes 0 (GDN) or 1 (full attention) and the head's 2,
+// so an experts image is told from the layer's whatever its tensors are.
+inline constexpr uint32_t kGgufExpertsImageType = 3;
+
 // Columns of a superblock, the unit a quantized tensor's width is a multiple of.
 inline constexpr uint64_t kGgufBlockColumns = 256;
 

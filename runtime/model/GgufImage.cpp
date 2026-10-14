@@ -289,10 +289,8 @@ Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vecto
   }
   b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
   if (g.ffnKind == QwenFfnKind::SparseMoe) {
-    const uint64_t routed = g.experts, width = g.expertIntermediateSize;
-    b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
-    b.gateUpExperts(p, routed, width, g.hiddenSize);
-    b.quantized(p + "ffn_down_exps.weight", routed * g.hiddenSize, width);
+    const uint64_t width = g.expertIntermediateSize;
+    b.floatTensor(p + "ffn_gate_inp.weight", g.experts, g.hiddenSize);
     b.quantized(p + "ffn_gate_shexp.weight", width, g.hiddenSize);
     b.quantized(p + "ffn_up_shexp.weight", width, g.hiddenSize);
     b.quantized(p + "ffn_down_shexp.weight", g.hiddenSize, width);
@@ -302,6 +300,16 @@ Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vecto
     b.quantized(p + "ffn_up.weight", g.intermediateSize, g.hiddenSize);
     b.quantized(p + "ffn_down.weight", g.hiddenSize, g.intermediateSize);
   }
+  return b.finish();
+}
+
+// A sparse MoE layer's routed experts: gate, up, then down.
+Image expertsImage(const GgufFile &file, const QwenTargetDimensions &g, std::vector<std::string> &problems,
+                   uint32_t index) {
+  const std::string p = prefix(index);
+  Builder b(file, g, problems, "experts-" + std::to_string(index) + ".bin", index, kGgufExpertsImageType);
+  b.gateUpExperts(p, g.experts, g.expertIntermediateSize, g.hiddenSize);
+  b.quantized(p + "ffn_down_exps.weight", uint64_t{g.experts} * g.hiddenSize, g.expertIntermediateSize);
   return b.finish();
 }
 
@@ -463,8 +471,10 @@ std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &
   requireMetadata(file.metadata(), geometry);
   std::vector<std::string> problems;
   std::vector<Image> images;
-  for (uint32_t layer = 0; layer < geometry.layers; ++layer)
+  for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
     images.push_back(layerImage(file, geometry, problems, layer));
+    if (imagesPerLayer(geometry) == 2) images.push_back(expertsImage(file, geometry, problems, layer));
+  }
   Builder head(file, geometry, problems, "head.bin", geometry.layers, 2);
   head.floatNorm("output_norm.weight", geometry.hiddenSize);
   head.quantized("output.weight", geometry.vocabularySize, geometry.hiddenSize);

@@ -28,6 +28,8 @@ public:
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
   [[nodiscard]] WeightFile layer(uint32_t index);
+  // A sparse MoE layer's routed experts, which its layer image does not hold.
+  [[nodiscard]] WeightFile experts(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
   // The input rotation of a Prism ML GGUF, which planImages checked names
@@ -39,13 +41,16 @@ private:
   struct Planned {
     explicit Planned(const std::filesystem::path &path) : source(path) {}
     WeightSource source;
-    std::vector<gguf::Image> images; // layers, head, embedding
+    std::vector<gguf::Image> images; // as gguf::planImages orders them
   };
   [[nodiscard]] WeightFile open(size_t index);
+  // Image `part` of target layer `index`: the layer's, or its experts'.
+  [[nodiscard]] WeightFile openLayer(uint32_t index, size_t part);
 
   metal::MetalBackend &backend_;
   WeightImages &images_;
   std::shared_ptr<Planned> planned_;
+  size_t layerImages_; // images per layer: gguf::imagesPerLayer
   std::optional<GgufRotation> rotation_;
 };
 

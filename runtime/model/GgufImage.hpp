@@ -119,7 +119,7 @@ struct Repack {
   std::vector<TensorRows> sources;
 };
 struct Image {
-  std::string name; // layer-N.bin, head.bin, embedding.bin
+  std::string name; // layer-N.bin, experts-N.bin, head.bin, embedding.bin
   std::string magic; // kGgufImageMagic
   uint32_t layer = 0;
   uint32_t type = 0;
@@ -170,9 +170,19 @@ private:
 // download. Throws GgufError naming every mismatch.
 void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &geometry);
 
-// The layers' images, then the head's and the embedding's. Checks the
-// metadata (requireMetadata) and each tensor's shape; throws GgufError naming
-// every missing tensor and every tensor of a type this build cannot load.
+// The images of each layer of a target: a sparse MoE layer's and the image of
+// its routed experts, which follows it, else the layer's alone.
+[[nodiscard]] inline size_t imagesPerLayer(const QwenTargetDimensions &geometry) noexcept {
+  return geometry.ffnKind == QwenFfnKind::SparseMoe ? 2 : 1;
+}
+
+// The images of each layer in order (imagesPerLayer), then the head's and the
+// embedding's. A sparse MoE layer's routed experts, most of its bytes, are
+// the image after its own: a model that changes only the rest of the layer,
+// such as a fine-tune of its attention, leaves that image's bytes unchanged.
+// Checks the metadata (requireMetadata) and each tensor's shape; throws
+// GgufError naming every missing tensor and every tensor of a type this build
+// cannot load.
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry);
 
 } // namespace splash::model::gguf

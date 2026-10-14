@@ -1,9 +1,15 @@
 // The GGUF image planner on the small dense and MoE targets and a rotated
 // dense one: where each tensor goes and in which row order, which F32 tensors
-// it narrows to bf16, and the sources it refuses.
+// it narrows to bf16, and the sources it refuses; and the safetensors planner's
+// split of a MoE layer's routed experts from its other tensors.
 //   gguf-planner
 #include "GgufFixtures.hpp"
+#include "TestCheckpoint.hpp"
 #include "metal/abi/Gguf.h"
+#include "model/Qwen3_6Moe.hpp"
+#include "model/Qwen3_8.hpp"
+#include "model/SafetensorsCheckpoint.hpp"
+#include "model/SafetensorsImage.hpp"
 
 #include <optional>
 
@@ -206,7 +212,15 @@ void checkMoe(const std::filesystem::path &directory) {
   const Plan moe = plan(path, g);
   check(!moe.error, "planner plans the MoE target" + (moe.error ? ": " + *moe.error : ""));
   if (moe.error) return;
-  const model::gguf::Image &layer = moe.images[0];
+  // A layer's routed experts have an image of their own after the layer's, under a header type that is neither a
+  // layer's (0 or 1) nor the head's (2).
+  const bool split = moe.images.size() == 4 && moe.images[0].name == "layer-0.bin" &&
+                     moe.images[1].name == "experts-0.bin" && moe.images[2].name == "head.bin" &&
+                     moe.images[3].name == "embedding.bin" && moe.images[1].layer == 0 && moe.images[1].type == 3 &&
+                     moe.images[0].type != moe.images[1].type;
+  check(split, "planner writes a MoE layer's routed experts into the image experts-N after the layer's");
+  if (!split) return;
+  const model::gguf::Image &layer = moe.images[0], &experts = moe.images[1];
   const auto *beta = copyOf(layer, "blk.0.ssm_beta.weight"), *alpha = copyOf(layer, "blk.0.ssm_alpha.weight");
   check(beta && alpha && alpha->destination == beta->destination + target.data(beta->source.name).size() &&
             grouped(beta->source.order, 0, 1, g) && grouped(alpha->source.order, 0, 1, g) &&
@@ -215,21 +229,35 @@ void checkMoe(const std::filesystem::path &directory) {
   for (const std::string name : {"blk.0.ffn_gate_inp.weight", "blk.0.ffn_gate_inp_shexp.weight"})
     check(asStored(copyOf(layer, name), target.data(name)), "planner copies the F32 tensor as stored: " + name);
 
-  // Each quantized tensor is repacked on its own, a 3-D expert tensor as one
-  // tensor of experts * N rows.
-  size_t quantized = 0;
+  // Each quantized tensor is repacked on its own, a 3-D expert tensor as one tensor of experts * N rows: the
+  // routed experts' in the experts image, gate, up, then down, the others in the layer's.
+  size_t quantized = 0, routed = 0;
+  std::vector<std::string> routedOrder;
   for (const Tensor &tensor : target.tensors) {
     if (!tensor.name.starts_with("blk.0.") || gguf_format_of(tensor.type) == GGUF_FMT_COUNT) continue;
-    ++quantized;
+    const bool inExperts = tensor.name.ends_with("_exps.weight");
+    ++(inExperts ? routed : quantized);
     const uint64_t rows = tensor.dims[1] * (tensor.dims.size() > 2 ? tensor.dims[2] : 1);
-    const auto *repack = repackOf(layer, tensor.name);
+    const auto *repack = repackOf(inExperts ? experts : layer, tensor.name);
     check(repack && repack->sources.size() == 1 && repack->rows == rows && repack->columns == tensor.dims[0] &&
-              repack->sources[0].rows == rows,
+              repack->sources[0].rows == rows && !repackOf(inExperts ? layer : experts, tensor.name),
           "planner repacks " + tensor.name + " as " + std::to_string(rows) + " rows of " +
-              std::to_string(tensor.dims[0]));
+              std::to_string(tensor.dims[0]) + " in the " + (inExperts ? "experts" : "layer") + " image");
   }
-  check(layer.repacks.size() == quantized, "planner repacks only the layer's quantized tensors");
+  for (const model::gguf::Repack &repack : experts.repacks) routedOrder.push_back(repack.sources.front().name);
+  check(layer.repacks.size() == quantized && experts.repacks.size() == routed && routed == 3 &&
+            routedOrder == std::vector<std::string>{"blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
+                                                    "blk.0.ffn_down_exps.weight"},
+        "planner repacks only the layer's other quantized tensors in its image, and the routed experts' gate, up and "
+        "down in the experts image");
+  check(experts.copies.empty(), "planner copies nothing into the experts image but through its repacks");
+}
 
+// llama.cpp's fused ffn_gate_up_exps in the MoE target.
+void checkFusedExperts(const std::filesystem::path &directory) {
+  SmallTarget target = smallTarget(true);
+  const model::QwenTargetDimensions &g = target.geometry;
+  const auto path = directory / "moe-fused.gguf";
   // llama.cpp's fused ffn_gate_up_exps: the gate tensor takes each expert's first width rows of it, the up tensor
   // the next width; one of a type the loader does not read is refused by name.
   const uint64_t width = g.expertIntermediateSize;
@@ -237,25 +265,140 @@ void checkMoe(const std::filesystem::path &directory) {
   writeGguf(path, fused, g);
   const Plan fusedPlan = plan(path, g);
   std::vector<const model::gguf::Repack *> halves;
-  if (!fusedPlan.error)
-    for (const model::gguf::Repack &repack : fusedPlan.images[0].repacks)
+  bool apart = !fusedPlan.error && fusedPlan.images.size() == 4;
+  if (apart) {
+    for (const model::gguf::Repack &repack : fusedPlan.images[1].repacks)
       if (repack.sources.front().name == "blk.0.ffn_gate_up_exps.weight") halves.push_back(&repack);
-  bool split = halves.size() == 2;
-  for (size_t half = 0; split && half < 2; ++half) {
-    split = halves[half]->rows == g.experts * width && halves[half]->sources.size() == g.experts;
-    for (uint64_t expert = 0; split && expert < g.experts; ++expert) {
+    for (const model::gguf::Repack &repack : fusedPlan.images[0].repacks)
+      apart = apart && repack.sources.front().name != "blk.0.ffn_gate_up_exps.weight" &&
+                  repack.sources.front().name != "blk.0.ffn_down_exps.weight";
+  }
+  bool fusedSplit = apart && halves.size() == 2 && fusedPlan.images[1].repacks.size() == 3 &&
+                    fusedPlan.images[1].repacks.back().sources.front().name == "blk.0.ffn_down_exps.weight";
+  for (size_t half = 0; fusedSplit && half < 2; ++half) {
+    fusedSplit = halves[half]->rows == g.experts * width && halves[half]->sources.size() == g.experts;
+    for (uint64_t expert = 0; fusedSplit && expert < g.experts; ++expert) {
       const model::gguf::TensorRows &rows = halves[half]->sources[expert];
-      split = rows.first == (2 * expert + half) * width && rows.rows == width &&
-              rows.rowBytes == gguf_reference::rowBytes(Fmt(gguf_format_of(rows.type)), g.hiddenSize);
+      fusedSplit = rows.first == (2 * expert + half) * width && rows.rows == width &&
+                   rows.rowBytes == gguf_reference::rowBytes(Fmt(gguf_format_of(rows.type)), g.hiddenSize);
     }
   }
-  check(split, "planner splits llama.cpp's fused gate/up experts into each expert's gate and up rows" +
-                   (fusedPlan.error ? ": " + *fusedPlan.error : ""));
+  check(fusedSplit,
+        "planner splits llama.cpp's fused gate/up experts into each expert's gate and up rows, in the experts image "
+        "with the down experts" + (fusedPlan.error ? ": " + *fusedPlan.error : ""));
   tensorNamed(fused, "blk.0.ffn_gate_up_exps.weight").type = kQ8_1;
   tensorNamed(fused, "blk.0.ffn_gate_up_exps.weight").data.resize(2 * g.experts * width * g.hiddenSize / 32 * 36);
   writeGguf(path, fused, g);
   check(names(plan(path, g), {"blk.0.ffn_gate_up_exps.weight (Q8_1)"}),
         "planner refuses a fused gate/up experts tensor of a type it does not read by name");
+}
+
+// A small target of Layout whose projections are whole 256-row tiles: four
+// layers, the last of them full attention, and a MoE's 256 experts.
+template <class Layout> Layout smallLayout() {
+  Layout target;
+  target.layers = 4;
+  target.hiddenSize = 256;
+  target.vocabularySize = 256;
+  target.convolutionDimension = 512;
+  target.gdnKeyHeads = 2;
+  target.gdnValueHeads = 4;
+  target.gdnHeadDimension = 64;
+  target.attentionWidth = 256;
+  target.packedGdnWidth = 1024;
+  target.attentionQueryHeads = 4;
+  target.attentionKvHeads = 4;
+  target.attentionHeadDimension = 64;
+  target.packedFullWidth = 1024;
+  if (target.ffnKind == model::QwenFfnKind::SparseMoe) target.expertIntermediateSize = 256;
+  else target.intermediateSize = 256;
+  target.fullAttentionPeriod = 4;
+  target.hiddenCaptureLayers.fill(target.layers - 1);
+  return target;
+}
+
+// Whether the image reads a tensor whose name holds `part`.
+bool readsTensor(const model::gguf::Image &image, std::string_view part) {
+  const auto holds = [&](const model::gguf::TensorRows &rows) { return rows.name.find(part) != std::string::npos; };
+  return std::any_of(image.copies.begin(), image.copies.end(),
+                     [&](const model::gguf::Copy &copy) { return holds(copy.source); }) ||
+         std::any_of(image.repacks.begin(), image.repacks.end(), [&](const model::gguf::Repack &repack) {
+           return std::any_of(repack.sources.begin(), repack.sources.end(), holds);
+         });
+}
+
+// A MoE target of a safetensors checkpoint: each layer's routed experts, MLX's
+// stacked tensor of each projection or a transformers checkpoint's modules of
+// their own, are the image after the layer's, gate, up, then down; the layer's
+// keeps the router and the shared expert; a dense target has no such image.
+void checkSafetensorsMoe(const std::filesystem::path &directory) {
+  const auto target = smallLayout<model::Qwen3_6MoeLayout>();
+  using splash::test::SyntheticTensor;
+  const auto mlxBits = [](const std::string &module) {
+    return module.ends_with(".gate") || module.ends_with("shared_expert_gate") ? std::pair{8u, 64u}
+                                                                                : std::pair{4u, 64u};
+  };
+  const auto nvfp4 = [](const std::string &) -> uint32_t { return GGUF_FMT_NVFP4; };
+  struct Checkpoint {
+    std::string name;
+    std::vector<SyntheticTensor> tensors;
+    std::string routed; // what a routed expert's tensor name holds
+  };
+  const std::vector<Checkpoint> checkpoints{
+      {"MLX", splash::test::mlxTargetTensors(target, mlxBits), ".switch_mlp."},
+      {"Model Optimizer",
+       splash::test::floatTargetTensors(target, nvfp4, splash::test::FloatCheckpoint::ModelOptimizer), ".experts."}};
+  for (const Checkpoint &checkpoint : checkpoints) {
+    const auto root = directory / checkpoint.name;
+    splash::test::writeSyntheticShard(root / "model.safetensors", checkpoint.tensors);
+    const model::SafetensorsCheckpoint source(root);
+    const std::vector<model::gguf::Image> images = model::safetensors::planImages(source, target);
+    const std::string what = "planner on a " + checkpoint.name + " MoE target: ";
+    bool ordered = images.size() == 2 * target.layers + 2;
+    for (uint32_t layer = 0; ordered && layer < target.layers; ++layer) {
+      const model::gguf::Image &mixer = images[2 * layer], &experts = images[2 * layer + 1];
+      ordered = mixer.name == "layer-" + std::to_string(layer) + ".bin" &&
+                experts.name == "experts-" + std::to_string(layer) + ".bin" && experts.layer == layer &&
+                experts.type == 3 && experts.magic == mixer.magic && mixer.type != experts.type;
+    }
+    ordered = ordered && images[images.size() - 2].name == "head.bin" && images.back().name == "embedding.bin";
+    check(ordered, what + "each layer is followed by its experts-N image of header type 3, then the head and the "
+                          "embedding");
+    if (!ordered) continue;
+    for (uint32_t layer = 0; layer < target.layers; ++layer) {
+      const model::gguf::Image &mixer = images[2 * layer], &experts = images[2 * layer + 1];
+      const std::string at = what + "layer " + std::to_string(layer) + " ";
+      // Gate and up of experts * width rows each, then down of experts * hidden rows.
+      const std::vector<uint64_t> rows{target.experts * target.expertIntermediateSize,
+                                       target.experts * target.expertIntermediateSize,
+                                       target.experts * target.hiddenSize};
+      bool exact = experts.repacks.size() == 3 && experts.copies.empty();
+      for (size_t projection = 0; exact && projection < 3; ++projection) {
+        const model::gguf::Repack &repack = experts.repacks[projection];
+        const std::string name = std::array{"gate_proj", "up_proj", "down_proj"}[projection];
+        exact = repack.rows == rows[projection] && !repack.sources.empty() &&
+                repack.sources.front().name.find(checkpoint.routed) != std::string::npos &&
+                (checkpoint.routed == ".experts." || repack.sources.front().name.ends_with(name)) &&
+                std::all_of(repack.sources.begin(), repack.sources.end(), [&](const model::gguf::TensorRows &source) {
+                  return source.name.find(checkpoint.routed) != std::string::npos;
+                });
+      }
+      check(exact, at + "experts-N holds exactly the routed gate, up and down experts");
+      check(!readsTensor(mixer, checkpoint.routed) && readsTensor(mixer, "shared_expert.gate_proj") &&
+                readsTensor(mixer, "mlp.gate"),
+            at + "layer-N holds no routed expert but keeps the router and the shared expert");
+    }
+  }
+
+  const auto dense = smallLayout<model::Qwen3_8Layout>();
+  splash::test::writeSyntheticShard(directory / "dense" / "model.safetensors",
+                                    splash::test::mlxTargetTensors(dense, mlxBits));
+  const model::SafetensorsCheckpoint source(directory / "dense");
+  const std::vector<model::gguf::Image> images = model::safetensors::planImages(source, dense);
+  check(images.size() == dense.layers + 2 &&
+            std::none_of(images.begin(), images.end(),
+                         [](const model::gguf::Image &image) { return image.name.starts_with("experts-"); }),
+        "planner on a dense safetensors target writes no experts image");
 }
 
 // The rotary embedding and norms the kernels compute: a GGUF declares their
@@ -367,6 +510,8 @@ int main() {
     const splash::test::TemporaryDirectory directory("splash-gguf-planner");
     guarded("planner on the dense target", [&] { checkDense(directory.path()); });
     guarded("planner on the MoE target", [&] { checkMoe(directory.path()); });
+    guarded("planner on fused gate/up experts", [&] { checkFusedExperts(directory.path()); });
+    guarded("planner on a safetensors MoE target", [&] { checkSafetensorsMoe(directory.path()); });
     guarded("planner on quantized alpha/beta", [&] { checkQuantizedAlphaBeta(directory.path()); });
     guarded("planner on the rotary metadata", [&] { checkRotary(directory.path()); });
     guarded("planner on a rotated target", [&] { checkRotation(directory.path()); });

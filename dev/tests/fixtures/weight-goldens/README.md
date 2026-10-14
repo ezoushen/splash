@@ -10,6 +10,14 @@
   Splash change touches them.
 - `gguf_images`: every image `gguf-preparation` writes from its dense and MoE
   GGUF fixtures.
+- `mlx_images`: every image `gguf-preparation` writes from its MLX MoE
+  checkpoint, random in every tensor.
+- `moe_layers_with_experts`: the layer image of each MoE fixture as 1.3.2
+  wrote it, the routed experts inside it. `gguf-preparation` puts each MoE
+  layer's image and its experts' image together, cutting both where their
+  sections start, and requires these hashes: the images that now hold the
+  layer's sections hold exactly the old ones. They change only with the
+  layer's own sections, not with where the routed experts are.
 - `draft_images`: every image `draft-preparation` writes from the DFlash2
   draft checkpoint `run_draft_preparation.py` writes.
 - `vision_image`: the image written from every `run_vision_preparation.py`

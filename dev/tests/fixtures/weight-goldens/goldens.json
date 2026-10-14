@@ -33,9 +33,29 @@
       "target/embedding.bin": "6d17df18962f4941a0ce6538aa0092dba1073c78848a62f577a666b81a89e159"
     },
     "moe": {
-      "target/layer-0.bin": "70d9d2727f5a8883507b6f7c3680913f6f8c3c131fbb90b01bffa05e831b637e",
+      "target/layer-0.bin": "c9a9b68974a99774f83cc5e4d03c388f5564ffc8699eaaf7d0da76fd41fea266",
+      "target/experts-0.bin": "b63d10b924c2407a53d265e51731475ddcc18664c9166388f3ce337b42db9354",
       "target/head.bin": "3f61a8a408a40624b12f9564472930c655a84cdf5e1782191990f678fe80305c",
       "target/embedding.bin": "86a749f41cab45849eb9a2753025779ef1c58e74842b65290534eff4e29403e9"
+    }
+  },
+  "mlx_images": {
+    "moe": {
+      "target/layer-0.bin": "d07f75920cdc82d4f10c8b5c27a6ced35e7e8d2bad8be79c648c8d149ab833e1",
+      "target/experts-0.bin": "c867e511e8d80f61f43e0aa92f95354e7b51fce63d6aa72a7a58043144758cfd",
+      "target/layer-1.bin": "e9080a00cf70699fce4127654088d94e6194a65f6220ff20af4dbc7ada6d232e",
+      "target/experts-1.bin": "a90795b77b6de815ac55f74272f2b5f4fe8c43f804aad4f9bcfbcec5efc27386",
+      "target/head.bin": "1adcc56c0ca39f43bcd2ac72c65eb6c415217395ef9a856b12fcb1380b96544f",
+      "target/embedding.bin": "6581b8576a420687915012afe0d0d5f28508bbf1b1f48dff617ae40b9289fbb0"
+    }
+  },
+  "moe_layers_with_experts": {
+    "gguf": {
+      "target/layer-0.bin": "70d9d2727f5a8883507b6f7c3680913f6f8c3c131fbb90b01bffa05e831b637e"
+    },
+    "mlx": {
+      "target/layer-0.bin": "da62c9760dc8ddf5cbace4463f2b6a602fc13c199f3fed17101c1aba8a20e5c1",
+      "target/layer-1.bin": "89235231209b3aa4482d951197c733a1e2e39b7562923a61d6567516ba5a54ae"
     }
   },
   "draft_images": {

@@ -324,7 +324,8 @@ struct QuantizedModules {
 };
 
 // The sections of each image, in their order, which a Builder plans and
-// QuantizedModules names: a layer's, the head's and the embedding's.
+// QuantizedModules names: a layer's, a sparse MoE layer's routed experts', the
+// head's and the embedding's.
 template <class Walk>
 void walkLayer(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32_t index) {
   const std::string prefix = modelPrefix(names) + "layers." + std::to_string(index) + ".";
@@ -354,9 +355,6 @@ void walkLayer(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32
   if (g.ffnKind == QwenFfnKind::SparseMoe) {
     const uint64_t width = g.expertIntermediateSize;
     b.floatTensor(mlp + "gate", g.experts, g.hiddenSize);
-    b.experts(mlp, "gate_proj", width, g.hiddenSize);
-    b.experts(mlp, "up_proj", width, g.hiddenSize);
-    b.experts(mlp, "down_proj", g.hiddenSize, width);
     b.projection(mlp + "shared_expert.gate_proj", width, g.hiddenSize);
     b.projection(mlp + "shared_expert.up_proj", width, g.hiddenSize);
     b.projection(mlp + "shared_expert.down_proj", g.hiddenSize, width);
@@ -366,6 +364,15 @@ void walkLayer(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32
     b.projection(mlp + "up_proj", g.intermediateSize, g.hiddenSize);
     b.projection(mlp + "down_proj", g.hiddenSize, g.intermediateSize);
   }
+}
+
+// A sparse MoE layer's routed experts: gate, up, then down.
+template <class Walk>
+void walkExperts(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32_t index) {
+  const std::string mlp = modelPrefix(names) + "layers." + std::to_string(index) + ".mlp.";
+  b.experts(mlp, "gate_proj", g.expertIntermediateSize, g.hiddenSize);
+  b.experts(mlp, "up_proj", g.expertIntermediateSize, g.hiddenSize);
+  b.experts(mlp, "down_proj", g.hiddenSize, g.expertIntermediateSize);
 }
 
 template <class Walk> void walkHead(Walk &b, const QwenTargetDimensions &g, ModuleNames names) {
@@ -392,6 +399,12 @@ std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, con
               geometry.isFullAttentionLayer(layer) ? 1u : 0u);
     walkLayer(b, geometry, names, layer);
     images.push_back(b.finish());
+    if (gguf::imagesPerLayer(geometry) == 2) {
+      Builder experts(checkpoint, geometry, names, "experts-" + std::to_string(layer) + ".bin", layer,
+                      kGgufExpertsImageType);
+      walkExperts(experts, geometry, names, layer);
+      images.push_back(experts.finish());
+    }
   }
   Builder head(checkpoint, geometry, names, "head.bin", geometry.layers, 2);
   walkHead(head, geometry, names);
@@ -404,7 +417,10 @@ std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, con
 
 std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, ModuleNames names) {
   QuantizedModules walk(names);
-  for (uint32_t layer = 0; layer < geometry.layers; ++layer) walkLayer(walk, geometry, names, layer);
+  for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
+    walkLayer(walk, geometry, names, layer);
+    if (gguf::imagesPerLayer(geometry) == 2) walkExperts(walk, geometry, names, layer);
+  }
   walkHead(walk, geometry, names);
   walkEmbedding(walk, names);
   return std::move(walk.modules);

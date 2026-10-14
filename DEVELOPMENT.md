@@ -1682,6 +1682,14 @@ without requantization, quantizes the draft's BF16 projections
 `float(-exp(double(A_log)))`, which may differ by one float ULP from MLX's float
 exponential.
 
+A sparse MoE layer's routed experts, most of its bytes, are the image after
+its own, `experts-N` (header type 3) beside `layer-N`, in both planners
+(`SafetensorsImage.cpp`, `GgufImage.cpp`); the layer's image keeps the router
+and the shared expert. A fine-tune that changes the attention or the shared
+expert but leaves the experts unchanged leaves the experts image's bytes
+unchanged. The sections of each image keep their order and 16 KiB alignment,
+so the two images hold exactly the sections the layer's one image held.
+
 Loading never rounds a target or vision weight but in the F32 values of
 quantized tensors the kernels read unquantized, and in two conversions: the
 GDN decay above and the RMSNorm weights below. The first are a safetensors
@@ -1802,8 +1810,11 @@ through `BlockTargetFormat`, which reads each tensor as one block-quantized
 `QuantizedSegment` (a fused projection's tensors in output column order), the
 norms as F32 (bf16 for an MLX checkpoint), and keeps the GDN output projection's
 input in the source's value-head order, llama.cpp's tiled or MLX's grouped.
-Both Qwen families share one layout
-(`QwenHybridLayout`) and its validator.
+A sparse MoE layer's FFN is read from the layer's image and its routed
+experts' (`experts(index)` of the loader), in file order: router, routed
+experts, shared expert, scalar gate; each image is recorded once, in load
+order, so the manifest fingerprint covers the experts. Both Qwen families
+share one layout (`QwenHybridLayout`) and its validator.
 
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever

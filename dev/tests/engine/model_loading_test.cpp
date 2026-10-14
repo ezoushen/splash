@@ -796,6 +796,22 @@ void testSyntheticFloatModel(MetalBackend &backend, const std::filesystem::path 
             "modelWeightBytes is not what a " + name + " target loads");
 }
 
+// A MoE target's images, in load order: each layer's, then its routed experts'
+// (header type 3), then the head's and the embedding's.
+void requireExpertsImages(std::span<const WeightFileRecord> files, uint32_t layers, const std::string &name) {
+    require(files.size() == 2 * layers + 2, "a " + name + " MoE target did not load an experts image per layer");
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+        const WeightFileRecord &mixer = files[2 * layer], &experts = files[2 * layer + 1];
+        require(mixer.relativePath == "target/layer-" + std::to_string(layer) + ".bin" &&
+                    experts.relativePath == "target/experts-" + std::to_string(layer) + ".bin" &&
+                    experts.layer == layer && experts.type == 3 && experts.magic == mixer.magic,
+                "a " + name + " MoE target's experts image does not follow its layer's");
+    }
+    require(files[files.size() - 2].relativePath == "target/head.bin" &&
+                files.back().relativePath == "target/embedding.bin",
+            "a " + name + " MoE target's head and embedding do not follow its layers' images");
+}
+
 // A MoE target in NVFP4 and FP8, as Model Optimizer or compressed-tensors
 // stores it, loads as block images: each layer's routed experts, modules of
 // their own, stacked in index order into the planes of their shared format,
@@ -834,6 +850,7 @@ void testSyntheticFloatMoeModel(MetalBackend &backend, const std::filesystem::pa
                         "a " + name + " layer's experts are not stacked in their index order");
         }
     require(stacks == 3 * target.layers, "a " + name + " layer's experts did not stack into three tensors");
+    requireExpertsImages(weights.files, target.layers, name);
     require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
             "modelWeightBytes is not what a " + name + " MoE target loads");
 }
@@ -894,6 +911,7 @@ void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::pa
                     ffn.sharedScalarGate.outputSize == 1,
                 "a block MoE did not read its router and shared-expert gate as F32");
     }
+    requireExpertsImages(weights.files, target.layers, "MLX");
     require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
             "modelWeightBytes is not what an MLX block MoE target loads");
 }
