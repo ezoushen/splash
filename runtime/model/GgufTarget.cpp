@@ -78,12 +78,13 @@ std::optional<GgufTargetLoader::StreamedTable> GgufTargetLoader::streamTable() c
 
 ImagePlan GgufTargetLoader::image(size_t index) const {
   const gguf::Image &plan = planned_->images.at(index);
+  gguf::Description description = gguf::describe(plan);
   return {"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
           [&backend = backend_, planned = planned_, index](std::span<uint8_t>, const metal::MetalBuffer &buffer) {
             writeGgufImage(backend, buffer, planned->images[index]);
             planned->source.checkUnchanged();
           },
-          plan.residentBytes};
+          plan.residentBytes, std::move(description.text), std::move(description.sources)};
 }
 
 WeightFile GgufTargetLoader::open(size_t index) { return images_.load(image(index)); }

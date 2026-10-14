@@ -61,6 +61,14 @@ inline Key stringKey(std::string name, std::string_view value) {
   return key;
 }
 
+inline Key float32ArrayKey(std::string name, const std::vector<float> &values) {
+  Key key{std::move(name), kArray, {}};
+  append(key.value, kFloat32);
+  append<uint64_t>(key.value, values.size());
+  for (float value : values) append(key.value, value);
+  return key;
+}
+
 inline Key int32ArrayKey(std::string name, const std::vector<int32_t> &values) {
   Key key{std::move(name), kArray, {}};
   append(key.value, kInt32);

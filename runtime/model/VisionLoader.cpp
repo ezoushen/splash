@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <sstream>
 
 namespace splash::model {
 namespace {
@@ -193,11 +194,30 @@ VisionLoader::~VisionLoader() = default;
 const ops::VisionLayout &VisionLoader::layout() const noexcept { return planned_->layout; }
 
 ImagePlan VisionLoader::image() const {
-  return {"vision/model.bin", std::string(kVisionMagic), planned_->layout.depth, 0, planned_->plan.bytes,
-          [planned = planned_](std::span<uint8_t> bytes, const metal::MetalBuffer &) {
-            vision::writeVision(bytes, planned->plan);
-            planned->checkUnchanged();
-          }};
+  ImagePlan image{"vision/model.bin", std::string(kVisionMagic), planned_->layout.depth, 0, planned_->plan.bytes,
+                  [planned = planned_](std::span<uint8_t> bytes, const metal::MetalBuffer &) {
+                    vision::writeVision(bytes, planned->plan);
+                    planned->checkUnchanged();
+                  }};
+  // For a shared image's key (ImagePlan): what the writer reads of the plan,
+  // and of each tensor its dtype and, as sources, its bytes. The tensors' and
+  // sections' names and a tensor's shape decide no byte: the shape follows from
+  // the section and the dtype from the tensor.
+  const Plan &plan = planned_->plan;
+  std::ostringstream text;
+  text << "vision-image 1 depth=" << plan.depth << " patch=" << plan.patchSize << '\n';
+  for (const Section &section : plan.sections) {
+    text << "section rows=" << section.rows << " columns=" << section.columns << " storedRows=" << section.storedRows
+         << " storedColumns=" << section.storedColumns << " reordered=" << section.patch
+         << " offset=" << section.offset << " inputs=";
+    for (const vision::Input &input : section.inputs) {
+      text << ' ' << input.tensor.dtype;
+      image.sources.push_back({input.tensor.file, input.tensor.offset, input.tensor.bytes});
+    }
+    text << '\n';
+  }
+  image.description = text.str();
+  return image;
 }
 
 uint64_t visionImageBytes(const ops::VisionLayout &layout) { return plan(layout).bytes; }
