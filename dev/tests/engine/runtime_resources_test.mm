@@ -10,7 +10,9 @@
 #include "engine/MemoryPlan.hpp"
 #include "model/ModelSizing.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/SharedImages.hpp"
 #include "model/SsdReaders.hpp"
+#include "model/WeightStore.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -793,6 +795,55 @@ void testFailedStepIsNamed(const char *metallibPath) {
           "a start the host refused was not retried");
 }
 
+// The weight images are shared with other processes only where the start is
+// given a place to share them (--share-weights): the images its loaders
+// describe are then written into shared memory this process serves, and
+// otherwise every image is its own. The place is the test's, so that no
+// registry of a running engine is touched; its registry is short, under /tmp,
+// as socket paths are.
+void testWeightsAreSharedOnlyOnRequest(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-share-model"), place("splash-share-place");
+  char registry[] = "/tmp/splash-rr-XXXXXX";
+  require(mkdtemp(registry) != nullptr, "cannot create a registry directory");
+  struct RemoveRegistry final {
+    const char *path;
+    ~RemoveRegistry() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } removeRegistry{registry};
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "share-test");
+  // The installer records each file by its content digest.
+  std::string files;
+  for (const auto &entry : std::filesystem::recursive_directory_iterator(root.path()))
+    if (entry.is_regular_file())
+      files += (files.empty() ? "" : ",") + std::string("\"") +
+               entry.path().lexically_relative(root.path()).generic_string() + R"(":{"digest":")" +
+               model::weightDigest(test::readFile(entry.path())) + "\"}";
+  test::writeFile(root.path() / "model.json", R"({"files":{)" + files + "}}");
+  const auto origins = [&] {
+    std::vector<model::ImageOrigin> result;
+    static_cast<void>(test::capturedStderr([&] {
+      const auto resources = RuntimeResources::create(config, 0);
+      for (const auto &image : resources->modelContext().model.images->contents())
+        if (image.component.starts_with("target/")) result.push_back(image.origin);
+    }));
+    return result;
+  };
+  const std::vector<model::ImageOrigin> alone = origins();
+  require(!alone.empty() && std::all_of(alone.begin(), alone.end(),
+                                        [](model::ImageOrigin origin) { return origin == model::ImageOrigin::Private; }),
+          "a start without --share-weights shared an image");
+  require(std::filesystem::is_empty(registry) && std::filesystem::is_empty(place.path()),
+          "a start without --share-weights created a registry or a digest table");
+  config.shareWeights = model::SharedImagesPlace{std::filesystem::path(registry) / "images", place.path() / "tables"};
+  const std::vector<model::ImageOrigin> shared = origins();
+  require(shared.size() == alone.size() &&
+              std::all_of(shared.begin(), shared.end(),
+                          [](model::ImageOrigin origin) { return origin == model::ImageOrigin::Written; }),
+          "a start with --share-weights did not write its target's images as shared ones");
+}
+
 // What a start allocates, the KV runway and then the arenas and the warmup as
 // RuntimeBootstrap::start allocates them, is memory a request in service
 // needs: neither the warning margin above the spare reserve nor macOS's
@@ -1141,6 +1192,7 @@ int main(int argc, char **argv) {
       testStartGrowsThroughHostPressure(argv[1]);
       testYarnRuntime(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
+      testWeightsAreSharedOnlyOnRequest(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);
       testAutomaticTierYieldsToTheContext(argv[1]);
