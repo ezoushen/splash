@@ -48,9 +48,15 @@ void WeightImages::release() {
   // During a restore, only the images it wrote back hold memory.
   const size_t held = released_ ? restored_ : images_.size();
   for (size_t index = 0; index < held; ++index) backend_->releaseMemory(images_[index].buffer);
-  // The restores that follow are a new pass among the holders: one that did
-  // not answer in time is asked again.
-  if (shared_) shared_->newPass();
+  if (shared_) {
+    // What the processes still holding an image keep of it, which the system
+    // does not get back.
+    for (Image &image : images_)
+      image.heldElsewhere = !image.key.empty() && shared_->heldByAnother(image.key, image.buffer.sizeBytes());
+    // The restores that follow are a new pass among the holders: one that did
+    // not answer in time is asked again.
+    shared_->newPass();
+  }
   released_ = true;
   restored_ = 0;
 }
@@ -98,6 +104,15 @@ bool WeightImages::restore(const metal::AllocationAdmission &admit) {
   }
   released_ = restored_ < images_.size();
   return !released_;
+}
+
+std::optional<uint64_t> WeightImages::heldElsewhereBytes() const {
+  if (!shared_) return std::nullopt;
+  uint64_t bytes = 0;
+  if (released_)
+    for (size_t index = restored_; index < images_.size(); ++index)
+      if (images_[index].heldElsewhere) bytes += images_[index].buffer.sizeBytes();
+  return bytes;
 }
 
 std::vector<WeightImages::Contents> WeightImages::contents() const {

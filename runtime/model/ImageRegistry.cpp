@@ -493,6 +493,10 @@ ImageRegistry::~ImageRegistry() {
   unlink(registry.holderPath(registry.name).c_str());
 }
 
+bool ImageRegistry::heldByAnother(const std::string &key, uint64_t bytes) {
+  return impl_->askHolders(key, bytes) != nullptr;
+}
+
 void ImageRegistry::newPass() { impl_->unanswered.clear(); }
 
 bool ImageRegistry::acquire(const std::string &key, uint64_t bytes,

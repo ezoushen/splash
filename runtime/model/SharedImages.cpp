@@ -55,6 +55,10 @@ bool SharedImages::acquire(const std::string &key, uint64_t bytes,
   return impl_->registry.acquire(key, bytes, attach, write);
 }
 
+bool SharedImages::heldByAnother(const std::string &key, uint64_t bytes) {
+  return impl_->registry.heldByAnother(key, bytes);
+}
+
 void SharedImages::newPass() { impl_->registry.newPass(); }
 
 namespace {

@@ -123,7 +123,8 @@ public:
   [[nodiscard]] engine::EngineSnapshot statusSnapshot() const;
   [[nodiscard]] WeightsSnapshot weightsSnapshot() const {
     return {idleReleaseSeconds_, config_.weights->released(),
-            restoreStarted_.has_value(), weightRestores_, weightRestoreFailures_};
+            restoreStarted_.has_value(), weightRestores_, weightRestoreFailures_,
+            config_.weights->heldElsewhereBytes()};
   }
   // The engine's (Engine::resourceWaitSnapshot), with the requests a refused
   // restore holds waiting for memory.

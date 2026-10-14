@@ -41,6 +41,10 @@ public:
   // Returns whether this process wrote the image.
   bool acquire(const std::string &key, uint64_t bytes, const std::function<void(metal::MappedMemory)> &attach,
                const std::function<void()> &write);
+  // Whether a process other than this one holds the image under key, of
+  // bytes, now. It asks the holders as acquire does, and maps nothing that
+  // outlives the call.
+  [[nodiscard]] bool heldByAnother(const std::string &key, uint64_t bytes);
   // Begins a pass of acquires, a load or a restore of this process's images:
   // a holder that did not answer in time is passed over for the rest of the
   // pass it did not answer in, so that a stopped process delays each pass by

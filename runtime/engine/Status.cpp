@@ -30,7 +30,8 @@ void appendRopeScaling(std::ostringstream &out, const model::RopeScaling &rope) 
   out << ",\"original_context_tokens\":" << rope.originalContextTokens << '}';
 }
 
-// idle_release_seconds is null with --idle-release off.
+// idle_release_seconds is null with --idle-release off; held_elsewhere_bytes
+// is there only with the weights shared with other processes.
 void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights) {
   out << "{\"idle_release_seconds\":";
   if (std::isinf(weights.idleReleaseSeconds))
@@ -40,7 +41,9 @@ void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights) {
   out << ",\"released\":" << boolean(weights.released)
       << ",\"restoring\":" << boolean(weights.restoring)
       << ",\"restores\":" << weights.restores
-      << ",\"restore_failures\":" << weights.restoreFailures << '}';
+      << ",\"restore_failures\":" << weights.restoreFailures;
+  if (weights.heldElsewhereBytes) out << ",\"held_elsewhere_bytes\":" << *weights.heldElsewhereBytes;
+  out << '}';
 }
 
 // reruns: the chunks the GPU ran again alone once the split's work for them

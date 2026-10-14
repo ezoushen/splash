@@ -76,6 +76,18 @@ class MemoryReleaseTests(HarnessTestCase):
         )
         self.assertEqual(runtime.release_calls, 1)
 
+    def test_shared_weights_report_the_bytes_other_processes_still_hold(self):
+        # With --share-weights the weights section also says how much of the
+        # release the other processes keep, so that "released" does not
+        # overstate what the system got back; the server passes it on.
+        weights = {**RELEASED_WEIGHTS, "held_elsewhere_bytes": 21_474_836_480}
+        runtime = FakeRuntime()
+        runtime.release_event = native_peer.status_event(weights=weights)
+        harness = self.harness(runtime)
+        self.assertEqual(
+            self.post(harness, {}), (200, {"released": True, "weights": weights})
+        )
+
     def test_a_body_with_fields_or_not_json_is_refused_before_the_engine(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime)
