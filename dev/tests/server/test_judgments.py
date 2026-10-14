@@ -3,6 +3,7 @@ import http.client
 import json
 import math
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from tokenizers import (
@@ -17,6 +18,7 @@ from transformers import PreTrainedTokenizerFast
 
 from dev.tests.server_fixtures import (
     FOREVER,
+    CharImageTokenizer,
     CharTokenizer,
     FakeRuntime,
     HarnessTestCase,
@@ -24,6 +26,7 @@ from dev.tests.server_fixtures import (
     byte_alphabet,
     judgment_body,
     make_frontend,
+    png_data_url,
     stays_connected,
 )
 from server import judgments
@@ -531,6 +534,271 @@ class JudgmentTests(HarnessTestCase):
         # Question a prepares and checks both slot boundaries; question b is
         # rejected on its prepare pass. Before the fix b also ran both checks.
         self.assertEqual(tokenizer.prompt_encodes, 4)
+
+    def systemone_image_harness(self, runtime, **options):
+        harness = self.harness(
+            runtime, tokenizer=CharImageTokenizer(), max_context=8192, **options
+        )
+        judgments.slot_labels(harness.tokenizer)
+        return harness
+
+    def test_systemone_images_reach_every_scored_question(self):
+        runtime = FakeRuntime(Plan(logits=(3.0, 1.0)), Plan(logits=(1.0, 3.0)))
+        harness = self.systemone_image_harness(runtime)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "test-model",
+                "state": "Is the square red?",
+                "images": [png_data_url()],
+                "cache_salt": "run-1",
+                "questions": {"red": {"type": "noul"}, "blue": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        answers = json.loads(payload)["answers"]
+        self.assertGreater(answers["red"]["noul"], 0.5)
+        self.assertLess(answers["blue"]["noul"], 0.5)
+        self.assertEqual(len(runtime.requests), 2)
+        pad = CharImageTokenizer.PAD_ID
+        for request in (call.frame for call in runtime.requests):
+            (span,) = request.image_spans
+            self.assertGreater(span.tokens, 1)
+            self.assertEqual(
+                list(request.prompt_tokens[span.offset : span.offset + span.tokens]),
+                [pad] * span.tokens,
+            )
+            self.assertEqual(list(request.prompt_tokens).count(pad), span.tokens)
+            self.assertTrue(request.image_pixels)
+            self.assertNotEqual(request.cache_salt, 0)
+
+    def test_systemone_images_precede_the_evidence(self):
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)))
+        harness = self.systemone_image_harness(runtime)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "test-model",
+                "state": "evidence",
+                "images": [png_data_url()],
+                "questions": {"q": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        user = harness.tokenizer.templates[-1][0][1]["content"]
+        self.assertEqual([part["type"] for part in user], ["image_url", "text"])
+        self.assertIn("evidence", user[1]["text"])
+
+    def test_systemone_without_images_renders_the_stock_prompt(self):
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)))
+        harness = self.systemone_image_harness(runtime)
+        body = {
+            "model": "test-model",
+            "state": "evidence",
+            "questions": {"q": {"type": "noul"}},
+        }
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        (call,) = runtime.requests
+        state, ((_, spec),), _ = judgments.validate_systemone(body)
+        labels = judgments.slot_labels(harness.tokenizer)[: len(spec.labels)]
+        messages = judgments.systemone_messages(state, spec, labels)
+        self.assertIsInstance(messages[1]["content"], str)
+        tokens, _, _ = judgments.encode_prompt(
+            harness.app.prompt_tokenizer,
+            harness.app.chat_templates.select(None).source,
+            messages,
+            labels,
+            admit=lambda _: None,
+            checkpoint=lambda: None,
+        )
+        self.assertEqual(list(call.frame.prompt_tokens), tokens)
+        self.assertEqual(call.frame.image_spans, ())
+        self.assertEqual(call.frame.image_pixels, b"")
+
+    def test_systemone_images_rejected_before_inference(self):
+        cases = (
+            ({"vision": False}, [png_data_url()], "--language-only"),
+            ({}, [], "data: URLs"),
+            ({}, "data:image/png;base64,AAAA", "data: URLs"),
+            ({}, ["https://example.com/a.png"], "data: URLs"),
+            ({}, [png_data_url()] * 65, "data: URLs"),
+        )
+        for options, urls, message in cases:
+            with self.subTest(options=options, images=str(urls)[:40]):
+                runtime = FakeRuntime()
+                harness = self.systemone_image_harness(runtime, **options)
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/systemone",
+                    {
+                        "model": "test-model",
+                        "state": "evidence",
+                        "images": urls,
+                        "questions": {"q": {"type": "noul"}},
+                    },
+                )
+                self.assertEqual(status, 422, payload)
+                (error,) = json.loads(payload)["detail"]
+                self.assertEqual(error["loc"], ["body", "images"])
+                self.assertIn(message, error["msg"])
+                self.assertEqual(runtime.requests, [])
+
+    def test_systemone_client_disconnect_stops_image_decoding(self):
+        app = make_frontend(
+            CharImageTokenizer(), None, "test-model", 8192, 10, 2, vision=True
+        )
+        body = {
+            "model": "test-model",
+            "state": "evidence",
+            "images": [png_data_url(), png_data_url((30, 30, 200))],
+            "questions": {"q": {"type": "noul"}},
+        }
+        # Connected through the first image.
+        polls = iter((False, True))
+        prepared = []
+        decode = app.images.prepare
+        with (
+            mock.patch.object(
+                app.images,
+                "prepare",
+                side_effect=lambda *args: (
+                    prepared.append(decode(*args)) or prepared[-1]
+                ),
+            ),
+            self.assertRaises(ConnectionResetError),
+        ):
+            app.prepare_systemone(
+                body, deadline=FOREVER, disconnected=lambda: next(polls)
+            )
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(app.preparation_active, 0)
+
+    def test_systemone_context_limit_counts_image_tokens(self):
+        body = {
+            "model": "test-model",
+            "state": "evidence",
+            "questions": {"q": {"type": "noul"}},
+        }
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)))
+        harness = self.systemone_image_harness(runtime)
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        text_tokens = len(runtime.requests[0].frame.prompt_tokens)
+
+        runtime = FakeRuntime()
+        harness = self.harness(
+            runtime,
+            tokenizer=CharImageTokenizer(),
+            max_context=text_tokens + 16,
+        )
+        body["images"] = [png_data_url()]
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(
+            json.loads(payload)["error"]["code"], "context_length_exceeded"
+        )
+        self.assertEqual(runtime.requests, [])
+
+    def test_systemone_questions_share_one_copy_of_the_pixels(self):
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)), Plan(logits=(1.0, 0.0)))
+        harness = self.systemone_image_harness(runtime)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "test-model",
+                "state": "evidence",
+                "images": [png_data_url((200, 30, 30)), png_data_url((30, 30, 200))],
+                "questions": {"a": {"type": "noul"}, "b": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        first, second = (call.frame for call in runtime.requests)
+        self.assertEqual(len(first.image_spans), 2)
+        self.assertIs(first.image_pixels, second.image_pixels)
+
+    def test_systemone_total_token_budget_counts_image_tokens(self):
+        body = {
+            "model": "test-model",
+            "state": "evidence",
+            "questions": {"q": {"type": "noul"}},
+        }
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)))
+        harness = self.systemone_image_harness(runtime)
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        text_tokens = len(runtime.requests[0].frame.prompt_tokens)
+
+        runtime = FakeRuntime()
+        harness = self.systemone_image_harness(runtime)
+        body["images"] = [png_data_url()]
+        with mock.patch.object(
+            judgments, "MAX_SYSTEMONE_TOTAL_TOKENS", text_tokens + 1
+        ):
+            status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 422, payload)
+        self.assertIn("total prepared", json.loads(payload)["detail"][0]["msg"])
+        self.assertEqual(runtime.requests, [])
+
+
+# Umpire's tokenizer and Qwen chat template, from the local Hub cache; the
+# test below needs the files, not the weights.
+UMPIRE_FILES = sorted(
+    Path.home().glob(
+        ".cache/huggingface/hub/models--ezoushen--umpire-35b-a3b-mlx-4bit"
+        "/snapshots/*/tokenizer.json"
+    )
+)
+
+
+@unittest.skipUnless(
+    UMPIRE_FILES, "Umpire's tokenizer files are not in the local Hub cache"
+)
+class RealTemplateTests(unittest.TestCase):
+    def test_systemone_image_prompt_agrees_with_encode_prompt(self):
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            UMPIRE_FILES[-1].parent, local_files_only=True
+        )
+        app = make_frontend(tokenizer, None, "test-model", 8192, 10, 2, vision=True)
+        pad = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        body = {
+            "model": "test-model",
+            "state": "Is the square red?",
+            "images": [png_data_url(), png_data_url((30, 30, 200))],
+            "questions": {"q": {"type": "noul"}},
+        }
+        ((_, _, job),) = app.prepare_systemone(
+            body, deadline=FOREVER, disconnected=stays_connected
+        )
+        self.assertEqual(len(job.image_spans), 2)
+        for span in job.image_spans:
+            self.assertEqual(
+                job.prompt_tokens[span.offset : span.offset + span.tokens],
+                [pad] * span.tokens,
+            )
+        # With each image's run narrowed back to its one placeholder, the
+        # prompt is what encode_prompt prepares for the same messages.
+        narrowed, cursor = [], 0
+        for span in job.image_spans:
+            narrowed += job.prompt_tokens[cursor : span.offset] + [pad]
+            cursor = span.offset + span.tokens
+        narrowed += job.prompt_tokens[cursor:]
+        state, ((_, spec),), _ = judgments.validate_systemone(body)
+        labels = judgments.slot_labels(tokenizer)[: len(spec.labels)]
+        expected, _, _ = judgments.encode_prompt(
+            app.prompt_tokenizer,
+            app.chat_templates.select(None).source,
+            judgments.systemone_messages(state, spec, labels, body["images"]),
+            labels,
+            admit=lambda _: None,
+            checkpoint=lambda: None,
+        )
+        self.assertEqual(narrowed, expected)
 
 
 if __name__ == "__main__":

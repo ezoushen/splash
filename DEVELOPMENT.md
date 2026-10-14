@@ -1457,6 +1457,14 @@ Questions run sequentially within a request under one shared deadline, allowing
 prefix reuse without filling the admission queue; independent HTTP requests still
 share the scheduler. Disconnects and timeouts cancel the current question.
 
+An optional `images` list holds 1–64 `data:` URLs. They are decoded once per
+request, shown before the evidence in every question's user turn, and scored
+with each question; each job carries the image spans and one shared copy of the
+pixels. A server started with `--language-only` rejects them with the other
+validation details, and a disconnect while they decode ends the request. An
+image question's prompt is rendered a second time, with the arguments it was
+prepared with, to find the template's image placeholders, as chat does.
+
 Preparation renders each prompt once, then enforces the context limit and the
 batch token budget before the per-slot boundary checks. A label can change only
 the tokens after the prompt's last `<|im_end|>`, which the tokenizer encodes on
