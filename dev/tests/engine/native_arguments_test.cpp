@@ -201,6 +201,19 @@ void testNeuralEngine() {
           "--ane did not reach the arguments as given");
 }
 
+// Weight images are shared with other processes only where --share-weights on
+// asks for it.
+void testShareWeights() {
+  const ModelDirectory model;
+  require(!parse(model, {"auto", "auto"}).shareWeights && parse(model, {"auto", "auto", "--share-weights", "on"}).shareWeights &&
+              !parse(model, {"auto", "auto", "--share-weights", "off"}).shareWeights,
+          "--share-weights did not reach the arguments as given");
+  rejects([&] { static_cast<void>(parse(model, {"auto", "auto", "--share-weights", "yes"})); },
+          "--share-weights requires on or off", "the engine read --share-weights yes");
+  rejects([&] { static_cast<void>(parse(model, {"auto", "auto", "--share-weights"})); },
+          "--share-weights requires on or off", "the engine read --share-weights without a value");
+}
+
 // A command line the server never writes is refused with what is wrong.
 void testRefusals() {
   const ModelDirectory model;
@@ -300,6 +313,7 @@ int main(int argc, char **argv) {
   try {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
+    testShareWeights();
     testRefusals();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;

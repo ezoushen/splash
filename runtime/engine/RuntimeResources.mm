@@ -454,7 +454,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   model::LoadedModel loaded;
   try {
     const auto started = AwakeClock::now();
-    loaded = model::loadModel(*backend, config.modelRoot, config.model);
+    std::shared_ptr<model::SharedImages> shared;
+    if (config.shareWeights)
+      shared = std::make_shared<model::SharedImages>(model::sharedImagesConfig(
+          *config.shareWeights, config.modelRoot, model::writerIdentity(*backend)));
+    loaded = model::loadModel(*backend, config.modelRoot, config.model, std::move(shared));
     requireLoadedModel(loaded);
     const std::chrono::duration<double> loading = AwakeClock::now() - started;
     logLine("Weights loaded in ", std::fixed, std::setprecision(2),

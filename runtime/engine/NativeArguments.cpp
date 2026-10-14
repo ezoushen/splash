@@ -146,6 +146,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--share-weights") {
+      if (value != "on" && value != "off")
+        throw UsageError("--share-weights requires on or off");
+      result.shareWeights = value == "on";
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {
