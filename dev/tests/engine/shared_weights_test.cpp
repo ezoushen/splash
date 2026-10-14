@@ -215,6 +215,7 @@ int runEngine(char **argv) {
   if (!std::getline(std::cin, line)) return 0;
   std::shared_ptr<model::SharedImages> shared;
   if (std::string_view(argv[6]) != "off") {
+    const bool recorded = std::string_view(argv[6]) == "on";
     model::SharedImagesConfig config;
     config.registry = argv[4];
     config.digestTables = argv[5];
@@ -222,7 +223,7 @@ int runEngine(char **argv) {
     config.writeWait = std::chrono::seconds(1);
     config.modelRoot = root;
     for (const auto &entry : std::filesystem::recursive_directory_iterator(root))
-      if (entry.is_regular_file() && std::string_view(argv[6]) == "on")
+      if (recorded && entry.is_regular_file())
         config.sourceDigests[entry.path().lexically_relative(root).generic_string()] =
             model::weightDigest(splash::test::readFile(entry.path()));
     shared = std::make_shared<model::SharedImages>(std::move(config));

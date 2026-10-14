@@ -236,9 +236,10 @@ private:
 
 // What an image's key covers beside the code that writes it (SharedImages):
 // the text that states each plan field writeGgufImage's output depends on,
-// and the source bytes it reads, in the order the text names them. Names and
-// offsets in the source files are in neither, so the same bytes in another
-// file are the same image.
+// and the source bytes it reads, in the order the text names them. The text
+// names no tensor or file and gives no offset in one; the sources say where
+// the bytes are but only their digests enter the key, so the same bytes in
+// another file are the same image.
 struct Description {
   std::string text;
   std::vector<SourceBytes> sources;
