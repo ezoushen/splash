@@ -199,10 +199,10 @@ ImagePlan VisionLoader::image() const {
                     vision::writeVision(bytes, planned->plan);
                     planned->checkUnchanged();
                   }};
-  // For a shared image's key (ImagePlan): what the writer reads of the plan,
-  // and of each tensor its dtype and, as sources, its bytes. The tensors' and
-  // sections' names and a tensor's shape decide no byte: the shape follows from
-  // the section and the dtype from the tensor.
+  // For a shared image's key (ImagePlan): what the writer reads of the plan;
+  // of each source tensor its dtype, which says how its values convert, and,
+  // as sources, its bytes. A name decides no byte, nor does a shape, which its
+  // section fixes.
   const Plan &plan = planned_->plan;
   std::ostringstream text;
   text << "vision-image 1 depth=" << plan.depth << " patch=" << plan.patchSize << '\n';
