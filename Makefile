@@ -298,6 +298,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/SsdReaders.cpp \
 	runtime/model/SparseRowStore.cpp \
 	runtime/model/WeightImages.cpp \
+	runtime/model/TensorDigests.cpp \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/SlotRecycler.cpp \
 	runtime/model/ExpertStore.cpp \
