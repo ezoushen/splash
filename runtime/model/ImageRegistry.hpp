@@ -7,8 +7,9 @@
 // to the others: it holds a lock on a holder file in the registry directory
 // for its lifetime, and answers on a Unix socket beside it with an image's
 // descriptor (SCM_RIGHTS) for its key. It marks both files as in use every
-// hour, so that a cleaner of temporary files leaves them; the lock file of
-// an image's writers is created again whenever it is missing.
+// hour, so that a cleaner of temporary files leaves them; the lock files of
+// an image's writers are in a subdirectory, and each is created again
+// whenever it is missing.
 
 #include "metal/MetalBackend.hpp"
 

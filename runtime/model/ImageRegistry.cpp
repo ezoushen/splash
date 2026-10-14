@@ -32,6 +32,9 @@ namespace {
 
 // A key is a SHA-256 in lowercase hex, which also names its lock file.
 constexpr size_t kKeyLength = 64;
+// The subdirectory of the registry that holds the lock files of the images'
+// writers, so that a lookup lists the holders and sockets only.
+constexpr const char *kLocksDirectory = "locks";
 // How many names a joining process tries for its holder file when another
 // process removes the staged one.
 constexpr int kJoinAttempts = 8;
@@ -500,6 +503,7 @@ ImageRegistry::ImageRegistry(const std::filesystem::path &directory, std::chrono
   registry.directory = directory;
   registry.writeWait = writeWait;
   requirePrivateDirectory(directory);
+  requirePrivateDirectory(directory / kLocksDirectory);
   for (int attempt = 1; !registry.join(); ++attempt)
     if (attempt == kJoinAttempts)
       throw std::system_error(ENOENT, std::generic_category(), "cannot publish the image registry holder");
@@ -550,7 +554,9 @@ bool ImageRegistry::acquire(const std::string &key, uint64_t bytes,
     // writer that holds the lock too long, as a stopped one does, is not
     // waited for: this process writes a copy of its own, which it does not
     // serve, as only an image written under its lock is served.
-    const FileLock writing(registry.directory / (key + ".lock"), registry.writeWait);
+    // The directory is made again if a cleaner of temporary files took it.
+    requirePrivateDirectory(registry.directory / kLocksDirectory);
+    const FileLock writing(registry.directory / kLocksDirectory / (key + ".lock"), registry.writeWait);
     region = find();
     if (!region) {
       region = createRegion(bytes);
