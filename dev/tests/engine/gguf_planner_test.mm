@@ -512,9 +512,10 @@ void checkSafetensorsMoe(const std::filesystem::path &directory) {
       for (size_t projection = 0; exact && projection < 3; ++projection) {
         const model::gguf::Repack &repack = experts.repacks[projection];
         const std::string name = std::array{"gate_proj", "up_proj", "down_proj"}[projection];
+        // MLX's one stacked tensor of the projection, or transformers' modules of each expert in index order.
+        const std::string first = checkpoint.routed == ".experts." ? ".experts.0." + name : name;
         exact = repack.rows == rows[projection] && !repack.sources.empty() &&
-                repack.sources.front().name.find(checkpoint.routed) != std::string::npos &&
-                (checkpoint.routed == ".experts." || repack.sources.front().name.ends_with(name)) &&
+                repack.sources.front().name.ends_with(first) &&
                 std::all_of(repack.sources.begin(), repack.sources.end(), [&](const model::gguf::TensorRows &source) {
                   return source.name.find(checkpoint.routed) != std::string::npos;
                 });
