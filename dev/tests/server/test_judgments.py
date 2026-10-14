@@ -702,6 +702,63 @@ class JudgmentTests(HarnessTestCase):
         )
         self.assertEqual(runtime.requests, [])
 
+    def test_systemone_image_question_may_fill_the_whole_window(self):
+        body = {
+            "model": "test-model",
+            "state": "evidence",
+            "images": [png_data_url()],
+            "questions": {"q": {"type": "noul"}},
+        }
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)))
+        harness = self.systemone_image_harness(runtime)
+        status, _, payload = harness.request("POST", "/v1/systemone", body)
+        self.assertEqual(status, 200, payload)
+        tokens = len(runtime.requests[0].frame.prompt_tokens)
+
+        # A score job's last position is read, not extended: the prompt may
+        # be exactly the window, and one token more is too long.
+        for window, expected in ((tokens, 200), (tokens - 1, 400)):
+            with self.subTest(window=window):
+                runtime = FakeRuntime(Plan(logits=(1.0, 0.0)))
+                harness = self.harness(
+                    runtime, tokenizer=CharImageTokenizer(), max_context=window
+                )
+                judgments.slot_labels(harness.tokenizer)
+                status, _, payload = harness.request("POST", "/v1/systemone", body)
+                self.assertEqual(status, expected, payload)
+                if expected == 400:
+                    self.assertEqual(
+                        json.loads(payload)["error"]["code"],
+                        "context_length_exceeded",
+                    )
+                    self.assertEqual(runtime.requests, [])
+
+    def test_systemone_undecodable_images_are_field_errors(self):
+        good = png_data_url()
+        cases = (
+            ("data:text/plain;base64,AAAA", "image could not be decoded"),
+            (good[:60], "not valid base64"),
+        )
+        for url, message in cases:
+            with self.subTest(url=url[:30]):
+                runtime = FakeRuntime()
+                harness = self.systemone_image_harness(runtime)
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/systemone",
+                    {
+                        "model": "test-model",
+                        "state": "evidence",
+                        "images": [good, url],
+                        "questions": {"q": {"type": "noul"}},
+                    },
+                )
+                self.assertEqual(status, 422, payload)
+                (error,) = json.loads(payload)["detail"]
+                self.assertEqual(error["loc"], ["body", "images"])
+                self.assertIn(message, error["msg"])
+                self.assertEqual(runtime.requests, [])
+
     def test_systemone_questions_share_one_copy_of_the_pixels(self):
         runtime = FakeRuntime(Plan(logits=(1.0, 0.0)), Plan(logits=(1.0, 0.0)))
         harness = self.systemone_image_harness(runtime)

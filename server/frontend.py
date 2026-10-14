@@ -339,11 +339,20 @@ class Frontend:
         return status
 
     def _prepare_images(
-        self, messages, deadline, *, check_context=True, checkpoint=None
+        self,
+        messages,
+        deadline,
+        *,
+        check_context=True,
+        checkpoint=None,
+        score_job=False,
     ):
         """Prepared images in template render order: content parts in message
         order, images in document order. A `checkpoint` that raises ends
-        preparation before each image; the deadline alone does without one."""
+        preparation before each image; the deadline alone does without one.
+        A `score_job` (System One) reads its last position instead of
+        extending it, so it may fill the whole window, and it answers an
+        image that cannot be decoded as a validation error on `images`."""
         parts = [
             part
             for message in messages
@@ -374,11 +383,16 @@ class Frontend:
                     pixel_bytes,
                     check_context=check_context,
                     image_tokens_only=True,
+                    score_job=score_job,
                 )
                 prepared.append(image)
             except image_input.ImageCapacityError as error:
                 raise APIError(503, str(error), "frontend_overloaded") from error
             except image_input.ImageError as error:
+                if score_job:
+                    raise RequestValidationError(
+                        [field_error(["images"], str(error))]
+                    ) from error
                 raise APIError(400, str(error)) from error
         return prepared
 
@@ -390,11 +404,12 @@ class Frontend:
         *,
         check_context=True,
         image_tokens_only=False,
+        score_job=False,
     ):
-        if check_context and tokens >= self.max_context:
-            raise ContextLengthError(
-                tokens, self.max_context - 1, image_tokens_only=image_tokens_only
-            )
+        # A generation needs a position after the prompt; a score job does not.
+        limit = self.max_context if score_job else self.max_context - 1
+        if check_context and tokens > limit:
+            raise ContextLengthError(tokens, limit, image_tokens_only=image_tokens_only)
         # A thinking budget's end tokens follow, at most this many.
         frame_bytes = (
             wire.REQUEST_FIXED_BYTES
@@ -452,7 +467,9 @@ class Frontend:
             raise APIError(400, "image count does not match the rendered template")
         return len(prompt_tokens) + sum(image.tokens - 1 for image in prepared)
 
-    def _expand_image_pads(self, prompt_tokens, prepared, positions):
+    def _expand_image_pads(
+        self, prompt_tokens, prepared, positions, *, score_job=False
+    ):
         """Widens the template's single placeholder per image to the image's
         merged token count and returns the spans the engine injects into."""
         token_count = self._image_token_count(prompt_tokens, prepared, positions)
@@ -462,6 +479,7 @@ class Frontend:
             token_count,
             len(prepared),
             sum(len(image.pixels) for image in prepared),
+            score_job=score_job,
         )
         expanded, spans, cursor = [], [], 0
         pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
@@ -659,7 +677,10 @@ class Frontend:
         parts = [{"type": "image_url", "image_url": {"url": url}} for url in image_urls]
         with self.latencies.measure("images"):
             images = self._prepare_images(
-                [{"role": "user", "content": parts}], deadline, checkpoint=checkpoint
+                [{"role": "user", "content": parts}],
+                deadline,
+                checkpoint=checkpoint,
+                score_job=True,
             )
         checkpoint()
         return images
@@ -673,7 +694,7 @@ class Frontend:
         rendered, positions, _ = self._render_image_tokens(messages, template)
         if rendered != tokens:
             raise APIError(500, "question prompt could not be rendered")
-        return self._expand_image_pads(tokens, images, positions)
+        return self._expand_image_pads(tokens, images, positions, score_job=True)
 
     def _encode_score_prompt(self, messages, labels, admit, checkpoint, what):
         """The tokens, answer-slot token ids and text of a scoring prompt. The
