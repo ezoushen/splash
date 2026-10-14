@@ -2,6 +2,9 @@
 
 #include "metal/MetalBackend.hpp"
 
+#include <cstdint>
+#include <optional>
+
 namespace splash::model {
 
 // Memory the engine gives back while idle and takes again before it runs the
@@ -23,6 +26,10 @@ public:
   // metal::MetalAllocationError with the cause. On any other failure the
   // weights are unusable: the engine stops.
   [[nodiscard]] virtual bool restore(const metal::AllocationAdmission &admit) = 0;
+  // The bytes of the released parts that other processes still hold, so that
+  // a release does not overstate what macOS got back; none when the memory is
+  // not shared with other processes.
+  [[nodiscard]] virtual std::optional<uint64_t> heldElsewhereBytes() const { return std::nullopt; }
 };
 
 } // namespace splash::model

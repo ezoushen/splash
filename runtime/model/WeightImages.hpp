@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -91,6 +92,11 @@ public:
   [[nodiscard]] bool released() const noexcept override { return released_; }
   void release() override;
   [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
+  // The bytes of the images not yet restored that another process held when
+  // the last release let go of this process's view of them; none without
+  // sharing. A process that ends after that release is not noticed until the
+  // next one.
+  [[nodiscard]] std::optional<uint64_t> heldElsewhereBytes() const override;
 
   struct Contents final {
     std::string_view component;
@@ -109,6 +115,9 @@ private:
     ImageOrigin origin = ImageOrigin::Private;
     // The image's key in SharedImages, empty for a private image.
     std::string key;
+    // Whether another process held the image when the last release let go of
+    // this process's view of it.
+    bool heldElsewhere = false;
   };
   // Takes back the memory of image, from the process that holds it or by
   // writing it.

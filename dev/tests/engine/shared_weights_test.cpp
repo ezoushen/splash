@@ -52,6 +52,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -639,7 +640,7 @@ std::string restoreReply(model::WeightImages &images, Admission &admit) {
 // but with unrecorded. "load NAME KIND" loads the model NAME under ROOT of
 // the kind of model KIND; "release", "restore [IMAGES]" (an admission that
 // refuses after IMAGES images), "contents", "sizes", "admitted" and
-// "allocated" are about its images. "copy ..." does the same with images that
+// "allocated" and "held" are about its images. "copy ..." does the same with images that
 // copy bytes of a file, whose next write can stop or run out of memory.
 int runEngine(char **argv) {
   metal::MetalBackend backend(argv[2]);
@@ -698,6 +699,10 @@ int runEngine(char **argv) {
       std::cout << "sizes";
       for (const auto &image : models.back().images->contents()) std::cout << ' ' << image.bytes.size();
       std::cout << std::endl;
+    } else if (verb == "held") {
+      // The bytes of the released images that other processes still hold.
+      const auto held = models.back().images->heldElsewhereBytes();
+      std::cout << "held " << (held ? std::to_string(*held) : "none") << std::endl;
     } else if (verb == "allocated") {
       std::cout << "allocated " << backend.memoryStats().allocatedBytes << std::endl;
     } else if (verb == "copy") {
@@ -1170,6 +1175,38 @@ size_t countOrigin(const Images &images, const std::string &origin) {
 
 double secondsSince(std::chrono::steady_clock::time_point started) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+}
+
+// What a process's release lets go of that other processes still hold, which
+// is what macOS did not get back: all of it while another process maps every
+// image, less the images that come back, and none once no other process holds
+// them. A process that shares nothing has no such figure.
+void testReleaseReportsWhatOthersStillHold(const Setup &setup) {
+  setup.checkpoint("base", targetTensors());
+  auto first = setup.engine(), second = setup.engine(), alone = setup.engine(false);
+  static_cast<void>(parseImages(first->ask("load base mlx")));
+  static_cast<void>(parseImages(second->ask("load base mlx")));
+  const std::vector<uint64_t> sizes = numbersOf(second->ask("sizes"), "sizes");
+  const uint64_t total = std::accumulate(sizes.begin(), sizes.end(), uint64_t{0});
+  require(sizes.size() > 2 && total > 0, "the model has too few images for the test");
+  const auto held = [](Engine &engine) { return engine.ask("held"); };
+  require(held(*second) == "held 0", "a process that released nothing reported " + held(*second));
+  static_cast<void>(second->ask("release"));
+  require(held(*second) == "held " + std::to_string(total),
+          "a release with another process holding every image reported " + held(*second) + ", not " +
+              std::to_string(total));
+  // Two images come back from the process that holds them.
+  static_cast<void>(second->ask("restore 2"));
+  require(held(*second) == "held " + std::to_string(total - sizes[0] - sizes[1]),
+          "a restore of two images left " + held(*second));
+  static_cast<void>(second->ask("restore"));
+  require(held(*second) == "held 0", "a restore of every image left " + held(*second));
+  static_cast<void>(second->ask("release"));
+  static_cast<void>(first->ask("release"));
+  require(held(*first) == "held 0", "a release with no other process holding an image reported " + held(*first));
+  static_cast<void>(alone->ask("load base mlx"));
+  static_cast<void>(alone->ask("release"));
+  require(held(*alone) == "held none", "a process that shares nothing reported " + held(*alone));
 }
 
 // A restore asks its admission for each image's full size, an image another
@@ -1905,6 +1942,7 @@ int main(int argc, char **argv) {
     if (selected("fine-tune", 120)) testFineTuneSharesWhatMatches(Setup(self, argv[1]));
     if (selected("unshared", 120)) testUnsharedCreatesNothing(Setup(self, argv[1]));
     if (selected("release and restore", 120)) testReleaseAndRestoreKeepOtherHolders(Setup(self, argv[1]));
+    if (selected("held elsewhere", 120)) testReleaseReportsWhatOthersStillHold(Setup(self, argv[1]));
     if (selected("restore admission", 120)) testRestoreAdmitsReceivedImagesInFull(Setup(self, argv[1]));
     if (selected("restore refused", 120)) testRestoreRefusedPartWay(Setup(self, argv[1]));
     if (selected("writer out of memory", 120)) testWriterOutOfMemoryLeavesNoLockOrMapping(Setup(self, argv[1]));

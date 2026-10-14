@@ -261,6 +261,10 @@ struct WeightsSnapshot {
   // The restores that gave up for want of memory: their requests failed
   // retryably and the weights were released again.
   uint64_t restoreFailures = 0;
+  // With the weights shared with other processes (--share-weights), the
+  // bytes of the released images that they still hold, which macOS did not
+  // get back (model::WeightMemory::heldElsewhereBytes); none otherwise.
+  std::optional<uint64_t> heldElsewhereBytes = std::nullopt;
 };
 
 // The prefill FFN's Neural Engine split (RuntimeResources::aneFfnSnapshot).

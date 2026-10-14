@@ -53,6 +53,9 @@ public:
   // process wrote it (ImageRegistry::acquire).
   bool acquire(const std::string &key, uint64_t bytes, const std::function<void(metal::MappedMemory)> &attach,
                const std::function<void()> &write);
+  // Whether another process holds the image under key, of bytes
+  // (ImageRegistry::heldByAnother).
+  [[nodiscard]] bool heldByAnother(const std::string &key, uint64_t bytes);
   // Begins a pass of acquires, a load or a restore (ImageRegistry::newPass).
   void newPass();
 

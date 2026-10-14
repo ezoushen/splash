@@ -37,6 +37,9 @@ public:
     if (!splitReleased_)
       splitReleased_ = split_ && split_->release();
   }
+  [[nodiscard]] std::optional<uint64_t> heldElsewhereBytes() const override {
+    return images_.heldElsewhereBytes();
+  }
   [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override {
     // Every image, then the program.
     if (images_.released() || !splitReleased_)
