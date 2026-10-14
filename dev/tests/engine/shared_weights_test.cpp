@@ -691,12 +691,12 @@ int runEngine(char **argv) {
       // released, by component.
       std::cout << imagesReply(*models.back().images) << std::endl;
     } else if (verb == "admitted") {
-      // The sizes the last restore asked its admission for, and the sizes
-      // of the images, in load order, as they are held.
+      // The sizes the last restore asked its admission for, in load order.
       std::cout << "admitted";
       for (uint64_t bytes : admission.admitted) std::cout << ' ' << bytes;
       std::cout << std::endl;
     } else if (verb == "sizes") {
+      // The sizes of the images, in load order, while they are held.
       std::cout << "sizes";
       for (const auto &image : models.back().images->contents()) std::cout << ' ' << image.bytes.size();
       std::cout << std::endl;
