@@ -3,7 +3,9 @@
 // source, and report where each image came from and what it holds. Each
 // loader's images are tested so: the target's from MLX, Model Optimizer and
 // compressed-tensors checkpoints and from GGUFs, the draft's and the vision
-// tower's from MLX checkpoints and a GGUF mmproj.
+// tower's from MLX checkpoints and a GGUF mmproj. So is the lifecycle of
+// the images in memory: release and restore under an admission, a holder that
+// is killed or stopped, and a writer that is refused memory.
 //
 //   shared-weights PRODUCTION_METALLIB OTHER_METALLIB [TEST]
 //
@@ -47,6 +49,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <regex>
@@ -563,10 +566,83 @@ const char *originName(model::ImageOrigin origin) {
   return "unknown";
 }
 
+// The images this process wrote itself through copyImage, and what a writer
+// does as it begins its next image: nothing, stops (SIGSTOP), or is refused
+// memory, as a GPU writer is when the driver runs short.
+unsigned gWrites = 0;
+enum class NextWrite { Normal, Stop, OutOfMemory };
+NextWrite gNextWrite = NextWrite::Normal;
+
+constexpr std::string_view kCopyMagic = "TEST0001";
+
+// An image of a 16 KiB header block, then bytes [offset, offset + bytes) of
+// file, padded to 16 KiB: what a loader's writer would plan, with no model.
+model::ImagePlan copyImage(std::shared_ptr<model::WeightSource> file, std::string component, uint64_t offset,
+                           uint64_t bytes) {
+  const uint64_t imageBytes = model::kWeightFileAlignment + model::alignWeightOffset(bytes);
+  model::ImagePlan plan{std::move(component), std::string(kCopyMagic), 0, 0, imageBytes,
+                        [file, offset, bytes](std::span<uint8_t> image, const metal::MetalBuffer &) {
+                          ++gWrites;
+                          const NextWrite next = std::exchange(gNextWrite, NextWrite::Normal);
+                          if (next == NextWrite::Stop) raise(SIGSTOP);
+                          if (next == NextWrite::OutOfMemory) throw metal::MetalAllocationError("writer out of memory");
+                          std::memset(image.data(), 0, image.size());
+                          const auto header = model::weightFileHeader(kCopyMagic, 0, 0);
+                          std::memcpy(image.data(), header.data(), header.size());
+                          file->readData(offset, image.subspan(model::kWeightFileAlignment, bytes));
+                          file->checkUnchanged();
+                        }};
+  plan.description = "copy " + std::to_string(bytes);
+  plan.sources = {{file.get(), offset, bytes}};
+  return plan;
+}
+
+// The reply that lists each image's origin and the SHA-256 of its bytes.
+std::string imagesReply(const model::WeightImages &images) {
+  std::string reply = "images";
+  for (const auto &image : images.contents())
+    reply += std::string(" ") + std::string(image.component) + "=" + originName(image.origin) + ":" +
+             (image.bytes.empty() ? "released" : model::weightDigest(image.bytes));
+  return reply;
+}
+
+// An admission as the memory governor's: it admits `limit` images, then
+// refuses, and gives the cause of an allocation the driver refused. The sizes
+// it was asked for are in admitted.
+struct Admission final {
+  unsigned limit = std::numeric_limits<unsigned>::max();
+  std::vector<uint64_t> admitted;
+  metal::AllocationResult operator()(uint64_t bytes, const std::function<void()> &allocate) {
+    if (admitted.size() >= limit) return metal::AllocationFailure::HostPressure;
+    admitted.push_back(bytes);
+    try {
+      allocate();
+    } catch (const metal::MetalAllocationError &error) {
+      return error.failure();
+    }
+    return {};
+  }
+};
+
+// Restores images, as the engine does one image a tick, until they are all
+// back or the admission refuses one: then "refused" and the cause.
+std::string restoreReply(model::WeightImages &images, Admission &admit) {
+  try {
+    while (!images.restore(std::ref(admit))) {
+    }
+  } catch (const metal::MetalAllocationError &refusal) {
+    return std::string("refused ") + refusal.what();
+  }
+  return imagesReply(images);
+}
+
 // Arguments: METALLIB ROOT REGISTRY DIGESTS on|off|unrecorded. Every file in
 // ROOT is a source, recorded by its SHA-256 as the installer records a file,
 // but with unrecorded. "load NAME KIND" loads the model NAME under ROOT of
-// the kind of model KIND.
+// the kind of model KIND; "release", "restore [IMAGES]" (an admission that
+// refuses after IMAGES images), "contents", "sizes", "admitted" and
+// "allocated" are about its images. "copy ..." does the same with images that
+// copy bytes of a file, whose next write can stop or run out of memory.
 int runEngine(char **argv) {
   metal::MetalBackend backend(argv[2]);
   std::cout << "ready" << std::endl;
@@ -591,6 +667,10 @@ int runEngine(char **argv) {
     shared = std::make_shared<model::SharedImages>(std::move(config));
   }
   std::vector<model::LoadedModel> models;
+  // Images of copyImage's, which a test makes fail as it likes.
+  model::WeightImages copies(backend, "sources", shared);
+  std::map<std::string, std::shared_ptr<model::WeightSource>> sources;
+  Admission admission;
   do {
     std::istringstream command(line);
     std::string verb, name, kind;
@@ -599,16 +679,58 @@ int runEngine(char **argv) {
       if (verb == "load")
         models.push_back(model::loadModel(backend, root / name, descriptorOf(kindNamed(kind)), {}, shared));
       else if (verb == "release") models.back().images->release();
-      else if (verb == "restore")
-        while (!models.back().images->restore(splash::test::admitAll)) {
-        }
+      else if (verb == "restore") {
+        // After name images (all, with none) the admission refuses.
+        admission = Admission{};
+        if (!name.empty()) admission.limit = unsigned(std::stoul(name));
+        const std::string reply = restoreReply(*models.back().images, admission);
+        std::cout << reply << std::endl;
+        continue;
+      }
       // The images' origin and the SHA-256 of their bytes, empty while
       // released, by component.
-      std::string reply = "images";
-      for (const auto &image : models.back().images->contents())
-        reply += std::string(" ") + std::string(image.component) + "=" + originName(image.origin) + ":" +
-                 (image.bytes.empty() ? "released" : model::weightDigest(image.bytes));
-      std::cout << reply << std::endl;
+      std::cout << imagesReply(*models.back().images) << std::endl;
+    } else if (verb == "admitted") {
+      // The sizes the last restore asked its admission for, and the sizes
+      // of the images, in load order, as they are held.
+      std::cout << "admitted";
+      for (uint64_t bytes : admission.admitted) std::cout << ' ' << bytes;
+      std::cout << std::endl;
+    } else if (verb == "sizes") {
+      std::cout << "sizes";
+      for (const auto &image : models.back().images->contents()) std::cout << ' ' << image.bytes.size();
+      std::cout << std::endl;
+    } else if (verb == "allocated") {
+      std::cout << "allocated " << backend.memoryStats().allocatedBytes << std::endl;
+    } else if (verb == "copy") {
+      // copy load FILE OFFSET BYTES, copy release, copy restore, copy
+      // contents, and copy fail or copy stop for the next write.
+      if (name == "load") {
+        uint64_t offset = 0, bytes = 0;
+        command >> offset >> bytes;
+        auto &source = sources[kind];
+        if (!source) source = std::make_shared<model::WeightSource>(root / kind);
+        const unsigned before = gWrites;
+        const model::WeightFile loaded =
+            copies.load(copyImage(source, "test/copy-" + std::to_string(copies.contents().size()) + ".bin", offset, bytes));
+        static_cast<void>(loaded);
+        std::cout << "loaded " << gWrites - before << ' ' << imagesReply(copies) << std::endl;
+      } else if (name == "release") {
+        copies.release();
+        std::cout << imagesReply(copies) << std::endl;
+      } else if (name == "restore") {
+        admission = Admission{};
+        std::cout << restoreReply(copies, admission) << std::endl;
+      } else if (name == "contents") {
+        std::cout << imagesReply(copies) << std::endl;
+      } else if (name == "writes") {
+        std::cout << "writes " << gWrites << std::endl;
+      } else if (name == "fail" || name == "stop") {
+        gNextWrite = name == "fail" ? NextWrite::OutOfMemory : NextWrite::Stop;
+        std::cout << "next write " << name << std::endl;
+      } else {
+        std::cout << "unknown command " << verb << ' ' << name << std::endl;
+      }
     } else if (verb == "identity") {
       // The writers' identity as this process runs them, or as its executable
       // file gives it.
@@ -676,9 +798,13 @@ public:
     require(reply() == "ready", "an engine process did not start");
   }
   ~Engine() {
+    // A stopped process cannot see the end of its commands.
+    if (stopped_) ::kill(pid_, SIGCONT);
     if (commands_) fclose(commands_);
-    int status = 0;
-    waitpid(pid_, &status, 0);
+    if (pid_ > 0) {
+      int status = 0;
+      waitpid(pid_, &status, 0);
+    }
     if (slot_ < std::size(gEngines)) gEngines[slot_] = 0;
     if (replies_) fclose(replies_);
   }
@@ -706,9 +832,35 @@ public:
     return reply;
   }
 
+  [[nodiscard]] pid_t pid() const { return pid_; }
+  // Ends the process at once, as the system does when it kills it for memory.
+  void kill() {
+    ::kill(pid_, SIGKILL);
+    int status = 0;
+    waitpid(pid_, &status, 0);
+    if (slot_ < std::size(gEngines)) gEngines[slot_] = 0;
+    pid_ = -1;
+  }
+  // Stops the process, as SIGSTOP or a debugger does, until resume().
+  void stop() {
+    ::kill(pid_, SIGSTOP);
+    stopped();
+  }
+  // Waits until the process stopped, itself or by stop().
+  void stopped() {
+    int status = 0;
+    require(waitpid(pid_, &status, WUNTRACED) == pid_ && WIFSTOPPED(status), "an engine process did not stop");
+    stopped_ = true;
+  }
+  void resume() {
+    ::kill(pid_, SIGCONT);
+    stopped_ = false;
+  }
+
 private:
   pid_t pid_ = -1;
   size_t slot_ = std::size(gEngines);
+  bool stopped_ = false;
   FILE *commands_ = nullptr;
   FILE *replies_ = nullptr;
 };
@@ -766,6 +918,10 @@ public:
   // reversed.
   void model(const Kind &kind, const std::string &name, bool reversed = false) const {
     kind.write(root_.path() / name, reversed);
+  }
+  // Writes the source file called name, which copy images are read from.
+  void source(const std::string &name, const std::vector<uint8_t> &bytes) const {
+    splash::test::writeFile(root_.path() / name, bytes);
   }
   const std::filesystem::path &registry() const { return registry_; }
   const std::filesystem::path &tables() const { return tables_.path(); }
@@ -961,8 +1117,10 @@ void testFineTuneSharesWhatMatches(const Setup &setup) {
 }
 
 // A process that releases its memory lets go of its view only: another
-// process that holds the image keeps its bytes, and the restore writes the
-// image again into memory of the restoring process alone.
+// process that holds the image keeps its bytes, and the restore maps the image
+// that process holds, writing nothing. The memory goes back to macOS when no
+// process holds it any more, so that a process that loads the model after
+// every holder released writes the images again.
 void testReleaseAndRestoreKeepOtherHolders(const Setup &setup) {
   setup.checkpoint("base", targetTensors());
   auto first = setup.engine(), second = setup.engine();
@@ -978,8 +1136,270 @@ void testReleaseAndRestoreKeepOtherHolders(const Setup &setup) {
             "another process's release changed " + component + " in the process that holds it");
   const Images restored = targetImages(parseImages(second->ask("restore")));
   for (const auto &[component, image] : received)
-    require(restored.at(component).digest == image.digest && restored.at(component).origin == "private",
-            "a restored " + component + " is not a copy of this process's own with the same bytes");
+    require(restored.at(component).digest == image.digest && restored.at(component).origin == "received",
+            "a restore did not map " + component + " that another process holds, or it holds other bytes");
+  const Images after = targetImages(parseImages(first->ask("contents")));
+  for (const auto &[component, image] : written)
+    require(after.at(component).digest == image.digest, "a restore in one process changed " + component + " in another");
+  // Every holder let go: the memory is gone, and the next load writes it.
+  require(!targetImages(parseImages(first->ask("release"))).empty() &&
+              !targetImages(parseImages(second->ask("release"))).empty(),
+          "a process did not release its images");
+  const Images last = targetImages(parseImages(setup.engine()->ask("load base mlx")));
+  for (const auto &[component, image] : written)
+    require(last.at(component).origin == "written" && last.at(component).digest == image.digest,
+            component + " was still held after every process released it, or differs");
+}
+
+// The numbers after a reply's first word, which is word.
+std::vector<uint64_t> numbersOf(const std::string &reply, const std::string &word) {
+  std::istringstream words(reply);
+  std::string first;
+  words >> first;
+  require(first == word, "an engine process answered " + reply);
+  std::vector<uint64_t> numbers;
+  for (uint64_t number; words >> number;) numbers.push_back(number);
+  return numbers;
+}
+
+uint64_t allocatedBy(Engine &engine) { return numbersOf(engine.ask("allocated"), "allocated").at(0); }
+
+size_t countOrigin(const Images &images, const std::string &origin) {
+  return size_t(std::count_if(images.begin(), images.end(), [&](const auto &entry) {
+    return entry.second.origin == origin && entry.second.digest != "released";
+  }));
+}
+
+double secondsSince(std::chrono::steady_clock::time_point started) {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+}
+
+// A restore asks its admission for each image's full size, an image another
+// process holds as one it writes: the memory is this process's own to account
+// for, whoever else maps it.
+void testRestoreAdmitsReceivedImagesInFull(const Setup &setup) {
+  setup.checkpoint("base", targetTensors());
+  auto first = setup.engine(), second = setup.engine();
+  static_cast<void>(parseImages(first->ask("load base mlx")));
+  const Images received = parseImages(second->ask("load base mlx"));
+  require(countOrigin(received, "received") == received.size(), "a second process did not receive every image");
+  const std::vector<uint64_t> sizes = numbersOf(second->ask("sizes"), "sizes");
+  static_cast<void>(second->ask("release"));
+  const Images restored = parseImages(second->ask("restore"));
+  require(countOrigin(restored, "received") == restored.size(), "a restore wrote an image another process holds");
+  require(numbersOf(second->ask("admitted"), "admitted") == sizes,
+          "a restore did not ask its admission for each image at its full size");
+}
+
+// An admission that refuses part-way through a restore leaves the images
+// before the refused one mapped and the others released, with no memory held
+// for the refused one; a release then gives back only what came back, and a
+// restore that starts over maps every image again. Another process that loads
+// meanwhile receives what is held and writes the rest.
+void testRestoreRefusedPartWay(const Setup &setup) {
+  setup.checkpoint("base", targetTensors());
+  auto first = setup.engine(), second = setup.engine();
+  const Images written = parseImages(first->ask("load base mlx"));
+  static_cast<void>(parseImages(second->ask("load base mlx")));
+  const uint64_t loaded = allocatedBy(*second);
+  static_cast<void>(second->ask("release"));
+  const uint64_t released = allocatedBy(*second);
+  require(released < loaded, "a released process still holds its images");
+
+  constexpr unsigned back = 3;
+  const std::string refused = second->ask("restore " + std::to_string(back));
+  require(refused.starts_with("refused ") && refused.find("host memory reserve protected") != std::string::npos,
+          "a restore refused by admission answered " + refused);
+  const Images partial = parseImages(second->ask("contents"));
+  size_t held = 0;
+  for (const auto &[component, image] : partial) {
+    if (image.digest == "released") continue;
+    ++held;
+    require(image.origin == "received" && image.digest == written.at(component).digest,
+            "the image " + component + " before the refused one did not come back whole");
+  }
+  require(held == back, std::to_string(held) + " images came back before the refusal, not " + std::to_string(back));
+  const uint64_t partway = allocatedBy(*second);
+  require(partway > released && partway < loaded, "the images before the refusal were not the memory held");
+  require(second->ask("restore 0").starts_with("refused ") && allocatedBy(*second) == partway,
+          "an image that admission refused holds memory");
+
+  // Meanwhile nothing waits for a lock: a process that loads receives the
+  // images held and writes the others.
+  static_cast<void>(first->ask("release"));
+  const auto started = std::chrono::steady_clock::now();
+  auto third = setup.engine();
+  const Images beside = parseImages(third->ask("load base mlx"));
+  require(secondsSince(started) < 5, "a restore refused part-way held up another process's load");
+  require(countOrigin(beside, "received") == back && countOrigin(beside, "written") == beside.size() - back,
+          "another process did not receive the images a partial restore holds and write the others");
+
+  // A release in the middle of a restore gives back what came back, no more.
+  static_cast<void>(second->ask("release"));
+  require(allocatedBy(*second) == released, "a release during a restore kept memory");
+  const Images again = parseImages(second->ask("restore"));
+  for (const auto &[component, image] : written)
+    require(again.at(component).digest == image.digest && again.at(component).origin == "received",
+            "a restore that started over did not map " + component + " as it was");
+  require(allocatedBy(*second) == loaded, "a restore that started over did not take back the memory");
+}
+
+// What a process answers to a copy image's load: how many images it wrote,
+// then its images.
+struct Copied final {
+  unsigned writes = 0;
+  Images images;
+};
+
+Copied parseCopied(const std::string &reply) {
+  std::istringstream words(reply);
+  std::string loaded;
+  Copied copied;
+  words >> loaded >> copied.writes;
+  require(loaded == "loaded", "an engine process answered " + reply);
+  std::string images;
+  std::getline(words, images);
+  copied.images = parseImages(images);
+  return copied;
+}
+
+// A writer that runs out of memory as a restore writes its image leaves no
+// lock and no mapping: the image stays released, holds no memory, and another
+// process that needs the same image is not held up by the lock, writes it and
+// serves it to the next.
+void testWriterOutOfMemoryLeavesNoLockOrMapping(const Setup &setup) {
+  setup.source("o.bin", pattern(100000, 31));
+  auto writer = setup.engine(), other = setup.engine();
+  const Copied written = parseCopied(writer->ask("copy load o.bin 0 65536"));
+  require(written.writes == 1, "a process did not write its image");
+  static_cast<void>(writer->ask("copy release"));
+  const uint64_t released = allocatedBy(*writer);
+  const uint64_t writes = numbersOf(writer->ask("copy writes"), "writes").at(0);
+  require(writer->ask("copy fail") == "next write fail", "a process did not take a command");
+  const std::string refused = writer->ask("copy restore");
+  require(refused.starts_with("refused "), "a restore whose writer ran out of memory answered " + refused);
+  require(numbersOf(writer->ask("copy writes"), "writes").at(0) == writes + 1,
+          "the restore did not reach its writer, so that it refused nothing");
+  const Images held = parseImages(writer->ask("copy contents"));
+  require(held.begin()->second.digest == "released" && allocatedBy(*writer) == released,
+          "an image whose writer ran out of memory holds memory");
+
+  // Another process asks for the key at once: the lock is free and it writes
+  // under it, so that the next process receives the image from it.
+  const auto started = std::chrono::steady_clock::now();
+  const Copied wrote = parseCopied(other->ask("copy load o.bin 0 65536"));
+  const double waited = secondsSince(started);
+  require(wrote.writes == 1 && waited < 0.8,
+          "a process that asked for the key of a writer that ran out of memory waited " + std::to_string(waited) + " s");
+  auto third = setup.engine();
+  const Copied received = parseCopied(third->ask("copy load o.bin 0 65536"));
+  require(received.writes == 0 && received.images.begin()->second.digest == wrote.images.begin()->second.digest &&
+              received.images.begin()->second.digest == written.images.begin()->second.digest,
+          "an image written after a writer ran out of memory was not served, or differs");
+
+  // The writer that failed restores it by receiving it.
+  const Images restored = parseImages(writer->ask("copy restore"));
+  require(restored.begin()->second.origin == "received" && restored.begin()->second.digest == written.images.begin()->second.digest,
+          "the writer that ran out of memory did not receive the image afterwards");
+}
+
+// A process stopped while it writes an image, holding the image's lock, delays
+// another process that needs the image by a bounded wait for the lock, after
+// which that one writes a copy of its own.
+void testStoppedWriterIsWaitedForBoundedly(const Setup &setup) {
+  setup.source("p.bin", pattern(100000, 32));
+  auto stopped = setup.engine(), other = setup.engine();
+  require(stopped->ask("copy stop") == "next write stop", "a process did not take a command");
+  stopped->send("copy load p.bin 0 65536");
+  stopped->stopped();
+  const auto started = std::chrono::steady_clock::now();
+  const Copied written = parseCopied(other->ask("copy load p.bin 0 65536"));
+  const double waited = secondsSince(started);
+  require(written.writes == 1, "a process did not write an image whose writer stopped");
+  require(waited < 6, "a stopped writer delayed a load by " + std::to_string(waited) + " s");
+  stopped->resume();
+  const Copied resumed = parseCopied(stopped->reply());
+  require(resumed.writes == 1 && resumed.images.begin()->second.digest == written.images.begin()->second.digest,
+          "a resumed writer's image differs");
+}
+
+// A holder killed leaves the others' images whole and nothing behind: the
+// survivors serve the same bytes, a process that starts afterwards maps what
+// they hold, the files of the process that was killed are removed, and the
+// memory goes back when the last holder is gone.
+void testKilledHolderLeavesOthersServing(const Setup &setup) {
+  setup.checkpoint("base", targetTensors());
+  auto first = setup.engine(), second = setup.engine();
+  const Images written = parseImages(first->ask("load base mlx"));
+  static_cast<void>(parseImages(second->ask("load base mlx")));
+  const std::string dead = std::to_string(first->pid()) + "-";
+  const auto leftBy = [&](const std::string &prefix) {
+    size_t files = 0;
+    for (const auto &entry : std::filesystem::directory_iterator(setup.registry()))
+      files += entry.path().filename().string().starts_with(prefix);
+    return files;
+  };
+  require(leftBy(dead) > 0, "a holder has no files in the registry");
+  first->kill();
+  const Images kept = parseImages(second->ask("contents"));
+  for (const auto &[component, image] : written)
+    require(kept.at(component).digest == image.digest, component + " changed when the process that wrote it was killed");
+
+  auto restart = setup.engine();
+  const Images restarted = parseImages(restart->ask("load base mlx"));
+  for (const auto &[component, image] : written)
+    require(restarted.at(component).origin == "received" && restarted.at(component).digest == image.digest,
+            "a restart did not map " + component + " that a survivor holds");
+  require(leftBy(dead) == 0, "the files of a process that was killed were left in the registry");
+
+  // A survivor that releases and restores while a process holds the images
+  // maps them again; the last holder's end ends the memory.
+  static_cast<void>(second->ask("release"));
+  const Images mapped = parseImages(second->ask("restore"));
+  require(countOrigin(mapped, "received") == mapped.size(), "a survivor's restore wrote images that a process holds");
+  second->kill();
+  const Images alone = parseImages(restart->ask("contents"));
+  for (const auto &[component, image] : written)
+    require(alone.at(component).digest == image.digest, component + " changed when the second holder was killed");
+  static_cast<void>(restart->ask("release"));
+  const Images rewritten = parseImages(restart->ask("restore"));
+  require(countOrigin(rewritten, "written") == rewritten.size(),
+          "a restore received images that no process held, or the memory was not given back");
+  for (const auto &[component, image] : written)
+    require(rewritten.at(component).digest == image.digest, "a rewritten " + component + " differs");
+  restart->kill();
+  require(parseImages(setup.engine()->ask("load base mlx")).begin()->second.origin == "written",
+          "an image outlived every process that held it");
+}
+
+// A stopped process that holds images delays another process's load, and its
+// restore, once each: after one wait for an answer the other process passes
+// over it and writes its images, rather than waiting per image. A restore
+// after it resumed asks it again and receives.
+void testStoppedHolderIsPassedOverOncePerPass(const Setup &setup) {
+  setup.checkpoint("base", targetTensors());
+  auto stopped = setup.engine(), other = setup.engine();
+  const Images held = parseImages(stopped->ask("load base mlx"));
+  stopped->stop();
+  auto started = std::chrono::steady_clock::now();
+  const Images loaded = parseImages(other->ask("load base mlx"));
+  const double loading = secondsSince(started);
+  require(countOrigin(loaded, "written") == loaded.size(), "an image of a stopped process was received");
+  require(loading < 8, "a stopped process delayed a load by " + std::to_string(loading) + " s");
+  static_cast<void>(other->ask("release"));
+  started = std::chrono::steady_clock::now();
+  const Images restored = parseImages(other->ask("restore"));
+  const double restoring = secondsSince(started);
+  require(countOrigin(restored, "written") == restored.size(), "a restore received from a stopped process");
+  require(restoring < 8, "a stopped process delayed a restore by " + std::to_string(restoring) + " s");
+  for (const auto &[component, image] : held)
+    require(restored.at(component).digest == image.digest, "images written beside a stopped process differ");
+
+  stopped->resume();
+  require(parseImages(stopped->ask("contents")).size() == held.size(), "a resumed process lost its images");
+  static_cast<void>(other->ask("release"));
+  const Images again = parseImages(other->ask("restore"));
+  require(countOrigin(again, "received") == again.size(), "a restore did not ask a holder that had stopped, once it resumed");
 }
 
 // Without sharing a process creates no registry and no digest table, and its
@@ -1491,6 +1911,12 @@ int main(int argc, char **argv) {
     if (selected("fine-tune", 120)) testFineTuneSharesWhatMatches(Setup(self, argv[1]));
     if (selected("unshared", 120)) testUnsharedCreatesNothing(Setup(self, argv[1]));
     if (selected("release and restore", 120)) testReleaseAndRestoreKeepOtherHolders(Setup(self, argv[1]));
+    if (selected("restore admission", 120)) testRestoreAdmitsReceivedImagesInFull(Setup(self, argv[1]));
+    if (selected("restore refused", 120)) testRestoreRefusedPartWay(Setup(self, argv[1]));
+    if (selected("writer out of memory", 120)) testWriterOutOfMemoryLeavesNoLockOrMapping(Setup(self, argv[1]));
+    if (selected("stopped writer", 120)) testStoppedWriterIsWaitedForBoundedly(Setup(self, argv[1]));
+    if (selected("killed holder", 120)) testKilledHolderLeavesOthersServing(Setup(self, argv[1]));
+    if (selected("stopped holder", 180)) testStoppedHolderIsPassedOverOncePerPass(Setup(self, argv[1]));
     if (selected("unrecorded", 120)) testUnrecordedSourcesAreNotShared(Setup(self, argv[1]));
     if (selected("running code", 120)) testWriterIsTheRunningCode(Setup(self, argv[1]));
     if (selected("plan keys", 120)) testKeyCoversThePlan(Setup(self, argv[1]));

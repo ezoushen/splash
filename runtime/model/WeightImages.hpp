@@ -73,9 +73,12 @@ enum class ImageOrigin : uint8_t {
 // fails (MetalBackend::releaseMemory). Every image's file records
 // contentIdentity, what the sources hold (ModelDescriptor::sourceIdentity).
 // With shared, each image a loader describes is the memory other processes
-// hold for the same contents, or memory this one writes and shares; the
-// memory of an image that other processes hold stays while any of them does.
-// A restore writes every image again into memory of this process alone.
+// hold for the same contents, or memory this one writes and shares; a release
+// lets go of this process's view only, so the memory of an image that other
+// processes hold stays while any of them does and goes back to the system with
+// the last. A restore asks the processes that hold each image first and
+// writes it only when none does; it asks inside the admission, which charges
+// the image's full size whoever else maps it.
 class WeightImages final : public WeightMemory {
 public:
   explicit WeightImages(metal::MetalBackend &backend, std::string contentIdentity = {},
@@ -108,7 +111,12 @@ private:
     metal::MetalBuffer buffer;
     ImageWriter write;
     ImageOrigin origin = ImageOrigin::Private;
+    // The image's key in SharedImages, empty for a private image.
+    std::string key;
   };
+  // Takes back the memory of image, from the process that holds it or by
+  // writing it.
+  void restoreImage(Image &image);
   metal::MetalBackend *backend_;
   std::string contentIdentity_;
   std::shared_ptr<SharedImages> shared_;

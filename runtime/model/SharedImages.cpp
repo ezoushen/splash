@@ -55,6 +55,8 @@ bool SharedImages::acquire(const std::string &key, uint64_t bytes,
   return impl_->registry.acquire(key, bytes, attach, write);
 }
 
+void SharedImages::newPass() { impl_->registry.newPass(); }
+
 namespace {
 
 // The digest of an engine's code: its __TEXT segment, from the Mach-O header

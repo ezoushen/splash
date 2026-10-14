@@ -40,7 +40,7 @@ WeightFile WeightImages::load(ImagePlan image) {
   }
   WeightFile file(*backend_, buffer, image.component, image.magic, image.layer, image.type,
                   image.declaredBytes ? image.declaredBytes : buffer.sizeBytes(), contentIdentity_);
-  images_.push_back({std::move(image.component), std::move(buffer), std::move(image.write), origin});
+  images_.push_back({std::move(image.component), std::move(buffer), std::move(image.write), origin, std::move(key)});
   return file;
 }
 
@@ -48,26 +48,48 @@ void WeightImages::release() {
   // During a restore, only the images it wrote back hold memory.
   const size_t held = released_ ? restored_ : images_.size();
   for (size_t index = 0; index < held; ++index) backend_->releaseMemory(images_[index].buffer);
+  // The restores that follow are a new pass among the holders: one that did
+  // not answer in time is asked again.
+  if (shared_) shared_->newPass();
   released_ = true;
   restored_ = 0;
+}
+
+void WeightImages::restoreImage(Image &image) {
+  const auto write = [&] { image.write(contentsOf(image.buffer), image.buffer); };
+  bool attached = false;
+  try {
+    if (image.key.empty()) {
+      backend_->restoreMemory(image.buffer);
+      attached = true;
+      write();
+      image.origin = ImageOrigin::Private;
+    } else {
+      const bool written = shared_->acquire(
+          image.key, image.buffer.sizeBytes(),
+          [&](metal::MappedMemory memory) {
+            backend_->restoreMemory(image.buffer, std::move(memory));
+            attached = true;
+          },
+          write);
+      image.origin = written ? ImageOrigin::Written : ImageOrigin::Received;
+    }
+  } catch (const metal::MetalAllocationError &) {
+    // A writer refused memory of its own leaves the image released too; the
+    // registry has already let go of the image's lock.
+    if (attached) backend_->releaseMemory(image.buffer);
+    throw;
+  }
 }
 
 bool WeightImages::restore(const metal::AllocationAdmission &admit) {
   if (!released_) throw std::logic_error("weights are not released");
   if (restored_ < images_.size()) {
     Image &image = images_[restored_];
-    const metal::AllocationResult admitted = admit(image.buffer.sizeBytes(), [&] {
-      backend_->restoreMemory(image.buffer);
-      try {
-        image.write(contentsOf(image.buffer), image.buffer);
-      } catch (const metal::MetalAllocationError &) {
-        // A writer refused memory of its own leaves the image released too.
-        backend_->releaseMemory(image.buffer);
-        throw;
-      }
-      // Memory of this process alone, whatever the image was before.
-      image.origin = ImageOrigin::Private;
-    });
+    // Admitted at its full size, whether another process holds the image or
+    // not; the registry is asked inside, so that a refusal asks no one.
+    const metal::AllocationResult admitted =
+        admit(image.buffer.sizeBytes(), [&] { restoreImage(image); });
     if (!admitted)
       throw metal::MetalAllocationError("unable to restore " + image.component + ": " +
                                             metal::allocationFailureName(admitted.failure),
