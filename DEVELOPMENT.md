@@ -2335,9 +2335,11 @@ images, and the restore loads it again in one tick more, after the last image
 `splash serve --share-weights` (a switch, off by default) passes
 `--share-weights on` to `serve-native`, which lets the processes of one user
 that load the same images hold one copy of each (`SharedImages.hpp`). Without
-it the engine is passed no option, loads exactly as before and creates no shared
-memory, registry, lock or digest table, and its status document has no field
-that only sharing adds. An image is
+it the engine is passed no option, creates no shared memory, registry, lock or
+digest table, shares no image, and its status document has no field that only
+sharing adds. The switch changes nothing about which images are created: a
+MoE target's routed experts are an image of their own, `experts-N`, with or
+without it ([Weight loading](#weight-loading)). An image is
 keyed by the SHA-256 of the code that writes it, its plan, and the SHA-256 of
 every source byte it reads:
 
