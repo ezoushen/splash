@@ -5,9 +5,10 @@
 
 namespace splash::model {
 
-// Block images keep the routed experts of each projection as one tensor, the
-// shared expert's as another, and the router and the shared-expert scalar
-// gate in F32 (readMoeBlock).
+// Block images keep the routed experts of each projection as one tensor, in
+// the layer's experts image (`routed`), the shared expert's as another, and
+// the router and the shared-expert scalar gate in F32, in the layer's
+// (readMoeBlock).
 Qwen3_6MoeWeights
 loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
                       const QwenTargetFiles &files) {
@@ -15,9 +16,8 @@ loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
       backend, layout, files, [&](auto &loader, const BlockTargetFormat &format, const MoeExperts &experts) {
         return readQwenTargetWeights<Qwen3_6MoeWeights>(
             layout, loader, format,
-            [&](WeightFile &file, Qwen3_6MoeLayerWeights &layer, const BlockTargetFormat &, uint32_t index) {
-              layer.ffn = readMoeBlock(file, experts, index);
-            });
+            [&](WeightFile &file, WeightFile &routed, Qwen3_6MoeLayerWeights &layer, const BlockTargetFormat &,
+                uint32_t index) { layer.ffn = readMoeBlock(file, routed, experts, index); });
       });
 }
 

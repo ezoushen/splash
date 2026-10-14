@@ -70,24 +70,32 @@ struct MoeExperts final {
 [[nodiscard]] MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetFiles &files,
                                         const QwenTargetDimensions &target);
 
-// A MoE block's sections in image order: its router, its routed experts'
-// gate, up and down (none when they stream), its shared expert's gate, up
+// A MoE block's sections in image order: from the layer's image `file` its
+// router, from its experts image `routed` its routed experts' gate, up and
+// down (none when they stream), then from `file` its shared expert's gate, up
 // and down and its scalar gate. Block `block` of the store when its experts
 // stream.
-[[nodiscard]] ops::BlockMoeWeights readMoeBlock(WeightFile &file, const MoeExperts &experts, uint32_t block);
+[[nodiscard]] ops::BlockMoeWeights readMoeBlock(WeightFile &file, WeightFile &routed, const MoeExperts &experts,
+                                                uint32_t block);
 
 // Reads a target through the files of its images, written from an upstream
 // source, in their format: per layer the input norm, mixer,
 // post-attention norm and the architecture's FFN through readFfn (called
 // with the file, the layer's weights, the format and the layer's index),
 // then the head and the token embedding. Weights is the architecture's
-// weight struct.
+// weight struct. A sparse MoE's readFfn takes the layer's routed experts'
+// file as well, after the layer's; each file is recorded once, in load order,
+// so the manifest fingerprint covers the experts.
 template <class Weights, class Layout, class Files, class ReadFfn>
 [[nodiscard]] Weights
 readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetFormat &format, ReadFfn readFfn) {
   Weights result;
   result.layout = layout;
   result.layers.reserve(layout.layers);
+  const auto record = [&](WeightFile &file) {
+    file.finish();
+    result.files.push_back(file.record());
+  };
 
   for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex) {
     const bool fullAttention = layout.isFullAttentionLayer(layerIndex);
@@ -96,9 +104,15 @@ readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetForm
     layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
     layer.mixer = readQwenMixer(file, format, layout, fullAttention);
     layer.postAttentionNorm = format.norm(file, layout.hiddenSize, "post-attention-norm");
-    readFfn(file, layer, format, layerIndex);
-    file.finish();
-    result.files.push_back(file.record());
+    if constexpr (requires { readFfn(file, file, layer, format, layerIndex); }) {
+      WeightFile experts = files.experts(layerIndex);
+      readFfn(file, experts, layer, format, layerIndex);
+      record(file);
+      record(experts);
+    } else {
+      readFfn(file, layer, format, layerIndex);
+      record(file);
+    }
   }
 
   {

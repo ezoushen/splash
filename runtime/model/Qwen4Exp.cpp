@@ -114,12 +114,13 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
         for (uint32_t index = 0; index < layout.layers; ++index) {
           const bool fullAttention = layout.isFullAttentionLayer(index);
           WeightFile file = gguf.layer(index);
+          WeightFile routed = gguf.experts(index);
           Qwen4ExpLayerWeights &layer = result.layers.emplace_back();
           layer.mixerHyper = readHyper(file, layout, true, "mixer-hyper");
           layer.mixer = readQwenMixer(file, format, layout, fullAttention);
           if (fullAttention) layer.indexer = readIndexer(file, layout);
           layer.ffnHyper = readHyper(file, layout, true, "ffn-hyper");
-          layer.ffn = readMoeBlock(file, experts, index);
+          layer.ffn = readMoeBlock(file, routed, experts, index);
           if (index == layout.pleLayer) {
             Qwen4PleWeights ple;
             ple.key = format.projection(file, streams, layout.pleWidth(), "ple-key");
@@ -133,6 +134,8 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
           }
           file.finish();
           result.files.push_back(file.record());
+          routed.finish();
+          result.files.push_back(routed.record());
         }
         {
           WeightFile file = gguf.head();

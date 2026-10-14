@@ -60,7 +60,8 @@ bool floatProjectionType(uint32_t type) { return floatType(type) || type == ggml
 bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
 
 // The header type of the image of a table a family adds (planImages), beside
-// the layers' 0 and 1 (GDN and full attention) and the head's 2.
+// the layers' 0 and 1 (GDN and full attention), the head's 2 and a MoE
+// layer's routed experts' (kGgufExpertsImageType).
 constexpr uint32_t kTableImageType = 3;
 
 // A repack of a [rows, columns] tensor in format, of no image section yet;
@@ -389,9 +390,8 @@ void mixerImage(Builder &b, const QwenTargetDimensions &g, const std::string &p,
 // A layer's dense FFN or sparse MoE, which every family's layers hold.
 void ffnImage(Builder &b, const QwenTargetDimensions &g, const std::string &p) {
   if (g.ffnKind == QwenFfnKind::SparseMoe) {
-    const uint64_t routed = g.experts, width = g.expertIntermediateSize;
-    b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
-    b.routedExperts(p, routed, width, g.hiddenSize);
+    const uint64_t width = g.expertIntermediateSize;
+    b.floatTensor(p + "ffn_gate_inp.weight", g.experts, g.hiddenSize);
     b.quantized(p + "ffn_gate_shexp.weight", width, g.hiddenSize);
     b.quantized(p + "ffn_up_shexp.weight", width, g.hiddenSize);
     b.quantized(p + "ffn_down_shexp.weight", g.hiddenSize, width);
@@ -523,6 +523,15 @@ template <class Use> decltype(auto) withFamily(std::string_view architecture, Us
   return use(HybridGguf{});
 }
 
+// A sparse MoE layer's routed experts: gate, up, then down; with
+// options.streamExperts none of their sections, which stream (Image::experts).
+Image expertsImage(const GgufFile &file, const QwenTargetDimensions &g, std::vector<std::string> &problems,
+                   uint32_t index, PlanOptions options) {
+  Builder b(file, g, problems, "experts-" + std::to_string(index) + ".bin", index, kGgufExpertsImageType, options);
+  b.routedExperts(prefix(index), g.experts, g.expertIntermediateSize, g.hiddenSize);
+  return b.finish();
+}
+
 // The images of a target from a GGUF of Family (planImages).
 template <class Family>
 std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options) {
@@ -534,6 +543,7 @@ std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions
                   g.isFullAttentionLayer(index) ? 1u : 0u, options);
     Family::layer(layer, g, index);
     images.push_back(layer.finish());
+    if (imagesPerLayer(g) == 2) images.push_back(expertsImage(file, g, problems, index, options));
   }
   Builder head(file, g, problems, "head.bin", g.layers, 2);
   Family::head(head, g);
@@ -575,11 +585,12 @@ void requireRotation(const GgufFile &file, const QwenTargetDimensions &g, const 
 
 } // namespace
 
-std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers) {
+std::vector<StreamedExperts> streamedExperts(std::span<const Image> images) {
   std::vector<StreamedExperts> result;
-  for (const Image &layer : layers) {
-    if (!layer.experts) throw GgufError("a target layer's experts do not stream");
-    result.push_back(*layer.experts);
+  for (const Image &image : images) {
+    if (image.type != kGgufExpertsImageType) continue;
+    if (!image.experts) throw GgufError("a target layer's experts do not stream");
+    result.push_back(*image.experts);
   }
   return result;
 }

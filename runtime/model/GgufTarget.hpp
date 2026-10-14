@@ -49,6 +49,8 @@ public:
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
   [[nodiscard]] WeightFile layer(uint32_t index);
+  // A sparse MoE layer's routed experts, which its layer image does not hold.
+  [[nodiscard]] WeightFile experts(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
   // The image of the table the family's GGUF holds after the embedding
@@ -75,14 +77,19 @@ private:
   struct Planned {
     explicit Planned(const std::vector<std::filesystem::path> &paths) : source(paths) {}
     OpenGguf source;
-    // Each layer's image, then the head's, the embedding's and a table's
-    // (gguf::planImages).
+    // Each layer's images (gguf::imagesPerLayer), then the head's, the
+    // embedding's and a table's (gguf::planImages).
     std::vector<gguf::Image> images;
     uint32_t layers = 0;
+    size_t layerImages = 1;
     SparseRowStoreOptions table;
     ExpertStoreOptions experts;
+    // The index of the first image after the layers': the head's.
+    [[nodiscard]] size_t layerEnd() const noexcept { return layers * layerImages; }
   };
   [[nodiscard]] WeightFile open(size_t index);
+  // Image `part` of target layer `index`: the layer's, or its experts'.
+  [[nodiscard]] WeightFile openLayer(uint32_t index, size_t part);
   // The plan of the table's image, or null for a family without one.
   [[nodiscard]] const gguf::Image *tablePlan() const noexcept;
 

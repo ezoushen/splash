@@ -37,9 +37,29 @@
       "target/embedding.bin": "6d17df18962f4941a0ce6538aa0092dba1073c78848a62f577a666b81a89e159"
     },
     "moe": {
-      "target/layer-0.bin": "6575ec6e4d2c72f2a3b406d490a95d6e4fec0d79b8b2e9110d4948c442f1f449",
+      "target/layer-0.bin": "5cd1d2e122e2b119cb9d58466495ca3ab8930285758916d5bf3bdcff6075b6ef",
+      "target/experts-0.bin": "0af4b1e8f72952604a4f28b6cfaf9bfe31b6bd445bdcd2e7327422474aa2291a",
       "target/head.bin": "cee4659abb8e830f64dc34ad7ecff5b7627ff3bdc81a299d3dd91ff90a7ebaa1",
       "target/embedding.bin": "86a749f41cab45849eb9a2753025779ef1c58e74842b65290534eff4e29403e9"
+    }
+  },
+  "mlx_images": {
+    "moe": {
+      "target/layer-0.bin": "6732b692d6b0b6e03afc858478505badf579cbd612f8b3a9c16855fb03f693e4",
+      "target/experts-0.bin": "06abefc21abf9815c795f3ccf019a1bb61eb51eaa1ec631e97fbb191d92d06f6",
+      "target/layer-1.bin": "5bf29c55f3b4e1b35de4b8c507f8054935379cde71d913e409d77562abd59649",
+      "target/experts-1.bin": "7df5daf72f5a64b79fc6b3c341cd7f6d770dc3a506f66eeb064d2d4d189211b8",
+      "target/head.bin": "f36fb0fc5a0aeb356cdfed237dee52817472ec71bc82689aede8d52830d3776f",
+      "target/embedding.bin": "6581b8576a420687915012afe0d0d5f28508bbf1b1f48dff617ae40b9289fbb0"
+    }
+  },
+  "moe_layers_with_experts": {
+    "gguf": {
+      "target/layer-0.bin": "6575ec6e4d2c72f2a3b406d490a95d6e4fec0d79b8b2e9110d4948c442f1f449"
+    },
+    "mlx": {
+      "target/layer-0.bin": "4391ad9964c0aa023db495cffadf90da43d1407275e29472d61e5c6b28586b46",
+      "target/layer-1.bin": "cf1656224211e479a92f05306fbb29f9a7eb4e99e2e64a2464884edea355b936"
     }
   },
   "draft_images": {

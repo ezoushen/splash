@@ -146,7 +146,7 @@ struct StreamedRows final {
   uint32_t format = 0; // its gguf_embedding_format (GGUF_FMT_*)
 };
 struct Image {
-  std::string name; // layer-N.bin, head.bin, embedding.bin, a family's table's (ple.bin)
+  std::string name; // layer-N.bin, experts-N.bin, head.bin, embedding.bin, a family's table's (ple.bin)
   std::string magic; // kGgufImageMagic
   uint32_t layer = 0;
   uint32_t type = 0;
@@ -154,7 +154,8 @@ struct Image {
   std::vector<Fill> fills;
   std::vector<Copy> copies;
   std::vector<Repack> repacks;
-  // A MoE layer's routed experts, when they stream: then not in the image.
+  // A MoE layer's routed experts, when they stream: then not in their image
+  // (experts-N.bin).
   std::optional<StreamedExperts> experts;
   // Its bytes with its routed experts in it, which its record declares
   // whether they stream or not, as a streamed table's image stands in with
@@ -177,9 +178,10 @@ struct PlanOptions {
   bool streamTable = false;
 };
 
-// The routed experts each layer's image streams (Image::experts), in layer
-// order; throws unless every layer's do.
-[[nodiscard]] std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers);
+// The routed experts each MoE layer's experts image (experts-N.bin) among a
+// target's images streams (Image::experts), in layer order; throws unless
+// every experts image's do.
+[[nodiscard]] std::vector<StreamedExperts> streamedExperts(std::span<const Image> images);
 // The bytes of the table rows an image streams (Image::streamedRows), 0 for
 // none.
 [[nodiscard]] uint64_t streamedTableBytes(const Image &image);
@@ -242,10 +244,19 @@ private:
 void requireMetadata(const GgufMetadata &metadata, std::string_view architecture,
                      const QwenTargetDimensions &geometry);
 
-// The images of a target from its GGUF of `architecture`: each layer's, then
-// the head's and the embedding's, then those of the tables its family adds
-// (Qwen3.8-Flash-Next's PLE n-gram table, ple.bin). Checks the metadata
-// (requireMetadata, and the arrays a family's file declares) and each
+// The images of each layer of a target: a sparse MoE layer's and the image of
+// its routed experts, which follows it, else the layer's alone.
+[[nodiscard]] inline size_t imagesPerLayer(const QwenTargetDimensions &geometry) noexcept {
+  return geometry.ffnKind == QwenFfnKind::SparseMoe ? 2 : 1;
+}
+
+// The images of a target from its GGUF of `architecture`: each layer's in
+// order (imagesPerLayer), then the head's and the embedding's, then those of
+// the tables its family adds (Qwen3.8-Flash-Next's PLE n-gram table, ple.bin).
+// A sparse MoE layer's routed experts, most of its bytes, are the image after
+// its own: a model that changes only the rest of the layer, such as a
+// fine-tune of its attention, leaves that image's bytes unchanged. Checks the
+// metadata (requireMetadata, and the arrays a family's file declares) and each
 // tensor's shape; throws GgufError naming every missing tensor and every
 // tensor of a type this build cannot load.
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
