@@ -2368,7 +2368,9 @@ an MLX checkpoint or a GGUF mmproj. An image that reads a file without a
 recorded digest is written into memory of the process alone. A start logs
 `Weight images shared with other processes: N received, M written, K private.`
 once its weights are loaded, so that a second start of one model reads as
-`0 written`.
+`0 written`. `written` counts every image this process wrote into shared memory,
+including a copy written after the wait for another process's write ran out,
+which no other process receives; `private` counts those with no key.
 
 A shared image lives in a POSIX shared-memory object whose name is removed as
 it is created, so it lasts as long as some process maps it or holds its
