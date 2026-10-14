@@ -203,6 +203,15 @@ RequestFrame exampleScoreRequest() {
   return request;
 }
 
+RequestFrame exampleScoreImageRequest() {
+  RequestFrame request = exampleScoreRequest();
+  const RequestFrame image = exampleImageRequest();
+  request.promptTokens = image.promptTokens;
+  request.imageSpans = image.imageSpans;
+  request.imagePixels = image.imagePixels;
+  return request;
+}
+
 RequestFrame exampleIgnoreEosRequest() {
   RequestFrame request = exampleRequest();
   request.constraint = ConstraintMode::None;
@@ -221,6 +230,7 @@ const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
       {"request", exampleRequest()},
       {"request_image", exampleImageRequest()},
       {"request_score", exampleScoreRequest()},
+      {"request_score_image", exampleScoreImageRequest()},
       {"request_ignore_eos", exampleIgnoreEosRequest()},
       {"request_progress", exampleProgressRequest()},
       {"cancel", CancelFrame{91}},
