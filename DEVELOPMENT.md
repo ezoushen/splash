@@ -1713,7 +1713,9 @@ of their bytes; the README beside it gives the procedure for an intended
 change.
 
 `WeightImages` (`WeightImages.hpp`) holds a model's images, each in a Metal
-buffer of its own that the weights are views of. Before any image is written,
+buffer of its own that the weights are views of (a [shared
+image](#shared-weight-images)'s buffer is over memory other processes map too).
+Before any image is written,
 the factory (`ModelFactory.cpp`) constructs the vision tower's loader
 (`planVisionLoader`), the draft's and the target's, so every source's metadata
 is checked first. A writer writes every byte of its image, zeroing alignment
@@ -1778,6 +1780,54 @@ place) stops the engine, which the server starts again. With the [Neural Engine
 split](#neural-engine-prefill), the release unloads its program after the
 images, and the restore loads it again in one tick more, after the last image
 (`ReleasableMemory`).
+
+#### Shared weight images
+
+`serve-native --share-weights on` (`off` by default, which creates no shared
+memory, registry, lock or digest table) lets the processes of one user that
+load the same images hold one copy of each (`SharedImages.hpp`). An image is
+keyed by the SHA-256 of the code that writes it, its plan, and the SHA-256 of
+every source byte it reads:
+
+- The writers' code is the engine as the process runs it (the `__TEXT` segment
+  of its executable, as mapped) and the metallib bytes it loaded, which write
+  every image of the `MDGG0001` layout on the GPU. Files that replace them on
+  disk after the start change nothing.
+- The plan is `gguf::describe(image)`: every field of the image's fills,
+  copies and repacks that decides what `writeGgufImage` writes, and which
+  tensors, rows and scales it reads. Names and offsets in the source files are
+  not in it.
+- A source byte range's digest is the SHA-256 of the SHA-256s of its 4 MiB
+  chunks (`TensorDigests`). A table per source file, named by the digest the
+  installation's `model.json` records for it and kept under
+  `~/Library/Caches/Splash/tensor-digests`, holds them, so a start that finds
+  its images held elsewhere reads no source bytes; the first start after an
+  installation reads each file once more.
+
+The same tensors in another file or at other offsets are the same image, so a
+fine-tune's unchanged routed experts (`experts-N`), embedding and head are its
+base model's, and its changed layers are its own. Only the images of
+safetensors targets are shared so far; an image whose loader does not describe
+it, or that reads a file without a recorded digest, is written into memory of
+the process alone.
+
+A shared image lives in a POSIX shared-memory object whose name is removed as
+it is created, so it lasts as long as some process maps it or holds its
+descriptor, and a process's end, `SIGKILL` included, leaves nothing behind
+(`ImageRegistry.hpp`). Each process holds a lock on a holder file in a
+directory in the user's own temporary directory (`confstr`'s
+`_CS_DARWIN_USER_TEMP_DIR`), which no other user can enter, and serves the
+images it holds on a Unix socket beside it, handing their descriptors over
+with `SCM_RIGHTS`. A process asks the live holders for an image and, when none
+holds it, writes it under a lock of the image's key, so that two processes
+never write one image at once, and serves it once it is written and its
+sources were found unchanged. Liveness is the holder file's lock, never a
+refused connection, which a full backlog causes too. A holder that does not
+answer within 2 s is passed over, and a process waits at most 10 s for another's
+write before it writes a copy of its own. Every process maps an image
+read-only; its buffer is a no-copy buffer over the mapping. Admission and the
+memory plan still count each process's images in full. After an idle release,
+the restore writes each image again into memory of its own process.
 
 #### Explicit weights release
 
