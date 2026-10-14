@@ -152,6 +152,7 @@ void testServerCommandLines(const char *path) {
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"share_weights", [](NativeArguments &read) { read.shareWeights = true; }},
       // A relaunch keeps the first engine's context; with --max-context,
       // which every start holds, its command is the first one's.
       {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
@@ -175,7 +176,7 @@ void testServerCommandLines(const char *path) {
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
-           read.neuralEngine == meant.neuralEngine;
+           read.neuralEngine == meant.neuralEngine && read.shareWeights == meant.shareWeights;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
