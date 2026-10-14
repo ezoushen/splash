@@ -6,7 +6,11 @@
 #include "TestChecks.hpp"
 #include "model/ImageRegistry.hpp"
 
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -182,10 +186,84 @@ void testHeldByAnotherCountsOtherRegistriesOnly() {
   rewritten.letGo();
 }
 
+constexpr unsigned kJoins = 300;
+
+// Joins the registry kJoins times while another registry, in this process or
+// in another, looks up an image all the time and so lists the directory and
+// removes the files of ended processes: a joining registry must not lose its
+// staged holder file to that.
+unsigned failedJoins(const std::filesystem::path &registry) {
+  unsigned failures = 0;
+  std::string first;
+  for (unsigned i = 0; i < kJoins; ++i) {
+    try {
+      ImageRegistry joining(registry, std::chrono::seconds(10));
+    } catch (const std::exception &error) {
+      if (!failures++) first = error.what();
+    }
+  }
+  require(!failures, std::to_string(failures) + " of " + std::to_string(kJoins) +
+                         " joins failed while another registry looked up an image (first: " + first + ")");
+  return failures;
+}
+
+void testJoinWhileAnotherRegistryLooksUp() {
+  const Directory directory;
+  ImageRegistry lister(directory.registry(), std::chrono::seconds(10));
+  std::atomic<bool> done{false};
+  std::thread asker([&] {
+    while (!done) (void)lister.heldByAnother(keyOf('a'), kImageBytes);
+  });
+  try {
+    failedJoins(directory.registry());
+  } catch (...) {
+    done = true;
+    asker.join();
+    throw;
+  }
+  done = true;
+  asker.join();
+}
+
+// The same with the registry that looks up in a process of its own, as two
+// engines are. It forks before this process has a thread.
+void testJoinWhileAnotherProcessLooksUp() {
+  const Directory directory;
+  std::filesystem::create_directory(directory.registry());
+  std::filesystem::permissions(directory.registry(), std::filesystem::perms::owner_all);
+  const pid_t child = fork();
+  require(child != -1, "cannot fork");
+  if (child == 0) {
+    try {
+      ImageRegistry lister(directory.registry(), std::chrono::seconds(10));
+      const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      while (std::chrono::steady_clock::now() < end && getppid() != 1)
+        (void)lister.heldByAnother(keyOf('a'), kImageBytes);
+    } catch (...) {
+    }
+    _exit(0);
+  }
+  const auto stop = [&] {
+    kill(child, SIGKILL);
+    int status = 0;
+    waitpid(child, &status, 0);
+  };
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  try {
+    failedJoins(directory.registry());
+  } catch (...) {
+    stop();
+    throw;
+  }
+  stop();
+}
+
 } // namespace
 
 int main() {
   try {
+    testJoinWhileAnotherProcessLooksUp();
+    testJoinWhileAnotherRegistryLooksUp();
     testConcurrentAcquiresWriteOnce();
     testImageLivesWhileAnyoneMapsIt();
     testFailedWriterLeavesNoLock();

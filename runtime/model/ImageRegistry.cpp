@@ -32,6 +32,9 @@ namespace {
 
 // A key is a SHA-256 in lowercase hex, which also names its lock file.
 constexpr size_t kKeyLength = 64;
+// How many names a joining process tries for its holder file when another
+// process removes the staged one.
+constexpr int kJoinAttempts = 8;
 // How long a process waits for a holder's answer: a holder answers from
 // memory, so only a stopped or overloaded holder takes this long. The asker
 // then goes on as if it did not hold the image, and passes over it until its
@@ -313,6 +316,9 @@ struct ImageRegistry::Impl {
   // the file is staged under .new, and through its rename to .holder; a file
   // of its that this process can lock, or none, means it has ended. The
   // staged name is tried first, as the rename only moves it to the other.
+  // The system creates a file and locks it in two steps, so a process that
+  // looks between them finds a joining process's staged file unlocked and
+  // takes it for an ended process's (join).
   [[nodiscard]] bool ended(std::string_view other) const {
     for (const std::filesystem::path &path : {stagedPath(other), holderPath(other)}) {
       Descriptor file(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
@@ -320,6 +326,47 @@ struct ImageRegistry::Impl {
       return file && flock(file.get(), LOCK_EX | LOCK_NB) == 0;
     }
     return true;
+  }
+
+  // Creates this process's holder file and socket under a new name and
+  // publishes the holder file. The file is created locked, under a staged
+  // name, before the socket is bound, so that no process takes either for an
+  // ended process's (ended) once it has locked it; it is renamed to its name
+  // once the socket listens. A process that looks at the registry in the
+  // moment between the file's creation and its lock may remove the staged
+  // file, and the socket with it: then nothing is published and the caller
+  // joins again under another name.
+  [[nodiscard]] bool join() {
+    name = std::to_string(getpid()) + "-" + randomHex(4);
+    const std::filesystem::path staged = stagedPath(name);
+    const std::filesystem::path socketPath = this->socketPath(name);
+    const sockaddr_un address = socketAddress(socketPath);
+    holder = Descriptor(open(staged.c_str(), O_RDWR | O_CREAT | O_EXCL | O_EXLOCK | O_CLOEXEC | O_NOFOLLOW, 0600));
+    if (!holder) fail("cannot create the image registry holder " + staged.string());
+    try {
+      listener = newSocket(kServeTimeout);
+      if (bind(listener.get(), reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == -1)
+        fail("cannot bind the image registry socket " + socketPath.string());
+      if (listen(listener.get(), SOMAXCONN) == -1) fail("cannot listen on the image registry socket");
+      if (rename(staged.c_str(), holderPath(name).c_str()) == -1) {
+        if (errno != ENOENT) fail("cannot publish the image registry holder");
+        leave();
+        return false;
+      }
+    } catch (...) {
+      leave();
+      throw;
+    }
+    return true;
+  }
+
+  // Removes this process's holder file and socket, and closes them.
+  void leave() {
+    unlink(holderPath(name).c_str());
+    unlink(socketPath(name).c_str());
+    unlink(stagedPath(name).c_str());
+    listener.reset();
+    holder.reset();
   }
 
   // A region this process holds for key, if any.
@@ -371,7 +418,8 @@ struct ImageRegistry::Impl {
   // The image under key from a live holder, or null. Only the files of a
   // process that has ended are removed (ended): a socket may refuse a live
   // holder too (a full backlog). That includes a socket or a staged holder
-  // file a process left when it ended while it joined.
+  // file a process left when it ended while it joined, and, rarely, those
+  // of a process that is joining (join).
   std::shared_ptr<Region> askHolders(const std::string &key, uint64_t bytes) {
     const auto deadline = AwakeClock::now() + kLookupTimeout;
     std::error_code error;
@@ -452,23 +500,10 @@ ImageRegistry::ImageRegistry(const std::filesystem::path &directory, std::chrono
   registry.directory = directory;
   registry.writeWait = writeWait;
   requirePrivateDirectory(directory);
-  registry.name = std::to_string(getpid()) + "-" + randomHex(4);
-  // The holder file is created locked, under a staged name, before the
-  // socket is bound, so no process takes either for an ended process's
-  // (Impl::ended); it is renamed to its name once the socket listens.
-  const std::filesystem::path staged = registry.stagedPath(registry.name);
-  const std::filesystem::path socketPath = registry.socketPath(registry.name);
-  const sockaddr_un address = socketAddress(socketPath);
-  registry.holder =
-      Descriptor(open(staged.c_str(), O_RDWR | O_CREAT | O_EXCL | O_EXLOCK | O_CLOEXEC | O_NOFOLLOW, 0600));
-  if (!registry.holder) fail("cannot create the image registry holder " + staged.string());
+  for (int attempt = 1; !registry.join(); ++attempt)
+    if (attempt == kJoinAttempts)
+      throw std::system_error(ENOENT, std::generic_category(), "cannot publish the image registry holder");
   try {
-    registry.listener = newSocket(kServeTimeout);
-    if (bind(registry.listener.get(), reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == -1)
-      fail("cannot bind the image registry socket " + socketPath.string());
-    if (listen(registry.listener.get(), SOMAXCONN) == -1) fail("cannot listen on the image registry socket");
-    if (rename(staged.c_str(), registry.holderPath(registry.name).c_str()) == -1)
-      fail("cannot publish the image registry holder");
     int wake[2];
     if (pipe(wake) == -1) fail("cannot create the image registry's wake pipe");
     registry.wake = {Descriptor(wake[0]), Descriptor(wake[1])};
@@ -476,9 +511,7 @@ ImageRegistry::ImageRegistry(const std::filesystem::path &directory, std::chrono
     closeOnExec(wake[1]);
     registry.server = std::thread([&registry] { registry.serve(); });
   } catch (...) {
-    unlink(registry.holderPath(registry.name).c_str());
-    unlink(socketPath.c_str());
-    unlink(staged.c_str());
+    registry.leave();
     throw;
   }
 }
