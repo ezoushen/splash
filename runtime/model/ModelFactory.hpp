@@ -26,6 +26,7 @@ namespace splash::model {
 class KvBlockCache;
 class KvHistoryStream;
 class QwenStateStorage;
+class SharedImages;
 class SsdReaders;
 class VisionLoader;
 
@@ -150,11 +151,14 @@ void requireCompatibleModel(const LoadedModel &model);
 
 // Production loading is selected by the validated descriptor. There
 // is one shared engine and DFlash controller; only model execution differs.
+// With shared, the images a loader describes are shared with the other
+// processes that share them (WeightImages).
 [[nodiscard]] LoadedModel
 loadModel(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
                  const ModelDescriptor &descriptor,
-                 const ModelLoadOptions &options = {});
+                 const ModelLoadOptions &options = {},
+                 std::shared_ptr<SharedImages> shared = nullptr);
 
 // The FFN layers of a dense target, which the prefill FFN's Neural Engine
 // split (ops::AneFfn) may take; none for another target.

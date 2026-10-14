@@ -299,6 +299,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/SparseRowStore.cpp \
 	runtime/model/WeightImages.cpp \
 	runtime/model/ImageRegistry.cpp \
+	runtime/model/SharedImages.cpp \
 	runtime/model/TensorDigests.cpp \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/SlotRecycler.cpp \

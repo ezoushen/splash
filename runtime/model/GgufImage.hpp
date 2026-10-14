@@ -234,6 +234,17 @@ private:
   uint32_t expertProjections_ = 0;
 };
 
+// What an image's key covers beside the code that writes it (SharedImages):
+// the text that states each plan field writeGgufImage's output depends on,
+// and the source bytes it reads, in the order the text names them. Names and
+// offsets in the source files are in neither, so the same bytes in another
+// file are the same image.
+struct Description {
+  std::string text;
+  std::vector<SourceBytes> sources;
+};
+[[nodiscard]] Description describe(const Image &image);
+
 // The target geometry a GGUF of `architecture` (its family's layout's
 // ggufArchitecture) declares in its metadata, the architecture included,
 // with the rotary embedding and norms the kernels compute: the RoPE base and

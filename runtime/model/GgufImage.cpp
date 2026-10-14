@@ -5,6 +5,7 @@
 #include "model/GgufImageLayout.hpp"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
+#include "model/WeightStore.hpp"
 
 #include <cmath>
 #include <limits>
@@ -786,6 +787,71 @@ StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t c
   rows.rowBytes = static_cast<uint32_t>(rowBytes);
   rows.format = format;
   return rows;
+}
+
+namespace {
+
+// The source bytes writeGgufImage reads for `rows`, as its reader does
+// (rowReader): the tensors a quantized safetensors tensor or a BF16 weight is
+// built from, else the rows of the file (llama.cpp's NVFP4 rows, the BF16 or
+// F16 rows quantized into Q8_0, or the rows as stored), and the tensor scale.
+void addSources(const TensorRows &rows, std::vector<SourceBytes> &sources) {
+  const auto whole = [&](const SourceTensor *tensor) {
+    if (tensor) sources.push_back({tensor->file, tensor->offset, tensor->bytes});
+  };
+  if (rows.safetensors.codes) {
+    whole(rows.safetensors.codes);
+    whole(rows.safetensors.scales);
+    whole(rows.safetensors.biases);
+  } else if (rows.safetensors.bfloat16 && !rows.ggufNvfp4RowBytes) {
+    whole(rows.safetensors.bfloat16);
+  } else {
+    const uint64_t rowBytes = rows.ggufNvfp4RowBytes  ? rows.ggufNvfp4RowBytes
+                              : rows.ggufFloatRowBytes ? rows.ggufFloatRowBytes
+                                                       : rows.rowBytes;
+    sources.push_back({rows.file, rows.offset + rows.first * rowBytes, rows.rows * rowBytes});
+  }
+  if (rows.scale.rowsPerValue) sources.push_back({rows.scale.file, rows.scale.offset, rows.scale.bytes});
+}
+
+// Every field of `rows` that decides what its reader writes, bar where its
+// bytes are in their files (the sources say what they hold).
+void describeRows(std::ostream &text, const TensorRows &rows) {
+  text << "rows type=" << rows.type << " rows=" << rows.rows << " rowBytes=" << rows.rowBytes
+       << " first=" << rows.first << " order=" << rows.order.from << ',' << rows.order.headRows << ','
+       << rows.order.keyHeads << ',' << rows.order.valueHeadsPerKey
+       << " nvfp4RowBytes=" << rows.ggufNvfp4RowBytes << " floatType=" << rows.ggufFloatType
+       << " floatRowBytes=" << rows.ggufFloatRowBytes << " tensors=" << bool(rows.safetensors.codes)
+       << bool(rows.safetensors.scales) << bool(rows.safetensors.biases) << bool(rows.safetensors.bfloat16)
+       << " scale=" << rows.scale.rowsPerValue << ',' << rows.scale.bytes << ',' << rows.scale.bfloat16 << ','
+       << rows.scale.reciprocal << '\n';
+}
+
+} // namespace
+
+Description describe(const Image &image) {
+  Description description;
+  std::ostringstream text;
+  text << "gguf-image 1\n";
+  for (const Fill &fill : image.fills)
+    text << "fill offset=" << fill.offset << " bytes=" << fill.bytes.size() << " sha256=" << weightDigest(fill.bytes)
+         << '\n';
+  for (const Copy &copy : image.copies) {
+    text << "copy destination=" << copy.destination << " conversion=" << static_cast<unsigned>(copy.conversion) << ' ';
+    describeRows(text, copy.source);
+    addSources(copy.source, description.sources);
+  }
+  for (const Repack &repack : image.repacks) {
+    text << "repack format=" << repack.format << " rows=" << repack.rows << " columns=" << repack.columns
+         << " planes=" << repack.plane0 << ',' << repack.plane1 << ',' << repack.meta
+         << " sources=" << repack.sources.size() << '\n';
+    for (const TensorRows &rows : repack.sources) {
+      describeRows(text, rows);
+      addSources(rows, description.sources);
+    }
+  }
+  description.text = text.str();
+  return description;
 }
 
 } // namespace splash::model::gguf
