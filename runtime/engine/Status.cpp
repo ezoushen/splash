@@ -15,7 +15,8 @@ namespace {
 
 const char *boolean(bool value) noexcept { return value ? "true" : "false"; }
 
-// idle_release_seconds is null with --idle-release off.
+// idle_release_seconds is null with --idle-release off; held_elsewhere_bytes
+// is there only with the weights shared with other processes.
 void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights) {
   out << "{\"idle_release_seconds\":";
   if (std::isinf(weights.idleReleaseSeconds))
@@ -25,7 +26,9 @@ void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights) {
   out << ",\"released\":" << boolean(weights.released)
       << ",\"restoring\":" << boolean(weights.restoring)
       << ",\"restores\":" << weights.restores
-      << ",\"restore_failures\":" << weights.restoreFailures << '}';
+      << ",\"restore_failures\":" << weights.restoreFailures;
+  if (weights.heldElsewhereBytes) out << ",\"held_elsewhere_bytes\":" << *weights.heldElsewhereBytes;
+  out << '}';
 }
 
 // reruns: the chunks the GPU ran again alone once the split's work for them

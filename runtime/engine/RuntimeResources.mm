@@ -454,11 +454,25 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   model::LoadedModel loaded;
   try {
     const auto started = AwakeClock::now();
-    loaded = model::loadModel(*backend, config.modelRoot, config.model);
+    std::shared_ptr<model::SharedImages> shared;
+    if (config.shareWeights)
+      shared = std::make_shared<model::SharedImages>(model::sharedImagesConfig(
+          *config.shareWeights, config.modelRoot, model::writerIdentity(*backend)));
+    loaded = model::loadModel(*backend, config.modelRoot, config.model, std::move(shared));
     requireLoadedModel(loaded);
     const std::chrono::duration<double> loading = AwakeClock::now() - started;
     logLine("Weights loaded in ", std::fixed, std::setprecision(2),
             loading.count(), " s.");
+    if (config.shareWeights) {
+      size_t received = 0, written = 0, held = 0;
+      for (const auto &image : loaded.images->contents()) {
+        ++held;
+        received += image.origin == model::ImageOrigin::Received;
+        written += image.origin == model::ImageOrigin::Written;
+      }
+      logLine("Weight images shared with other processes: ", received, " received, ", written, " written, ",
+              held - received - written, " private.");
+    }
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(), {},

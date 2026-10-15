@@ -98,6 +98,7 @@ access.
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
+| `--share-weights` | Off | Share weight memory with other Splash processes of this build, of this user, that load the same weights. See [shared weight images](#shared-weight-images). |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume's free space up to 32 GiB, a size such as `16G` sets the quota, `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--max-cache-disk-writes` | `0` (no limit) | The most the SSD cache writes a day, e.g. `200G`. See [SSD cache](#ssd-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts. See [persistent cache](#persistent-cache). |
@@ -1132,7 +1133,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
 | `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
-| `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
+| `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures`, `held_elsewhere_bytes` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, the restores that gave up for want of memory, and with `--share-weights` the bytes of the released images that other processes still hold (`0` while the weights are held; [shared weight images](#shared-weight-images)) |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |
@@ -1682,6 +1683,14 @@ without requantization, quantizes the draft's BF16 projections
 `float(-exp(double(A_log)))`, which may differ by one float ULP from MLX's float
 exponential.
 
+A sparse MoE layer's routed experts, most of its bytes, are the image after
+its own, `experts-N` (header type 3) beside `layer-N`, in both planners
+(`SafetensorsImage.cpp`, `GgufImage.cpp`); the layer's image keeps the router
+and the shared expert. A fine-tune that changes the attention or the shared
+expert but leaves the experts unchanged leaves the experts image's bytes
+unchanged. The sections of each image keep their order and 16 KiB alignment,
+so the two images hold exactly the sections the layer's one image held.
+
 Loading never rounds a target or vision weight but in the F32 values of
 quantized tensors the kernels read unquantized, and in two conversions: the
 GDN decay above and the RMSNorm weights below. The first are a safetensors
@@ -1705,7 +1714,9 @@ of their bytes; the README beside it gives the procedure for an intended
 change.
 
 `WeightImages` (`WeightImages.hpp`) holds a model's images, each in a Metal
-buffer of its own that the weights are views of. Before any image is written,
+buffer of its own that the weights are views of (a [shared
+image](#shared-weight-images)'s buffer is over memory other processes map too).
+Before any image is written,
 the factory (`ModelFactory.cpp`) constructs the vision tower's loader
 (`planVisionLoader`), the draft's and the target's, so every source's metadata
 is checked first. A writer writes every byte of its image, zeroing alignment
@@ -1771,6 +1782,122 @@ split](#neural-engine-prefill), the release unloads its program after the
 images, and the restore loads it again in one tick more, after the last image
 (`ReleasableMemory`).
 
+#### Shared weight images
+
+`splash serve --share-weights` (a switch, off by default) passes
+`--share-weights on` to `serve-native`, which lets the processes of one user
+that load the same images hold one copy of each (`SharedImages.hpp`). Without
+it the engine is passed no option, creates no shared memory, registry, lock or
+digest table, shares no image, and its status document has no field that only
+sharing adds. The switch changes nothing about which images are created: a
+MoE target's routed experts are an image of their own, `experts-N`, with or
+without it ([Weight loading](#weight-loading)). An image is
+keyed by the SHA-256 of the code that writes it, its plan, and the SHA-256 of
+every source byte it reads:
+
+- The writers' code is the engine as the process runs it (the `__TEXT` segment
+  of its executable, as mapped) and the metallib bytes it loaded, which write
+  every image of the `MDGG0001` layout on the GPU. Files that replace them on
+  disk after the start change nothing.
+- The plan is `gguf::describe(image)` for the images of a target, a GGUF's
+  and a safetensors checkpoint's (MLX, Model Optimizer or compressed-tensors),
+  and of a draft: every field of the image's fills, copies and repacks that
+  decides what `writeGgufImage` writes, and which tensors, rows and scales it
+  reads. The vision tower's (`VisionLoader::image`) is its sections' sizes,
+  padding and offsets, whether its patch embedding is reordered, and the dtype
+  of each tensor it converts. Names and offsets in the source files are not in
+  either.
+- A source byte range's digest is the SHA-256 of the SHA-256s of its 4 MiB
+  chunks (`TensorDigests`). A table per source file, named by the digest the
+  installation's `model.json` records for it and kept under
+  `~/Library/Caches/Splash/tensor-digests`, holds them, so a start that finds
+  its images held elsewhere reads no source bytes; the first start after an
+  installation reads each file once more.
+
+The same tensors in another file or at other offsets are the same image, so a
+fine-tune's unchanged routed experts (`experts-N`), embedding and head are its
+base model's, and its changed layers are its own. Every loader's images are
+shared: a safetensors or a GGUF target's, a draft's and a vision tower's, from
+an MLX checkpoint or a GGUF mmproj. An image that reads a file without a
+recorded digest is written into memory of the process alone. A start logs
+`Weight images shared with other processes: N received, M written, K private.`
+once its weights are loaded, so that a second start of one model reads as
+`0 written`. `written` counts every image this process wrote into shared memory,
+including a copy written after the wait for another process's write ran out,
+which no other process receives; `private` counts those with no key.
+
+A shared image lives in a POSIX shared-memory object whose name is removed as
+it is created, so it lasts as long as some process maps it or holds its
+descriptor, and a process's end, `SIGKILL` included, leaves nothing behind
+(`ImageRegistry.hpp`). Each process holds a lock on a holder file in a
+directory in the user's own temporary directory (`confstr`'s
+`_CS_DARWIN_USER_TEMP_DIR`), which no other user can enter, and serves the
+images it holds on a Unix socket beside it, handing their descriptors over
+with `SCM_RIGHTS`. A process asks the live holders for an image and, when none
+holds it, writes it under a lock of the image's key, so that two processes
+never write one image at once, and serves it once it is written and its
+sources were found unchanged. Liveness is the holder file's lock, never a
+refused connection, which a full backlog causes too. A holder that does not
+answer within 2 s is passed over, and a process waits at most 10 s for another's
+write before it writes a copy of its own. Every process maps an image
+read-only; its buffer is a no-copy buffer over the mapping. Admission and the
+memory plan still count each process's images in full.
+
+An idle release lets go of the process's mapping of each image
+(`WeightImages::release`); the memory stays while another process holds it and
+goes back to macOS when the last holder lets go. The restore asks the live
+holders for each image and maps what one holds, writing it only when none does,
+as a process that starts does. It does so inside the governor's admission of
+the image, which charges the image's full size whether it is mapped or written,
+so that a refusal asks no one and leaves nothing mapped. A writer the driver
+refuses memory for gives back its image's mapping and its lock of the key, so
+that the next process that needs the image writes it, and a release during a
+restore gives back only the images that came back. A holder that does not
+answer is passed over for the rest of a pass, a load or a restore, and asked
+again in the next.
+
+The registry directory and the digest tables' directory must be the user's own:
+a directory of this user's that is not a symbolic link and that no one else may
+read, write or search (`requirePrivateDirectory`, which creates a missing one
+with mode 0700). Sharing refuses any other (`refusing <path>: it must be a
+directory of this user's that no one else may use`) and never falls back to
+another place, so the engine does not start and `splash serve` reports that
+error with the engine's other start-up failures.
+
+After a release, the weights count the images that another process still
+holds, and `weights.held_elsewhere_bytes` in the status document (with
+`POST /v1/memory/release`'s answer) reports their bytes, as the registry
+answered when the release let go of them and less the images a restore has
+since mapped again. That is memory a release did not give back to macOS: the
+other process keeps it, and the figure shows no change if that process ends
+afterwards, until the next release. A process that shares nothing reports no
+such field.
+
+Trust: the processes that share images are those of one user, which trust one
+another: any of them could write the memory it serves, as it could write the
+others' memory anyway, and a receiver's descriptor stays writable although it
+maps the image read-only. They share an image only when their writers' code is
+the same, which holds for servers of one build; that identity does not cover the
+system's libraries and frameworks or the toolchain the build was made with. The
+files in the registry and the digest tables decide which bytes an image holds,
+which is why their directories are checked as above.
+
+Costs: the first start after an installation reads each source file once more,
+for its digests. A start, and a restore after a release, that needs an image
+another process is writing waits for that write, and one that finds a stopped
+process waits as above. Admission and the memory plan count every image in full
+in every process, so each process's `--max-memory` must cover its weights as
+without sharing; macOS charges a shared image's memory to the process that wrote
+it, not to those that map it, as `footprint` and Activity Monitor show. A release asks the
+holders for each image to count what they hold, a lookup per image on the
+engine's tick. The registry's files stay in the user's temporary directory,
+which each process marks as in use every hour so that a cleaner of temporary
+files leaves them; the per-image lock files, a few bytes each, stay and are
+created again when one is missing. They are in a `locks` subdirectory, which a
+lookup does not list; a lookup lists the top of the directory, so the lock files
+that a build without that subdirectory left there are listed, though no key lock
+uses them.
+
 #### Explicit weights release
 
 `POST /v1/memory/release` asks the engine for the same release without waiting
@@ -1785,7 +1912,9 @@ take the weights' memory back on demand instead of on a timer. The server
 answers `200` when the document says the weights are released and not being
 restored (`weights.released` and not `weights.restoring`, as a restore leaves
 them released until its last image is back), whether this request released
-them or they already were. An engine serving a request or restoring its weights
+them or they already were; with `--share-weights` its `weights` also say how
+many bytes of what was released other processes still hold
+(`held_elsewhere_bytes`), which macOS did not get back. An engine serving a request or restoring its weights
 keeps them, and the server answers `409 engine_busy`. An engine that does not
 answer within 5 s, as while it runs a long command, gets `503 engine_busy`, and
 while the engine restarts or the server stops the release gets
@@ -1802,8 +1931,11 @@ through `BlockTargetFormat`, which reads each tensor as one block-quantized
 `QuantizedSegment` (a fused projection's tensors in output column order), the
 norms as F32 (bf16 for an MLX checkpoint), and keeps the GDN output projection's
 input in the source's value-head order, llama.cpp's tiled or MLX's grouped.
-Both Qwen families share one layout
-(`QwenHybridLayout`) and its validator.
+A sparse MoE layer's FFN is read from the layer's image and its routed
+experts' (`experts(index)` of the loader), in file order: router, routed
+experts, shared expert, scalar gate; each image is recorded once, in load
+order, so the manifest fingerprint covers the experts. Both Qwen families
+share one layout (`QwenHybridLayout`) and its validator.
 
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever
@@ -2704,9 +2836,18 @@ the other. Per model, `release-check`:
   twice the run's own ABBA spread, a spread above 5% fails as inconclusive,
   and this build's
   memory plan must hold, without the Neural Engine split, at least the
-  context the baseline's holds without it. `ANE_FFN_SHARE=SHARE` runs
-  every round at that share instead, in each build whose benchmark takes one
-  (0: the GPU alone); a baseline whose benchmark takes none must report none.
+  context the baseline's holds without it. A change that means new image bytes
+  follows the procedure of the goldens README ([Weight loading](#weight-loading)),
+  and `EXPECT_IMAGE_CHANGE` then names the images that change, a regular
+  expression that must match a component's whole name: those may differ or be
+  loaded by one build only, and are recorded in `backend-regression.json` and
+  printed; any other image must keep its bytes, and outputs and acceptance
+  decide as before. A MoE target whose routed experts moved into
+  `target/experts-N.bin` is compared with
+  `EXPECT_IMAGE_CHANGE='target/(layer|experts)-[0-9]+\.bin'`.
+  `ANE_FFN_SHARE=SHARE` runs every round at that share instead, in each build
+  whose benchmark takes one (0: the GPU alone); a baseline whose benchmark
+  takes none must report none.
 
 Results go to `build/release/<owner>--<repo>[--VARIANT]/`. The weight images
 do not depend on the GPU, so each model's `weights.json` must be identical on
@@ -2777,8 +2918,10 @@ checkout, after
 It takes any installed model and, for an upstream one, holds its assembly for
 the whole run, so every round serves the same model. It starts isolated servers
 in ABBA order, compares matched cold, exact-prefix and decode requests by the
-release check's speed rule and weight bytes (decode by `metrics.decode_cycle_ms`
-per output token, so host work between commands counts), and saves
+release check's speed rule and weight bytes (`--expect-image-change REGEX` or
+`EXPECT_IMAGE_CHANGE`, as in the [Release check](#release-check); decode by
+`metrics.decode_cycle_ms` per output token, so host work between commands
+counts), and saves
 `build/release/http-regression.json`. With `--burst N` it sends N requests of
 each context at once instead, 16 output tokens each, and reports each build's
 replay points lost to the burst (`replay_state_publication_failures`), its

@@ -2,11 +2,14 @@
 
 #include "metal/MetalBackend.hpp"
 #include "model/WeightMemory.hpp"
+#include "model/WeightSource.hpp"
 #include "model/WeightStore.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -31,7 +34,12 @@ using ImageWriter = std::function<void(std::span<uint8_t> bytes, const metal::Me
 
 // An image of a model's weights as its loader plans it: the component it is
 // (such as target/layer-0.bin), the header its file starts with, its size and
-// its writer.
+// its writer. For a shared image (SharedImages), its loader also describes
+// it: the sections it plans, and the source bytes the writer reads, in the
+// order the description names them. Together with the writer's code they
+// determine every byte the writer writes; source offsets belong in sources,
+// not in the description, so that the same bytes elsewhere give the same
+// image.
 struct ImagePlan final {
   std::string component;
   std::string magic;
@@ -39,6 +47,24 @@ struct ImagePlan final {
   uint32_t type = 0;
   uint64_t bytes = 0;
   ImageWriter write;
+  std::string description{};
+  std::vector<SourceBytes> sources{};
+};
+
+class SharedImages;
+
+// Where an image's memory came from.
+enum class ImageOrigin : uint8_t {
+  // This process's alone: sharing is off, the loader does not describe the
+  // image, or a file it reads has no recorded digest, so that it has no key.
+  Private,
+  // Memory another process holds for the same contents.
+  Received,
+  // Shared memory this process wrote because no other process held the image
+  // (ImageRegistry::acquire). It is served to the others, except a copy
+  // written after the wait for another process's write ran out, which only
+  // this process maps.
+  Written,
 };
 
 // A model's weights in memory: each image in a buffer of its own, written
@@ -47,25 +73,40 @@ struct ImagePlan final {
 // of it stays the same handle: a command that binds a view of released memory
 // fails (MetalBackend::releaseMemory). Every image's file records
 // contentIdentity, what the sources hold (ModelDescriptor::sourceIdentity).
+// With shared, each image a loader describes is the memory other processes
+// hold for the same contents, or memory this one writes and shares; a release
+// lets go of this process's view only, so the memory of an image that other
+// processes hold stays while any of them does and goes back to the system with
+// the last. A restore asks the processes that hold each image first and
+// writes it only when none does; it asks inside the admission, which charges
+// the image's full size whoever else maps it.
 class WeightImages final : public WeightMemory {
 public:
-  WeightImages(metal::MetalBackend &backend, std::string contentIdentity) noexcept
-      : backend_(&backend), contentIdentity_(std::move(contentIdentity)) {}
+  explicit WeightImages(metal::MetalBackend &backend, std::string contentIdentity = {},
+                        std::shared_ptr<SharedImages> shared = nullptr) noexcept;
+  ~WeightImages() override;
   WeightImages(const WeightImages &) = delete;
   WeightImages &operator=(const WeightImages &) = delete;
 
-  // Allocates the image's buffer, writes it and returns its file.
+  // Takes or allocates the image's buffer, writes it unless another process
+  // holds it, and returns its file.
   [[nodiscard]] WeightFile load(ImagePlan image);
   [[nodiscard]] bool released() const noexcept override { return released_; }
   void release() override;
   [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
+  // The bytes of the images not yet restored that another process held when
+  // the last release let go of this process's view of them; none without
+  // sharing. A process that ends after that release is not noticed until the
+  // next one.
+  [[nodiscard]] std::optional<uint64_t> heldElsewhereBytes() const override;
 
   struct Contents final {
     std::string_view component;
     std::span<const uint8_t> bytes;
+    ImageOrigin origin = ImageOrigin::Private;
   };
-  // Each image's component and bytes in load order, its bytes empty while
-  // released, valid until the next load().
+  // Each image's component, bytes and origin in load order, its bytes empty
+  // while released, valid until the next load().
   [[nodiscard]] std::vector<Contents> contents() const;
 
 private:
@@ -73,9 +114,19 @@ private:
     std::string component;
     metal::MetalBuffer buffer;
     ImageWriter write;
+    ImageOrigin origin = ImageOrigin::Private;
+    // The image's key in SharedImages, empty for a private image.
+    std::string key;
+    // Whether another process held the image when the last release let go of
+    // this process's view of it.
+    bool heldElsewhere = false;
   };
+  // Takes back the memory of image, from the process that holds it or by
+  // writing it.
+  void restoreImage(Image &image);
   metal::MetalBackend *backend_;
   std::string contentIdentity_;
+  std::shared_ptr<SharedImages> shared_;
   std::vector<Image> images_;
   bool released_ = false;
   // The images restore() has written back since release().

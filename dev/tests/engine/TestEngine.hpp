@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace splash::test {
@@ -38,6 +39,7 @@ public:
     return restored_ < kImages;
   }
   void release() override { restored_ = 0; }
+  [[nodiscard]] std::optional<uint64_t> heldElsewhereBytes() const override { return otherProcessesHold; }
   bool restore(const metal::AllocationAdmission &admit) override {
     if (failRestore)
       throw std::runtime_error("weights restore test");
@@ -50,6 +52,9 @@ public:
   // The images in memory.
   [[nodiscard]] uint32_t held() const noexcept { return restored_; }
   bool failRestore = false;
+  // What other processes still hold of the released images, as weights shared
+  // with them report it; none for weights that are not.
+  std::optional<uint64_t> otherProcessesHold;
   // The images written back.
   uint32_t restores = 0;
 

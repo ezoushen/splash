@@ -1,0 +1,377 @@
+// The registry that processes share weight images through (ImageRegistry),
+// with several registries in one process: each serves on a thread of its own
+// and asks the others through its socket as a process would, so that the
+// sanitizers watch the threads and the mappings. The processes that share
+// images are tested in shared_weights_test.cpp.
+#include "TestChecks.hpp"
+#include "model/ImageRegistry.hpp"
+#include "model/ImageRegistryInstrumentation.hpp"
+
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace {
+
+using splash::metal::MappedMemory;
+using splash::model::ImageRegistry;
+using splash::model::ImageRegistryInstrumentation;
+using splash::test::require;
+
+constexpr uint64_t kImageBytes = 3 * 16384 + 123;
+
+// A registry directory of this test alone, which no other user can enter.
+class Directory final {
+public:
+  Directory() {
+    char pattern[] = "/tmp/splash-ir-XXXXXX";
+    require(mkdtemp(pattern) != nullptr, "cannot create a registry directory");
+    root_ = pattern;
+  }
+  ~Directory() {
+    std::error_code ignored;
+    std::filesystem::remove_all(root_, ignored);
+  }
+  Directory(const Directory &) = delete;
+  Directory &operator=(const Directory &) = delete;
+  [[nodiscard]] std::filesystem::path registry() const { return root_ / "registry"; }
+
+private:
+  std::filesystem::path root_;
+};
+
+std::string keyOf(char digit) { return std::string(64, digit); }
+
+uint8_t patternAt(uint64_t index) { return static_cast<uint8_t>(index * 31 + 7); }
+
+// What a registry gave a process for an image, which the test lets go of as
+// the backend lets go of a buffer's memory.
+struct Held final {
+  MappedMemory memory;
+  bool written = false;
+  void letGo() {
+    if (memory.unmap) std::exchange(memory.unmap, {})();
+  }
+};
+
+// One acquire of key through registry, counting the writes in writes: the
+// image's bytes are patternAt, unless write fails.
+Held acquire(ImageRegistry &registry, const std::string &key, std::atomic<unsigned> &writes, bool fail = false) {
+  Held held;
+  held.written = registry.acquire(
+      key, kImageBytes, [&](MappedMemory memory) { held.memory = std::move(memory); },
+      [&] {
+        ++writes;
+        if (fail) throw std::runtime_error("the writer failed");
+        auto *bytes = static_cast<uint8_t *>(held.memory.address);
+        for (uint64_t i = 0; i < kImageBytes; ++i) bytes[i] = patternAt(i);
+      });
+  return held;
+}
+
+bool holdsPattern(const Held &held) {
+  const auto *bytes = static_cast<const uint8_t *>(held.memory.address);
+  for (uint64_t i = 0; i < kImageBytes; ++i)
+    if (bytes[i] != patternAt(i)) return false;
+  return true;
+}
+
+// Registries that ask for one image at the same time write it once and the
+// others receive it, each of them holding the same bytes.
+void testConcurrentAcquiresWriteOnce() {
+  const Directory directory;
+  constexpr size_t count = 6;
+  std::vector<std::unique_ptr<ImageRegistry>> registries;
+  for (size_t i = 0; i < count; ++i)
+    registries.push_back(std::make_unique<ImageRegistry>(directory.registry(), std::chrono::seconds(10)));
+  std::atomic<unsigned> writes{0};
+  std::vector<Held> held(count);
+  std::vector<std::thread> threads;
+  for (size_t i = 0; i < count; ++i)
+    threads.emplace_back([&, i] { held[i] = acquire(*registries[i], keyOf('1'), writes); });
+  for (std::thread &thread : threads) thread.join();
+  require(writes == 1, "registries that asked for one image at once wrote it " + std::to_string(writes.load()) + " times");
+  size_t writers = 0;
+  for (Held &image : held) {
+    writers += image.written;
+    require(holdsPattern(image), "a registry holds other bytes than the image's");
+  }
+  require(writers == 1, "not one registry wrote the image");
+  for (Held &image : held) image.letGo();
+}
+
+// An image is held while some registry's process maps it: another registry
+// then receives it, and once every mapping is let go, writes it again.
+void testImageLivesWhileAnyoneMapsIt() {
+  const Directory directory;
+  ImageRegistry first(directory.registry(), std::chrono::seconds(10)), second(directory.registry(), std::chrono::seconds(10));
+  std::atomic<unsigned> writes{0};
+  Held written = acquire(first, keyOf('2'), writes);
+  Held received = acquire(second, keyOf('2'), writes);
+  require(writes == 1 && !received.written && holdsPattern(received), "a registry did not receive a held image");
+  written.letGo();
+  Held again = acquire(second, keyOf('2'), writes);
+  require(writes == 1 && !again.written && holdsPattern(again), "an image another registry still maps was written again");
+  received.letGo();
+  again.letGo();
+  Held rewritten = acquire(first, keyOf('2'), writes);
+  require(writes == 2 && rewritten.written && holdsPattern(rewritten),
+          "an image that no registry maps any more was received");
+  rewritten.letGo();
+}
+
+// A writer that fails frees the lock of its image's key at once and serves
+// nothing: another registry that asks for the key writes it, without waiting
+// for the wait the writer's lock allows, and serves it to the next.
+void testFailedWriterLeavesNoLock() {
+  const Directory directory;
+  ImageRegistry failing(directory.registry(), std::chrono::seconds(10)), other(directory.registry(), std::chrono::seconds(10)),
+      third(directory.registry(), std::chrono::seconds(10));
+  std::atomic<unsigned> writes{0};
+  Held failed;
+  splash::test::rejects(
+      [&] {
+        failed.written = failing.acquire(
+            keyOf('3'), kImageBytes, [&](MappedMemory memory) { failed.memory = std::move(memory); },
+            [&] {
+              ++writes;
+              throw std::runtime_error("the writer failed");
+            });
+      },
+      "the writer failed", "a writer that failed did not fail its acquire");
+  require(writes == 1, "the acquire did not reach its writer");
+  failed.letGo();
+  const auto started = std::chrono::steady_clock::now();
+  Held written = acquire(other, keyOf('3'), writes);
+  const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  require(writes == 2 && written.written && holdsPattern(written) && waited < 5,
+          "a registry that asked for the key of a failed writer waited " + std::to_string(waited) + " s");
+  Held received = acquire(third, keyOf('3'), writes);
+  require(writes == 2 && !received.written && holdsPattern(received), "the image written after a failed writer was not served");
+  written.letGo();
+  received.letGo();
+}
+
+// Whether another registry holds an image: not this registry's own mapping,
+// not an image no one maps, and not one of another key or length, and the
+// asking leaves no mapping that keeps an image alive.
+void testHeldByAnotherCountsOtherRegistriesOnly() {
+  const Directory directory;
+  ImageRegistry first(directory.registry(), std::chrono::seconds(10)), second(directory.registry(), std::chrono::seconds(10));
+  std::atomic<unsigned> writes{0};
+  require(!first.heldByAnother(keyOf('4'), kImageBytes), "an image no one holds was reported held");
+  Held written = acquire(first, keyOf('4'), writes);
+  require(!first.heldByAnother(keyOf('4'), kImageBytes), "a registry reported its own image as held by another");
+  require(second.heldByAnother(keyOf('4'), kImageBytes), "another registry's image was not reported held");
+  require(!second.heldByAnother(keyOf('5'), kImageBytes) && !second.heldByAnother(keyOf('4'), kImageBytes + 1),
+          "an image of another key or length was reported held");
+  written.letGo();
+  require(!second.heldByAnother(keyOf('4'), kImageBytes), "an image no one maps any more was reported held");
+  Held rewritten = acquire(second, keyOf('4'), writes);
+  require(writes == 2 && rewritten.written, "asking whether an image was held kept it alive");
+  rewritten.letGo();
+}
+
+constexpr unsigned kJoins = 300;
+
+// Joins the registry kJoins times while another registry, in this process or
+// in another, looks up an image all the time and so lists the directory and
+// removes the files of ended processes: a joining registry must not lose its
+// staged holder file to that.
+unsigned failedJoins(const std::filesystem::path &registry) {
+  unsigned failures = 0;
+  std::string first;
+  for (unsigned i = 0; i < kJoins; ++i) {
+    try {
+      ImageRegistry joining(registry, std::chrono::seconds(10));
+    } catch (const std::exception &error) {
+      if (!failures++) first = error.what();
+    }
+  }
+  require(!failures, std::to_string(failures) + " of " + std::to_string(kJoins) +
+                         " joins failed while another registry looked up an image (first: " + first + ")");
+  return failures;
+}
+
+void testJoinWhileAnotherRegistryLooksUp() {
+  const Directory directory;
+  ImageRegistry lister(directory.registry(), std::chrono::seconds(10));
+  std::atomic<bool> done{false};
+  std::thread asker([&] {
+    while (!done) (void)lister.heldByAnother(keyOf('a'), kImageBytes);
+  });
+  try {
+    failedJoins(directory.registry());
+  } catch (...) {
+    done = true;
+    asker.join();
+    throw;
+  }
+  done = true;
+  asker.join();
+}
+
+// The same with the registry that looks up in a process of its own, as two
+// engines are. It forks before this process has a thread.
+void testJoinWhileAnotherProcessLooksUp() {
+  const Directory directory;
+  std::filesystem::create_directory(directory.registry());
+  std::filesystem::permissions(directory.registry(), std::filesystem::perms::owner_all);
+  const pid_t child = fork();
+  require(child != -1, "cannot fork");
+  if (child == 0) {
+    try {
+      ImageRegistry lister(directory.registry(), std::chrono::seconds(10));
+      const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      while (std::chrono::steady_clock::now() < end && getppid() != 1)
+        (void)lister.heldByAnother(keyOf('a'), kImageBytes);
+    } catch (...) {
+    }
+    _exit(0);
+  }
+  const auto stop = [&] {
+    kill(child, SIGKILL);
+    int status = 0;
+    waitpid(child, &status, 0);
+  };
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  try {
+    failedJoins(directory.registry());
+  } catch (...) {
+    stop();
+    throw;
+  }
+  stop();
+}
+
+// A lookup lists the registry for holders and sockets only: the lock files
+// of the images' writers are in a directory of their own, so that their
+// number, which grows with the images ever written, does not slow a lookup.
+// A lock file a process of an earlier layout left at the top is not used.
+void testWriterLocksAreKeptApart() {
+  const Directory directory;
+  ImageRegistry registry(directory.registry(), std::chrono::seconds(10));
+  const std::filesystem::path old = directory.registry() / (keyOf('6') + ".lock");
+  const int taken = open(old.c_str(), O_RDWR | O_CREAT, 0600);
+  require(taken != -1 && flock(taken, LOCK_EX) == 0, "cannot hold a lock file at the top of the registry");
+  std::atomic<unsigned> writes{0};
+  std::vector<Held> held;
+  const auto started = std::chrono::steady_clock::now();
+  for (const char digit : {'6', '7', '8', '9'}) held.push_back(acquire(registry, keyOf(digit), writes));
+  const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  require(writes == 4 && waited < 5, "a lock file at the top of the registry was waited for");
+  size_t locks = 0;
+  for (const auto &entry : std::filesystem::directory_iterator(directory.registry())) {
+    const std::string name = entry.path().filename().string();
+    if (entry.path() == old) continue;
+    if (entry.path().extension() == ".lock") ++locks;
+    else if (entry.path().extension() == ".holder" || entry.path().extension() == ".socket") continue;
+    else require(name == "locks", "the registry holds an unexpected entry " + name);
+  }
+  require(!locks, "a lock file was written at the top of the registry");
+  struct stat state{};
+  require(stat((directory.registry() / "locks").c_str(), &state) == 0 && S_ISDIR(state.st_mode) &&
+              (state.st_mode & 0777) == 0700 && state.st_uid == getuid(),
+          "the writer locks are not in a private directory of the registry");
+  for (Held &image : held) image.letGo();
+  close(taken);
+}
+
+// A lookup that finds a process ended removes only what that process left. A
+// joining process's staged file that the lookup locked in the moment between
+// the file's creation and its lock is such a file, and the joiner then waits
+// for the lock: it gets it as soon as the lookup lets it go. The joiner here
+// is the test, which takes that part at the file level, and the hook holds
+// the lookup, at the first process it finds ended (the lookup visits the
+// names in order), between finding it ended and removing its files, the
+// window in which the joiner could publish. A joiner that published must
+// still be in the registry afterwards: either it did not get past the
+// lookup's removal, and joins again, or the lookup left its file.
+struct JoinerInTheWindow final {
+  std::filesystem::path staged;
+  std::filesystem::path published;
+  std::thread joiner;
+  std::atomic<bool> renamed{false};
+  std::atomic<bool> didPublish{false};
+  int staging = -1;
+};
+JoinerInTheWindow *window = nullptr;
+
+void joinerInTheWindow() {
+  JoinerInTheWindow &w = *window;
+  if (w.joiner.joinable()) return;
+  w.joiner = std::thread([&w] {
+    if (flock(w.staging, LOCK_EX) != 0) return;
+    w.didPublish = rename(w.staged.c_str(), w.published.c_str()) == 0;
+    w.renamed = true;
+  });
+  // The joiner gets the lock at once if the lookup let it go; otherwise it
+  // is still waiting when the wait ends.
+  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+  while (!w.renamed && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
+void testLookupKeepsAJoinersPublishedHolder() {
+  const Directory directory;
+  ImageRegistry lister(directory.registry(), std::chrono::seconds(10));
+  const std::filesystem::path stale = directory.registry() / "9-ended.holder";
+  require(close(open(stale.c_str(), O_RDWR | O_CREAT, 0600)) == 0, "cannot create an ended process's holder file");
+  JoinerInTheWindow w;
+  w.staged = directory.registry() / "2-joining.new";
+  w.published = directory.registry() / "2-joining.holder";
+  // The system created the staged file and has not locked it yet.
+  w.staging = open(w.staged.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+  require(w.staging != -1, "cannot create a joining process's staged file");
+  window = &w;
+  ImageRegistryInstrumentation::setRemovalHook(joinerInTheWindow);
+  try {
+    require(!lister.heldByAnother(keyOf('a'), kImageBytes), "an image was found in an empty registry");
+  } catch (...) {
+    ImageRegistryInstrumentation::setRemovalHook(nullptr);
+    if (w.joiner.joinable()) w.joiner.join();
+    close(w.staging);
+    throw;
+  }
+  ImageRegistryInstrumentation::setRemovalHook(nullptr);
+  w.joiner.join();
+  close(w.staging);
+  require(!std::filesystem::exists(stale), "a lookup left an ended process's holder file");
+  require(!w.didPublish || std::filesystem::exists(w.published),
+          "a lookup removed the holder file of a joiner that had published it");
+}
+
+} // namespace
+
+int main() {
+  try {
+    testJoinWhileAnotherProcessLooksUp();
+    testJoinWhileAnotherRegistryLooksUp();
+    testWriterLocksAreKeptApart();
+    testLookupKeepsAJoinersPublishedHolder();
+    testConcurrentAcquiresWriteOnce();
+    testImageLivesWhileAnyoneMapsIt();
+    testFailedWriterLeavesNoLock();
+    testHeldByAnotherCountsOtherRegistriesOnly();
+    std::cout << "PASS image-registry\n";
+  } catch (const std::exception &error) {
+    std::cerr << "FAIL: " << error.what() << '\n';
+    return 1;
+  }
+  return 0;
+}

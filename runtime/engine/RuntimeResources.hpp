@@ -10,6 +10,7 @@
 #include "engine/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/SharedImages.hpp"
 #include "model/QwenState.hpp"
 #include "engine/MemoryAudit.hpp"
 #include "engine/ReleasableMemory.hpp"
@@ -119,6 +120,11 @@ struct RuntimeResourcesConfig {
   // to it when the model loaded vision and none otherwise. The wire parser
   // keeps the protocol ceiling.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
+  // Where to share the weight images with the other processes of this user
+  // that load the same images (--share-weights, model::SharedImages): the
+  // images share only between processes that run the same code. None for
+  // images of this process alone.
+  std::optional<model::SharedImagesPlace> shareWeights;
   // How long the engine keeps its memory without work (--idle-release): every
   // buffer stays wired that long after the last command (the backend's
   // residency keep-alive), and the weights' memory is freed once that long

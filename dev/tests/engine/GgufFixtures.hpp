@@ -5,7 +5,9 @@
 // native blocks and F32 values, and small qwen35 and qwen35moe GGUF targets
 // in the shapes llama.cpp writes.
 
+#ifdef __OBJC__
 #import <Foundation/Foundation.h>
+#endif
 
 #include "GgufFormatReference.hpp"
 #include "TestFiles.hpp"
@@ -68,6 +70,7 @@ struct MlxTensor {
     return gguf_reference::mlxNative(format(), rows, columns, weight, scales, biases);
   }
 };
+#ifdef __OBJC__
 inline std::vector<MlxTensor> mlxFixture(const char *path) {
   NSData *data = [NSData dataWithContentsOfFile:@(path)];
   NSDictionary *fixture = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
@@ -97,6 +100,7 @@ inline std::vector<MlxTensor> mlxFixture(const char *path) {
   }
   return tensors;
 }
+#endif
 
 inline void check(bool ok, const std::string &what) {
   std::printf("%-64s %s\n", what.c_str(), ok ? "ok" : "FAIL");
@@ -114,6 +118,7 @@ template <class F> void guarded(const std::string &what, F run) {
 
 // The hashes of one section of the goldens file, nested keys joined by '/'.
 using Goldens = std::map<std::string, std::string>;
+#ifdef __OBJC__
 inline Goldens goldens(const char *path, NSString *section) {
   NSData *data = [NSData dataWithContentsOfFile:@(path)];
   NSDictionary *all = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
@@ -130,6 +135,7 @@ inline Goldens goldens(const char *path, NSString *section) {
   flatten(flatten, all[section], "");
   return hashes;
 }
+#endif
 
 // Checks bytes against the golden `name` and prints their hash when it differs.
 inline void checkGolden(const Goldens &hashes, const std::string &name, std::span<const uint8_t> bytes,

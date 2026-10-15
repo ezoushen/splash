@@ -41,15 +41,16 @@ enum class ModuleNames : uint8_t { Mlx, Transformers };
 // MLX's bf16 norms as stored.
 [[nodiscard]] constexpr bool float32Norms(ModuleNames names) noexcept { return names == ModuleNames::Transformers; }
 
-// The layers' images, then the head's and the embedding's. The checkpoint
-// outlives them: their rows read its tensors.
+// The images of each layer in order (gguf::imagesPerLayer), a sparse MoE
+// layer's followed by the image of its routed experts, then the head's and the
+// embedding's. The checkpoint outlives them: their rows read its tensors.
 [[nodiscard]] std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint,
                                                   const QwenTargetDimensions &geometry);
 
 // The modules the images read only quantized, in their order and by `names`:
-// the layers' projections, the routed experts' (as a configuration names
-// them: MLX's stacked tensor per projection, once transformers' mlp.experts) and
-// the shared expert's, and the head. planImages refuses a checkpoint holding
+// the layers' projections and the shared expert's, each followed by the
+// layer's routed experts' (as a configuration names them: MLX's stacked tensor
+// per projection, once transformers' mlp.experts), and the head. planImages refuses a checkpoint holding
 // one unquantized, and the configuration check one its config.json states
 // unquantized (model/ModelDescriptor.mm). The router, the shared-expert gate,
 // GDN alpha and beta and the token table are not among them.

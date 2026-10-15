@@ -1679,6 +1679,8 @@ def _native_command(args, relaunch_context=None):
         )
     if args.disable_ane:
         command.extend(("--ane", "off"))
+    if args.share_weights:
+        command.extend(("--share-weights", "on"))
     if args.decode_share is not None:
         command.extend(("--decode-share", str(args.decode_share)))
     if args.max_image_pixels != image_input.MAX_PIXELS:

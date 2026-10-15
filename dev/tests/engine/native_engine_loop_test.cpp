@@ -1942,6 +1942,14 @@ void testReleaseRequestGivesTheWeightsBackWhenIdle() {
   answer = releaseAnswer(fixture, 6);
   require(weights.released() && answer.released && !answer.restoring,
           "releasing released weights again failed");
+  // Weights shared with other processes say how much of the release the
+  // others still hold; weights that are not say nothing.
+  require(!answer.heldElsewhereBytes, "weights that are not shared reported bytes other processes hold");
+  weights.otherProcessesHold = Weights::kImageBytes;
+  answer = releaseAnswer(fixture, 8);
+  require(answer.heldElsewhereBytes == Weights::kImageBytes,
+          "a release request's answer did not report the bytes other processes still hold");
+  weights.otherProcessesHold.reset();
 
   // A request restores them, an image per tick. A release request during the
   // restore leaves it alone, and its answer reports the restore.
