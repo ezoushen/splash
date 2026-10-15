@@ -203,6 +203,15 @@ RequestFrame exampleScoreRequest() {
   return request;
 }
 
+RequestFrame exampleScoreImageRequest() {
+  RequestFrame request = exampleScoreRequest();
+  const RequestFrame image = exampleImageRequest();
+  request.promptTokens = image.promptTokens;
+  request.imageSpans = image.imageSpans;
+  request.imagePixels = image.imagePixels;
+  return request;
+}
+
 RequestFrame exampleIgnoreEosRequest() {
   RequestFrame request = exampleRequest();
   request.constraint = ConstraintMode::None;
@@ -221,6 +230,7 @@ const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
       {"request", exampleRequest()},
       {"request_image", exampleImageRequest()},
       {"request_score", exampleScoreRequest()},
+      {"request_score_image", exampleScoreImageRequest()},
       {"request_ignore_eos", exampleIgnoreEosRequest()},
       {"request_progress", exampleProgressRequest()},
       {"cancel", CancelFrame{91}},
@@ -370,7 +380,17 @@ void testScoreRequestAndDoneLogits() {
   withImage.imageSpans = {
       {0, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL}};
   withImage.imagePixels.resize(withImage.imageSpans[0].pixelBytes());
-  expectRequestIssue(test, withImage, IssueCode::InvalidCount);
+  CHECK(test, roundTrip(withImage) == withImage);
+
+  // The wire sizes the pixels from the spans, so pixels that do not cover
+  // them are a payload length error.
+  RequestFrame badPixels = withImage;
+  badPixels.imagePixels.resize(16);
+  expectRequestIssue(test, badPixels, IssueCode::InvalidPayloadLength);
+
+  RequestFrame pixelsOnly = request;
+  pixelsOnly.imagePixels = {0};
+  expectRequestIssue(test, pixelsOnly, IssueCode::InvalidPayloadLength);
 
   RequestFrame constrained = request;
   constrained.constraint = ConstraintMode::TokenMask;
