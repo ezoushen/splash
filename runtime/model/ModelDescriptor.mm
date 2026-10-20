@@ -205,9 +205,12 @@ void requireLayerTypes(NSArray *types, const QwenTargetDimensions &target,
   }
 }
 
-// A draft trained for a block no longer than the engine's cannot draft its rows.
-static_assert(DFlashDraftLayout{}.trainedBlockSize == ExecutionLimits::draftQueryRows,
-              "a draft trained for the engine's block is the default");
+// A draft is trained for a block at least as long as the engine's, whose rows
+// it drafts; the default is the engine's own.
+static_assert(DFlashDraftLayout{}.trainedBlockSize == ExecutionLimits::draftQueryRows &&
+                  kQwen3_6Moe35B.draft.trainedBlockSize >= ExecutionLimits::draftQueryRows &&
+                  kQwen3_5Moe122B.draft.trainedBlockSize >= ExecutionLimits::draftQueryRows,
+              "a draft trained for a shorter block than the engine's cannot draft its rows");
 
 // Each family's native window, which its config's max_position_embeddings
 // states, fits the runtime's KV ceiling.

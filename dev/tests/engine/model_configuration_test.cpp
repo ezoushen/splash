@@ -162,7 +162,7 @@ void testMoeGeometries(const std::filesystem::path &fixtures) {
               shipped.hiddenCaptureLayers == std::array<uint32_t, 8>{1, 6, 11, 16, 22, 27, 32, 37},
           "the default MoE layout is no longer the 35B's");
   require(model::kQwen3_6MoeDraftLayout.hiddenSize == 2048 && model::kQwen3_6MoeDraftLayout.intermediateSize == 6144 &&
-              model::kQwen3_6MoeDraftLayout.targetHiddenSize == 16384 && model::kQwen3_6MoeDraftLayout.trainedBlockSize == 8,
+              model::kQwen3_6MoeDraftLayout.targetHiddenSize == 16384,
           "the 35B's draft layout changed");
 
   // A config of neither geometry is refused against the 35B, as before: the
