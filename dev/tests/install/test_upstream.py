@@ -38,7 +38,8 @@ from install import assembly, families, hub, models, paths, upstream
 # tells it apart.
 UNSUPPORTED = (
     "no supported model has this architecture [(]{}[)]; "
-    "supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next"
+    "supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, "
+    "Qwen3.8-Flash-Next"
 )
 
 
@@ -65,6 +66,11 @@ class UpstreamTest(unittest.TestCase):
             with self.subTest(repo=repo):
                 self.assertEqual(models.validate_repo_id(repo), repo)
         self.assertEqual(len(set(repos)), len(repos))
+
+    def test_ornith_122b_is_served_with_the_draft_trained_for_it(self):
+        family = families.named("Qwen3.5-122B-A10B")
+        self.assertIsNotNone(family)
+        self.assertEqual(family.draft_repo, "incoai/Ornith-1.5-122B-DFlash2")
 
     def test_family_is_identified_by_architecture_not_name(self):
         # The engine's check (its model-check command), with and without the
@@ -1052,7 +1058,7 @@ class UpstreamTest(unittest.TestCase):
             f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot install "
             f"{MODEL}@{'b' * 40}: no supported model has this architecture (text "
             "config head_dim: safetensors 128, Qwen3.8-27B 256); supported: Qwen3.8-27B, "
-            "Qwen3.6-35B-A3B, Qwen3.8-Flash-Next",
+            "Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next",
             warnings,
         )
         self.assertEqual(chosen.link.resolve(), installed)

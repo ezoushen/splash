@@ -17,6 +17,7 @@
 #include "model/RopeScaling.hpp"
 #include "model/WeightStore.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <filesystem>
@@ -161,7 +162,7 @@ void testFamilies(const std::filesystem::path &fixtures) {
   // tell its target from other models of the architecture, which Splash does
   // not serve, such as Qwen3.5-4B.
   constexpr std::string_view supported =
-      "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next";
+      "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next";
   struct Refused final {
     std::string_view from, to, difference;
   };
@@ -176,6 +177,85 @@ void testFamilies(const std::filesystem::path &fixtures) {
             "no supported model has this architecture (" + std::string(refused.difference) + ")" +
                 std::string(supported),
             "a config of another model was accepted with " + std::string(refused.to));
+}
+
+// Ornith-1.5-122B is a Qwen3.5-122B-A10B: the same mixed-attention MoE as the
+// 35B at another size. Its sizes below are the ones its own config.json and
+// its DFlash2 draft's state (dev/tests/fixtures/model-configs/qwen3.5-122b-a10b,
+// the files of ornith-ai/Ornith-1.5-122B-MLX-4bit and incoai/Ornith-1.5-122B-DFlash2).
+void testOrnith122B(const std::filesystem::path &fixtures) {
+  const SourceModel ornith = mlxModel(fixtures, "qwen3.5-122b-a10b");
+  const model::ModelDescriptor descriptor = inspect(ornith);
+  require(descriptor.family() == "Qwen3.5-122B-A10B", "an MLX Ornith-1.5-122B was not described as a Qwen3.5-122B-A10B");
+  const auto &target = std::get<model::Qwen3_6MoeLayout>(descriptor.target);
+  require(target.layers == 48 && target.hiddenSize == 3072 && target.vocabularySize == 248320 &&
+              target.nativeContextTokens == 262144 && target.fullAttentionPeriod == 4,
+          "the 122B's depth, width or window differ from its config");
+  require(target.attentionQueryHeads == 32 && target.attentionKvHeads == 2 && target.attentionHeadDimension == 256 &&
+              target.attentionWidth == 8192 && target.rotaryPairs == 32,
+          "the 122B's attention differs from its config");
+  require(target.gdnKeyHeads == 16 && target.gdnValueHeads == 64 && target.gdnHeadDimension == 128 &&
+              target.convolutionDimension == 12288,
+          "the 122B's GDN differs from its config");
+  require(target.experts == 256 && target.expertsPerToken == 8 && target.expertIntermediateSize == 1024,
+          "the 122B's experts differ from its config");
+  constexpr std::array<uint32_t, 8> draftReads{1, 7, 14, 20, 26, 32, 39, 45};
+  require(std::ranges::equal(descriptor.draft.targetLayerIds(), draftReads),
+          "the 122B's draft does not read the layers its draft config names");
+  require(descriptor.draft.layers == 6 && descriptor.draft.hiddenSize == 3072 &&
+              descriptor.draft.intermediateSize == 9216 && descriptor.draft.targetHiddenSize() == 24576 &&
+              descriptor.draft.trainedBlockSize == 16,
+          "the 122B's draft differs from its config");
+}
+
+// The 35B is what Splash's lanes run: giving the 122B a geometry of its own
+// leaves every size the 35B's layout had, and refuses what is neither.
+void testMoeGeometries(const std::filesystem::path &fixtures) {
+  // The shipped 35B layout, by the values it had before the 122B (the
+  // Qwen3.6-35B-A3B config: 40 layers, width 2048, 32 value heads).
+  const model::Qwen3_6MoeLayout shipped;
+  require(shipped.family == "Qwen3.6-35B-A3B" && shipped.layers == 40 && shipped.hiddenSize == 2048 &&
+              shipped.packedGdnWidth == 12544 && shipped.packedFullWidth == 9216 &&
+              shipped.convolutionDimension == 8192 && shipped.gdnValueHeads == 32 && shipped.attentionWidth == 4096 &&
+              shipped.attentionQueryHeads == 16 && shipped.expertIntermediateSize == 512,
+          "the default MoE layout is no longer the 35B's");
+  const model::DFlashDraftLayout moeDraft = inspect(mlxModel(fixtures, "qwen3.6-35b-a3b")).draft;
+  require(moeDraft.hiddenSize == 2048 && moeDraft.intermediateSize == 6144 && moeDraft.targetHiddenSize() == 16384 &&
+              moeDraft.trainedBlockSize == 8,
+          "the 35B's draft layout changed");
+
+  // A config of neither geometry is refused against the 35B, as before: the
+  // 122B's width with another depth, or its depth with another width, is not
+  // the 122B.
+  const SourceModel ornith = mlxModel(fixtures, "qwen3.5-122b-a10b");
+  refuses(ornith.with(&SourceModel::config, R"("num_hidden_layers": 48)", R"("num_hidden_layers": 40)"),
+          "text config hidden_size: safetensors 3072, Qwen3.6-35B-A3B 2048", "a 3072-wide 40-layer model was accepted");
+  refuses(ornith.with(&SourceModel::config, "\n    \"hidden_size\": 3072", "\n    \"hidden_size\": 4096"),
+          "text config hidden_size: safetensors 4096, Qwen3.6-35B-A3B 2048", "a 4096-wide 48-layer model was accepted");
+
+  // The refusal lists every family served.
+  refuses(ornith.with(&SourceModel::config, R"("model_type": "qwen3_5_moe_text")", R"("model_type": "gemma3_text")"),
+          "supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next",
+          "the refusal does not list the 122B");
+
+  // Each draft was trained for one block, and is accepted for that one only.
+  const SourceModel moe = mlxModel(fixtures, "qwen3.6-35b-a3b");
+  refuses(moe.with(&SourceModel::draft, R"("block_size": 8)", R"("block_size": 16)"),
+          "draft config dflash_config block_size mismatch: checkpoint 16, runtime 8", "a 35B draft of block 16 was accepted");
+  refuses(ornith.with(&SourceModel::draft, R"("block_size": 16)", R"("block_size": 8)"),
+          "draft config dflash_config block_size mismatch: checkpoint 8, runtime 16", "a 122B draft of block 8 was accepted");
+
+  // Only the 35B's GGUF is served: nothing has run the 122B from one.
+  SourceModel gguf = ornith.with(&SourceModel::record, R"("mlx-affine")", R"("gguf")");
+  gguf.config = R"({"model_type":"qwen3_5_moe","text_config":{"model_type":"qwen3_5_moe_text","hidden_size":3072,)"
+                R"("max_position_embeddings":262144,"num_attention_heads":32,"num_key_value_heads":2,)"
+                R"("head_dim":256,"num_hidden_layers":48,"vocab_size":248320}})";
+  refuses(gguf, "GGUF Qwen3.5-122B-A10B is not served", "a GGUF of the 122B was accepted");
+
+  // The vision tower projects into the model's own width.
+  const model::ModelDescriptor withVision = inspect(ornith.with(&SourceModel::record, R"("none")", R"("safetensors")"));
+  require(withVision.hasVision() && withVision.vision.outputHiddenSize == 3072,
+          "the 122B's vision tower does not project into its width");
 }
 
 // A descriptor states where its weights come from: one that leaves either
@@ -757,6 +837,8 @@ int main(int argc, char **argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
     testFamilies(argv[1]);
+    testOrnith122B(argv[1]);
+    testMoeGeometries(argv[1]);
     testSources();
     testOneRulePerValue(argv[1]);
     testQuantization(argv[1]);
