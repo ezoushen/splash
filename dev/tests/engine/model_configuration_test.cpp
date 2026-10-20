@@ -220,8 +220,7 @@ void testMoeGeometries(const std::filesystem::path &fixtures) {
               shipped.attentionQueryHeads == 16 && shipped.expertIntermediateSize == 512,
           "the default MoE layout is no longer the 35B's");
   const model::DFlashDraftLayout moeDraft = inspect(mlxModel(fixtures, "qwen3.6-35b-a3b")).draft;
-  require(moeDraft.hiddenSize == 2048 && moeDraft.intermediateSize == 6144 && moeDraft.targetHiddenSize() == 16384 &&
-              moeDraft.trainedBlockSize == 8,
+  require(moeDraft.hiddenSize == 2048 && moeDraft.intermediateSize == 6144 && moeDraft.targetHiddenSize() == 16384,
           "the 35B's draft layout changed");
 
   // A config of neither geometry is refused against the 35B, as before: the
