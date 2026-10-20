@@ -13,7 +13,7 @@
 namespace splash::ops {
 namespace {
 
-enum class KernelLayout : uint8_t { Kv4Group6, Kv2Group8 };
+enum class KernelLayout : uint8_t { Kv4Group6, Kv2Group8, Kv2Group16 };
 
 // One thread per gate element, across rows x query heads x head dimension.
 uint64_t gateGroups(uint64_t rows, uint32_t queryHeads, uint32_t headDimension) {
@@ -36,14 +36,33 @@ KernelLayout storageKernelLayout(kv::Layout layout) {
 KernelLayout attentionKernelLayout(uint32_t queryHeads, kv::Layout layout) {
   // Select a compiled GQA variant so kernels need no geometry branches.
   const KernelLayout result = storageKernelLayout(layout);
-  if ((result == KernelLayout::Kv4Group6 && queryHeads == 24) ||
-      (result == KernelLayout::Kv2Group8 && queryHeads == 16))
+  if (result == KernelLayout::Kv4Group6 && queryHeads == 24)
     return result;
+  if (result == KernelLayout::Kv2Group8 && queryHeads == 16)
+    return result;
+  if (result == KernelLayout::Kv2Group8 && queryHeads == 32)
+    return KernelLayout::Kv2Group16;
   throw std::invalid_argument("no paged-attention kernel for layout");
 }
 
-std::string_view pipeline(KernelLayout layout, std::string_view kv4Group6,
-                          std::string_view kv2Group8) noexcept {
+// The attention kernel of the GQA group the layout compiled.
+std::string_view pipeline(KernelLayout layout, std::string_view kv4Group6, std::string_view kv2Group8,
+                          std::string_view kv2Group16) noexcept {
+  switch (layout) {
+  case KernelLayout::Kv4Group6:
+    return kv4Group6;
+  case KernelLayout::Kv2Group8:
+    return kv2Group8;
+  case KernelLayout::Kv2Group16:
+    return kv2Group16;
+  }
+  return kv2Group8;
+}
+
+// A store kernel, which depends on the KV heads alone: the layout is a storage layout.
+std::string_view pipeline(KernelLayout layout, std::string_view kv4Group6, std::string_view kv2Group8) {
+  if (layout == KernelLayout::Kv2Group16)
+    throw std::logic_error("a store kernel is selected by the KV heads, not the query group");
   return layout == KernelLayout::Kv4Group6 ? kv4Group6 : kv2Group8;
 }
 
@@ -135,11 +154,14 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
                              layout.headDimension),
           layout.format == kv::Format::BFloat16
               ? pipeline(kernel, "prefill_attention_bf16_split",
-                         "prefill_attention_bf16_split_kv2_g8")
+                         "prefill_attention_bf16_split_kv2_g8",
+                         "prefill_attention_bf16_split_kv2_g16")
               : pipeline(kernel, "prefill_attention_q8_split",
-                         "prefill_attention_q8_split_kv2_g8"),
+                         "prefill_attention_q8_split_kv2_g8",
+                         "prefill_attention_q8_split_kv2_g16"),
           pipeline(kernel, "prefill_attention_reduce",
-                   "prefill_attention_reduce_kv2_g8"),
+                   "prefill_attention_reduce_kv2_g8",
+                   "prefill_attention_reduce_kv2_g16"),
           {layout.kvHeads, tiles, splits}, {layout.kvHeads, fusedRows, tiles}, layout, queryHeads};
 }
 
@@ -165,18 +187,21 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           verifyWorkspaceBound(lanes, queryHeads, layout),
           layout.format == kv::Format::BFloat16
               ? pipeline(kernel, "verify_attention_bf16_split",
-                         "verify_attention_bf16_split_kv2_g8")
+                         "verify_attention_bf16_split_kv2_g8",
+                         "verify_attention_bf16_split_kv2_g16")
               : pipeline(kernel, "verify_attention_q8_split",
-                         "verify_attention_q8_split_kv2_g8"),
+                         "verify_attention_q8_split_kv2_g8",
+                         "verify_attention_q8_split_kv2_g16"),
           pipeline(kernel, "verify_attention_reduce",
-                   "verify_attention_reduce_kv2_g8"),
+                   "verify_attention_reduce_kv2_g8",
+                   "verify_attention_reduce_kv2_g16"),
           {layout.kvHeads, splits, lanes},
           {layout.kvHeads,
            kv::kVerifyRows * (queryHeads / layout.kvHeads), lanes},
           layout.format == kv::Format::BFloat16
-              ? pipeline(kernel, "verify_attention_bf16_store",
+              ? pipeline(storageKernelLayout(layout), "verify_attention_bf16_store",
                          "verify_attention_bf16_store_kv2_g8")
-              : pipeline(kernel, "verify_attention_q8_store",
+              : pipeline(storageKernelLayout(layout), "verify_attention_q8_store",
                          "verify_attention_q8_store_kv2_g8"),
           {uint64_t{lanes} * 2 * kv::kVerifyRows * layout.kvHeads, 1, 1},
           {layout.headDimension, 1, 1}, layout, queryHeads};
@@ -222,7 +247,8 @@ void PagedAttention::addPrefillProjection(
   requireBytes(chunkValues, staging.valueBytes(layout.headDimension), "attention value");
   const FullPrefillParams params{tokens, stride};
   graph.add(qkNormKernel(pipeline(kernel, "prefill_attention_qkv",
-                                  "prefill_attention_qkv_kv2_g8"),
+                                  "prefill_attention_qkv_kv2_g8",
+                                  "prefill_attention_qkv_kv2_g16"),
                          queryNorm, keyNorm, layout.headDimension),
             {std::move(packed), queryNorm.buffer, keyNorm.buffer,
              std::move(ropeCos), std::move(ropeSin), std::move(queries),
@@ -245,7 +271,8 @@ void PagedAttention::addPrefillGate(
   requireBytes(hidden, uint64_t{tokens} * queryHeads * layout.headDimension * 2, "attention hidden");
   const FullPrefillParams params{tokens, stride};
   graph.add(std::string(pipeline(kernel, "prefill_attention_gate",
-                                 "prefill_attention_gate_kv2_g8")),
+                                 "prefill_attention_gate_kv2_g8",
+                                 "prefill_attention_gate_kv2_g16")),
             {std::move(packed), std::move(attention), std::move(hidden)}, params,
             {gateGroups(tokens, queryHeads, layout.headDimension), 1, 1});
 }
@@ -268,7 +295,8 @@ void PagedAttention::addVerifyProjection(
   requireBytes(chunkKeys, staging.rowBytes(1, layout.headDimension), "attention key");
   requireBytes(chunkValues, staging.valueBytes(layout.headDimension), "attention value");
   graph.add(qkNormKernel(pipeline(kernel, "verify_attention_qkv",
-                                  "verify_attention_qkv_kv2_g8"),
+                                  "verify_attention_qkv_kv2_g8",
+                                  "verify_attention_qkv_kv2_g16"),
                          queryNorm, keyNorm, layout.headDimension),
             {std::move(packed), queryNorm.buffer, keyNorm.buffer,
              std::move(ropeCos), std::move(ropeSin), std::move(queries),
@@ -294,13 +322,14 @@ PreparedInput PagedAttention::addVerifyGate(
     const uint32_t width = queryHeads * layout.headDimension;
     requireTableScratch(scratch, input, width, rows);
     std::string name = std::string("verify_attention_gate") + tableSuffix(input);
-    name += pipeline(kernel, "", "_kv2_g8");
+    name += pipeline(kernel, "", "_kv2_g8", "_kv2_g16");
     graph.add(std::move(name), {packed, attention, hidden, scratch.input, scratch.sums},
               {width / 64 * lanes, 1, 1}, {256, 1, 1});
     return {std::move(hidden), input};
   }
   graph.add(std::string(pipeline(kernel, "verify_attention_gate",
-                                 "verify_attention_gate_kv2_g8")),
+                                 "verify_attention_gate_kv2_g8",
+                                 "verify_attention_gate_kv2_g16")),
             {std::move(packed), std::move(attention), hidden},
             FullDecodeBatchParams{lanes},
             {gateGroups(rows, queryHeads, layout.headDimension), 1, 1});

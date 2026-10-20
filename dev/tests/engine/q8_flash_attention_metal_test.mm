@@ -29,8 +29,8 @@ constexpr uint32_t kQueryStride = kStride;
 constexpr uint32_t kRows = kVerifyRows;
 static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
 
-// The two production GQA geometries. The group size selects the kernel
-// specialization; the suffix names its pipelines.
+// The production GQA geometries (27B, 35B, 122B). The group size selects the
+// kernel specialization; the suffix names its pipelines.
 struct Shape {
   uint32_t kvHeads;
   uint32_t queryHeadsPerKvHead;
@@ -39,7 +39,7 @@ struct Shape {
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
   Layout layout() const { return {1, kvHeads, kHeadDimension}; }
 };
-constexpr std::array<Shape, 2> kShapes{{{4, 6, ""}, {2, 8, "_kv2_g8"}}};
+constexpr std::array<Shape, 3> kShapes{{{4, 6, ""}, {2, 8, "_kv2_g8"}, {2, 16, "_kv2_g16"}}};
 
 using splash::test::require;
 

@@ -53,7 +53,8 @@ constexpr float kScale = 0.08838834765F;
 
 constexpr std::array kShapes{
     DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
-    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
+    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128},
+    DraftAttentionShape{3072, 768, 6144, 4096, 32, 8, 128}};
 
 using splash::test::rejects;
 using splash::test::require;
