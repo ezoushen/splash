@@ -28,8 +28,15 @@ public:
   SafetensorsTargetLoader &operator=(const SafetensorsTargetLoader &) = delete;
 
   [[nodiscard]] WeightFile layer(uint32_t index);
+  // A sparse MoE layer's routed experts, which its layer image does not hold.
+  [[nodiscard]] WeightFile experts(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
+  // The plan of the image at `index` among those planned, in load order: each
+  // layer's, followed by its routed experts' for a sparse MoE, then the head's
+  // and the embedding's.
+  [[nodiscard]] ImagePlan image(size_t index) const;
+  [[nodiscard]] size_t imageCount() const noexcept { return planned_->images.size(); }
   // Whether its images hold F32 norms (safetensors::float32Norms).
   [[nodiscard]] bool float32Norms() const noexcept { return float32Norms_; }
   // Whether the routed experts stream, then the store's options and every
@@ -43,13 +50,16 @@ private:
   struct Planned {
     explicit Planned(const std::filesystem::path &directory) : checkpoint(directory) {}
     SafetensorsCheckpoint checkpoint;
-    std::vector<gguf::Image> images; // layers, head, embedding
+    std::vector<gguf::Image> images; // as safetensors::planImages orders them
   };
   [[nodiscard]] WeightFile open(size_t index);
+  // Image `part` of target layer `index`: the layer's, or its experts'.
+  [[nodiscard]] WeightFile openLayer(uint32_t index, size_t part);
 
   metal::MetalBackend &backend_;
   WeightImages &images_;
   std::shared_ptr<Planned> planned_;
+  size_t layerImages_; // images per layer: gguf::imagesPerLayer
   bool float32Norms_ = false;
   ExpertStoreOptions experts_;
 };

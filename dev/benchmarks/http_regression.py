@@ -348,6 +348,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--output", type=Path, default=Path("build/release/http-regression.json")
     )
+    weights.add_expect_image_change(parser)
     args = smoke.resolve_server_arguments(parser.parse_args(argv))
     args.contexts = [int(value) for value in args.contexts.split(",")]
     if args.samples < 2 or not args.contexts or min(args.contexts) < 256:
@@ -507,9 +508,12 @@ def main(argv=None):
         document["weights"] = weights.compare(
             weights.digests(builds["baseline"], model_root),
             weights.digests(builds["candidate"], model_root),
+            args.expect_image_change,
         )
+        # A change of the image layout (--expect-image-change alone) reports
+        # the images that differ instead of failing on them.
         smoke.require(
-            document["weights"]["pass"],
+            document["weights"]["pass"] or args.expect_image_change is True,
             f"weight bytes differ: {document['weights']['failures']}",
         )
         document["correctness_pass"] = True

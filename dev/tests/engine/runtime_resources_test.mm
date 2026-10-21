@@ -10,7 +10,9 @@
 #include "engine/MemoryPlan.hpp"
 #include "model/ModelSizing.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/SharedImages.hpp"
 #include "model/SsdReaders.hpp"
+#include "model/WeightStore.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -793,6 +795,74 @@ void testFailedStepIsNamed(const char *metallibPath) {
           "a start the host refused was not retried");
 }
 
+// The weight images are shared with other processes only where the start is
+// given a place to share them (--share-weights): the images of its target, its
+// draft and its vision tower are then written into shared memory this process
+// serves, a second start receives them, and each start logs how many it
+// received and wrote; otherwise every image is its own. The place is the
+// test's, so that no registry of a running engine is touched; its registry is
+// short, under /tmp, as socket paths are.
+void testWeightsAreSharedOnlyOnRequest(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-share-model"), place("splash-share-place");
+  char registry[] = "/tmp/splash-rr-XXXXXX";
+  require(mkdtemp(registry) != nullptr, "cannot create a registry directory");
+  struct RemoveRegistry final {
+    const char *path;
+    ~RemoveRegistry() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } removeRegistry{registry};
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "share-test");
+  // The installer records each file by its content digest.
+  std::string files;
+  for (const auto &entry : std::filesystem::recursive_directory_iterator(root.path()))
+    if (entry.is_regular_file())
+      files += (files.empty() ? "" : ",") + std::string("\"") +
+               entry.path().lexically_relative(root.path()).generic_string() + R"(":{"digest":")" +
+               model::weightDigest(test::readFile(entry.path())) + "\"}";
+  test::writeFile(root.path() / "model.json", R"({"files":{)" + files + "}}");
+  // The origin of each image a start loads, every role's, and what it logs of
+  // them; `held` keeps the start's resources, whose images other starts then
+  // receive.
+  struct Start final {
+    std::vector<model::ImageOrigin> origins;
+    std::string log;
+  };
+  const auto start = [&](std::vector<std::unique_ptr<RuntimeResources>> &held) {
+    Start result;
+    result.log = test::capturedStderr([&] {
+      held.push_back(RuntimeResources::create(config, 0));
+      for (const auto &image : held.back()->modelContext().model.images->contents())
+        result.origins.push_back(image.origin);
+    });
+    return result;
+  };
+  const auto all = [](const Start &start, model::ImageOrigin origin) {
+    return !start.origins.empty() &&
+           std::all_of(start.origins.begin(), start.origins.end(), [&](model::ImageOrigin each) { return each == origin; });
+  };
+  const std::string logged = "Weight images shared with other processes: ";
+  std::vector<std::unique_ptr<RuntimeResources>> held;
+  const Start alone = start(held);
+  held.clear();
+  require(all(alone, model::ImageOrigin::Private) && alone.log.find(logged) == std::string::npos,
+          "a start without --share-weights shared an image or reported sharing");
+  require(std::filesystem::is_empty(registry) && std::filesystem::is_empty(place.path()),
+          "a start without --share-weights created a registry or a digest table");
+  config.shareWeights = model::SharedImagesPlace{std::filesystem::path(registry) / "images", place.path() / "tables"};
+  const Start written = start(held);
+  const std::string count = std::to_string(alone.origins.size());
+  require(written.origins.size() == alone.origins.size() && all(written, model::ImageOrigin::Written) &&
+              written.log.find(logged + "0 received, " + count + " written, 0 private.") != std::string::npos,
+          "a start with --share-weights did not write the images of its target, its draft and its vision tower "
+          "as shared ones");
+  const Start received = start(held);
+  require(all(received, model::ImageOrigin::Received) &&
+              received.log.find(logged + count + " received, 0 written, 0 private.") != std::string::npos,
+          "a second start with --share-weights did not receive every image of the first");
+}
+
 // What a start allocates, the KV runway and then the arenas and the warmup as
 // RuntimeBootstrap::start allocates them, is memory a request in service
 // needs: neither the warning margin above the spare reserve nor macOS's
@@ -1141,6 +1211,7 @@ int main(int argc, char **argv) {
       testStartGrowsThroughHostPressure(argv[1]);
       testYarnRuntime(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
+      testWeightsAreSharedOnlyOnRequest(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);
       testAutomaticTierYieldsToTheContext(argv[1]);

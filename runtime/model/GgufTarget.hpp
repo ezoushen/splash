@@ -49,6 +49,8 @@ public:
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
   [[nodiscard]] WeightFile layer(uint32_t index);
+  // A sparse MoE layer's routed experts, which its layer image does not hold.
+  [[nodiscard]] WeightFile experts(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
   // The image of the table the family's GGUF holds after the embedding
@@ -61,6 +63,11 @@ public:
   // The GGUF's header, for what a family reads beside its images (Flash-Next's
   // PLE hash).
   [[nodiscard]] const GgufFile &file() const noexcept { return planned_->source.file(); }
+  // The plan of the image at `index` among those planned, in load order: each
+  // layer's, followed by its routed experts' for a sparse MoE, then the head's,
+  // the embedding's and a table's (gguf::planImages).
+  [[nodiscard]] ImagePlan image(size_t index) const;
+  [[nodiscard]] size_t imageCount() const noexcept { return planned_->images.size(); }
   // The input rotation of a Prism ML GGUF, which planImages checked names
   // every quantized tensor of the target and its token table.
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return file().rotation(); }
@@ -75,14 +82,19 @@ private:
   struct Planned {
     explicit Planned(const std::vector<std::filesystem::path> &paths) : source(paths) {}
     OpenGguf source;
-    // Each layer's image, then the head's, the embedding's and a table's
-    // (gguf::planImages).
+    // Each layer's images (gguf::imagesPerLayer), then the head's, the
+    // embedding's and a table's (gguf::planImages).
     std::vector<gguf::Image> images;
     uint32_t layers = 0;
+    size_t layerImages = 1;
     SparseRowStoreOptions table;
     ExpertStoreOptions experts;
+    // The index of the first image after the layers': the head's.
+    [[nodiscard]] size_t layerEnd() const noexcept { return layers * layerImages; }
   };
   [[nodiscard]] WeightFile open(size_t index);
+  // Image `part` of target layer `index`: the layer's, or its experts'.
+  [[nodiscard]] WeightFile openLayer(uint32_t index, size_t part);
   // The plan of the table's image, or null for a family without one.
   [[nodiscard]] const gguf::Image *tablePlan() const noexcept;
 

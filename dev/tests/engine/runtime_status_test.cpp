@@ -592,6 +592,15 @@ void testWeightsStatus() {
   require(status({600.0, true, true, 2, 1})
                   .find("\"released\":true,\"restoring\":true,") != std::string::npos,
           "a restore under way is missing from the weights' status");
+  // Only weights shared with other processes say what those still hold.
+  require(status({600.0, true, false, 2, 1, 1073741824})
+                  .find("\"restore_failures\":1,\"held_elsewhere_bytes\":1073741824}") != std::string::npos,
+          "the bytes of released weights that other processes hold are missing");
+  require(status({600.0, true, false, 2, 1, 0}).find("\"restore_failures\":1,\"held_elsewhere_bytes\":0}") !=
+              std::string::npos,
+          "weights shared with other processes that none holds do not say so");
+  require(status({600.0, true, false, 2, 1}).find("held_elsewhere_bytes") == std::string::npos,
+          "weights that are not shared report the bytes others hold");
   require(status({1234567.5, false, false, 0}).find("\"idle_release_seconds\":1234567.5,") !=
               std::string::npos,
           "the idle release lost precision");

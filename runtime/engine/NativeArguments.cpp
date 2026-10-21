@@ -174,6 +174,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");
       result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+    } else if (option == "--share-weights") {
+      if (value != "on" && value != "off")
+        throw UsageError("--share-weights requires on or off");
+      result.shareWeights = value == "on";
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {

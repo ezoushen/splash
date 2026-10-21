@@ -49,6 +49,14 @@ public:
     if (!splitReleased_)
       splitReleased_ = split_ && split_->release();
   }
+  // What the parts that share their memory with other processes report
+  // (the images with --share-weights); none when no part does.
+  [[nodiscard]] std::optional<uint64_t> heldElsewhereBytes() const override {
+    std::optional<uint64_t> result;
+    for (const model::WeightMemory *part : parts_)
+      if (const std::optional<uint64_t> held = part->heldElsewhereBytes()) result = result.value_or(0) + *held;
+    return result;
+  }
   [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override {
     // Every part, then the program. With nothing released, the first part
     // refuses the restore.

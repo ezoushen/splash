@@ -15,6 +15,21 @@
   to its commit 7ab4ee7 alike.
 - `gguf_images`: every image `gguf-preparation` writes from its dense and MoE
   GGUF fixtures.
+- `mlx_images`: every image `gguf-preparation` writes from its MLX MoE
+  checkpoint, random in every tensor.
+- `moe_layers_with_experts`: the layer image of each MoE fixture as stock
+  1.4.0 wrote it, the routed experts inside it. `gguf-preparation` puts each MoE
+  layer's image and its experts' image together, cutting both where their
+  sections start, and requires these hashes: the images that now hold the
+  layer's sections hold exactly the old ones. They change only with the
+  layer's own sections, not with where the routed experts are. Beside the
+  llama.cpp and MLX fixtures above, `gguf-preparation` pins the fused
+  gate/up and NVFP4 GGUFs, MLX affine of other widths and groups, mxfp4 and
+  nvfp4, and Model Optimizer's and compressed-tensors' NVFP4 and FP8
+  experts, each under the name of its fixture in `checkUnsplitFormats`. These
+  hashes were recorded from an unmodified 1.4.0 build running the same
+  fixtures (the layer image its planner wrote), not from the split, so they
+  change only with a fixture.
 - `draft_images`: every image `draft-preparation` writes from the DFlash2
   draft checkpoint `run_draft_preparation.py` writes.
 - `vision_image`: the image written from every `run_vision_preparation.py`

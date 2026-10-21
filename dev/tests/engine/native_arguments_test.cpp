@@ -156,6 +156,7 @@ void testServerCommandLines(const char *path) {
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // Auto is the engine's default, which the server leaves out.
       {"verify_rows_auto", [](NativeArguments &) {}},
+      {"share_weights", [](NativeArguments &read) { read.shareWeights = true; }},
       // A relaunch keeps the first engine's context; with --max-context,
       // which every start holds, its command is the first one's.
       {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
@@ -202,7 +203,8 @@ void testServerCommandLines(const char *path) {
            read.preventIdleSleep == meant.preventIdleSleep &&
            read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
-           read.kvSpillAlways == meant.kvSpillAlways && read.verifyRows == meant.verifyRows;
+           read.kvSpillAlways == meant.kvSpillAlways && read.verifyRows == meant.verifyRows &&
+           read.shareWeights == meant.shareWeights;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -247,6 +249,19 @@ void testStreamedMemoryAndSpill() {
               !automatic.sparseKvMemory && !automatic.kvSpillAlways,
           "auto did not leave the stores to the planner");
   require(parse(model, {"auto", "auto", "--kv-spill", "always"}).kvSpillAlways, "--kv-spill always was not read");
+}
+
+// Weight images are shared with other processes only where --share-weights on
+// asks for it.
+void testShareWeights() {
+  const ModelDirectory model;
+  require(!parse(model, {"auto", "auto"}).shareWeights && parse(model, {"auto", "auto", "--share-weights", "on"}).shareWeights &&
+              !parse(model, {"auto", "auto", "--share-weights", "off"}).shareWeights,
+          "--share-weights did not reach the arguments as given");
+  rejects([&] { static_cast<void>(parse(model, {"auto", "auto", "--share-weights", "yes"})); },
+          "--share-weights requires on or off", "the engine read --share-weights yes");
+  rejects([&] { static_cast<void>(parse(model, {"auto", "auto", "--share-weights"})); },
+          "--share-weights requires on or off", "the engine read --share-weights without a value");
 }
 
 // A command line the server never writes is refused with what is wrong.
@@ -372,6 +387,7 @@ int main(int argc, char **argv) {
     testNeuralEngine();
     testVerifyRows();
     testStreamedMemoryAndSpill();
+    testShareWeights();
     testRefusals();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;

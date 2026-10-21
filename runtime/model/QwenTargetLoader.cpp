@@ -73,13 +73,14 @@ MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetFiles &f
       files);
 }
 
-ops::BlockMoeWeights readMoeBlock(WeightFile &file, const MoeExperts &experts, uint32_t block) {
+ops::BlockMoeWeights readMoeBlock(WeightFile &file, WeightFile &routed, const MoeExperts &experts,
+                                  uint32_t block) {
   ops::BlockMoeWeights ffn;
   ffn.router = readQuantizedSegment(file, "router");
   if (!experts.store) {
-    ffn.gate.routed = readQuantizedSegment(file, "experts-gate");
-    ffn.up.routed = readQuantizedSegment(file, "experts-up");
-    ffn.down.routed = readQuantizedSegment(file, "experts-down");
+    ffn.gate.routed = readQuantizedSegment(routed, "experts-gate");
+    ffn.up.routed = readQuantizedSegment(routed, "experts-up");
+    ffn.down.routed = readQuantizedSegment(routed, "experts-down");
     ffn.slotTable = experts.resident;
     ffn.slots = experts.experts;
   }

@@ -42,7 +42,11 @@ otherwise idle:
   baseline of an earlier release. A baseline of an earlier release prepares
   into a cache of its own, <output dir>/baseline-weights. With
   --expect-image-change (or EXPECT_IMAGE_CHANGE=1), for a change of the image
-  layout, the images that differ are reported and fail nothing.
+  layout, the images that differ are reported and fail nothing. With
+  --expect-image-change REGEX (or EXPECT_IMAGE_CHANGE=REGEX), for a change
+  that means to change some images, the images whose component name REGEX
+  matches whole may differ or be loaded by one build only; they are recorded,
+  and any other difference still fails.
 
 The candidate's own benchmark invariants must hold too, and the baseline must
 be another build: one with the candidate's build_id compares nothing. The
@@ -486,12 +490,7 @@ def parse_args(argv=None):
         default=os.environ.get("EXPECT_OUTPUT_CHANGE", "") not in ("", "0"),
         help="allow changed outputs with acceptance within 0.02 (EXPECT_OUTPUT_CHANGE=1)",
     )
-    parser.add_argument(
-        "--expect-image-change",
-        action="store_true",
-        default=os.environ.get("EXPECT_IMAGE_CHANGE", "") not in ("", "0"),
-        help="report changed weight images without failing (EXPECT_IMAGE_CHANGE=1)",
-    )
+    weights.add_expect_image_change(parser)
     parser.add_argument(
         "--ane-ffn-share",
         type=ane_ffn_share,
@@ -580,7 +579,12 @@ def main(argv=None) -> int:
         "samples": args.samples,
         "scenario_invocations": invocations(args.combined, args.scenarios),
         "weight_digest_options": args.weight_digest_options,
-        "expect_image_change": args.expect_image_change,
+        # True for every image, the pattern of the images named, or False.
+        "expect_image_change": (
+            args.expect_image_change.pattern
+            if isinstance(args.expect_image_change, re.Pattern)
+            else bool(args.expect_image_change)
+        ),
         "pass": False,
     }
     try:
@@ -609,9 +613,10 @@ def main(argv=None) -> int:
             args.model_root,
             environments["baseline"],
             args.weight_digest_options,
+            args.expect_image_change,
         )
         document["pass"] = document["comparison"]["pass"] and (
-            document["weights"]["pass"] or args.expect_image_change
+            document["weights"]["pass"] or args.expect_image_change is True
         )
     except Exception as error:
         document["error"] = str(error)
@@ -655,10 +660,15 @@ def report(document: dict) -> None:
             "PASS"
             if images["pass"]
             else f"CHANGED, as expected {images['failures']}"
-            if document["expect_image_change"]
+            if document["expect_image_change"] is True
             else f"FAIL {images['failures']}"
         )
     )
+    if images.get("expected_changes"):
+        print(
+            f"expected changes (EXPECT_IMAGE_CHANGE={images['expect_image_change']}): "
+            f"{images['expected_changes']}"
+        )
     for failure in comparison["failures"]:
         print(f"FAIL: {failure}")
     print(f"backend regression: {'PASS' if document['pass'] else 'FAIL'}")

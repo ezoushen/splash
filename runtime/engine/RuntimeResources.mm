@@ -835,6 +835,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // engine lends it to model execution without inspecting its plans.
   ops::ExecutionPlans operators(device);
   model::LoadedModel loaded;
+  // The weight images shared with the other processes that load them
+  // (--share-weights), made at the first load and kept by every later one.
+  std::shared_ptr<model::SharedImages> shared;
   // The runtime's lane state and arenas as the model loaded, with its K/V in
   // memory and where it spills.
   model::ModelMemoryPlan modelMemoryPlan, spillModelMemoryPlan;
@@ -850,11 +853,27 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       // row cache the audit's budget for Metal leaves out.
       loaded = {};
       backend->restartPeaks();
-      loaded = model::loadModel(*backend, config.modelRoot, config.model, loadOptions);
+      if (config.shareWeights && !shared)
+        shared = std::make_shared<model::SharedImages>(model::sharedImagesConfig(
+            *config.shareWeights, config.modelRoot, model::writerIdentity(*backend)));
+      // A holder that did not answer the last load is asked again by this one.
+      if (shared)
+        shared->newPass();
+      loaded = model::loadModel(*backend, config.modelRoot, config.model, loadOptions, shared);
       requireLoadedModel(loaded);
       const std::chrono::duration<double> loading = AwakeClock::now() - started;
       logLine("Weights loaded ", again ? "again " : "", "in ", std::fixed, std::setprecision(2), loading.count(),
               " s.");
+      if (config.shareWeights) {
+        size_t received = 0, written = 0, held = 0;
+        for (const auto &image : loaded.images->contents()) {
+          ++held;
+          received += image.origin == model::ImageOrigin::Received;
+          written += image.origin == model::ImageOrigin::Written;
+        }
+        logLine("Weight images shared with other processes: ", received, " received, ", written, " written, ",
+                held - received - written, " private.");
+      }
     } catch (const metal::MetalAllocationError &error) {
       throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                   error.what(), {},

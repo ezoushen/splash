@@ -5,6 +5,7 @@
 #include "model/GgufImageLayout.hpp"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
+#include "model/WeightStore.hpp"
 
 #include <cmath>
 #include <limits>
@@ -60,7 +61,8 @@ bool floatProjectionType(uint32_t type) { return floatType(type) || type == ggml
 bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
 
 // The header type of the image of a table a family adds (planImages), beside
-// the layers' 0 and 1 (GDN and full attention) and the head's 2.
+// the layers' 0 and 1 (GDN and full attention), the head's 2 and a MoE
+// layer's routed experts' (kGgufExpertsImageType).
 constexpr uint32_t kTableImageType = 3;
 
 // A repack of a [rows, columns] tensor in format, of no image section yet;
@@ -389,9 +391,8 @@ void mixerImage(Builder &b, const QwenTargetDimensions &g, const std::string &p,
 // A layer's dense FFN or sparse MoE, which every family's layers hold.
 void ffnImage(Builder &b, const QwenTargetDimensions &g, const std::string &p) {
   if (g.ffnKind == QwenFfnKind::SparseMoe) {
-    const uint64_t routed = g.experts, width = g.expertIntermediateSize;
-    b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
-    b.routedExperts(p, routed, width, g.hiddenSize);
+    const uint64_t width = g.expertIntermediateSize;
+    b.floatTensor(p + "ffn_gate_inp.weight", g.experts, g.hiddenSize);
     b.quantized(p + "ffn_gate_shexp.weight", width, g.hiddenSize);
     b.quantized(p + "ffn_up_shexp.weight", width, g.hiddenSize);
     b.quantized(p + "ffn_down_shexp.weight", g.hiddenSize, width);
@@ -523,6 +524,15 @@ template <class Use> decltype(auto) withFamily(std::string_view architecture, Us
   return use(HybridGguf{});
 }
 
+// A sparse MoE layer's routed experts: gate, up, then down; with
+// options.streamExperts none of their sections, which stream (Image::experts).
+Image expertsImage(const GgufFile &file, const QwenTargetDimensions &g, std::vector<std::string> &problems,
+                   uint32_t index, PlanOptions options) {
+  Builder b(file, g, problems, "experts-" + std::to_string(index) + ".bin", index, kGgufExpertsImageType, options);
+  b.routedExperts(prefix(index), g.experts, g.expertIntermediateSize, g.hiddenSize);
+  return b.finish();
+}
+
 // The images of a target from a GGUF of Family (planImages).
 template <class Family>
 std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options) {
@@ -534,6 +544,7 @@ std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions
                   g.isFullAttentionLayer(index) ? 1u : 0u, options);
     Family::layer(layer, g, index);
     images.push_back(layer.finish());
+    if (imagesPerLayer(g) == 2) images.push_back(expertsImage(file, g, problems, index, options));
   }
   Builder head(file, g, problems, "head.bin", g.layers, 2);
   Family::head(head, g);
@@ -575,11 +586,12 @@ void requireRotation(const GgufFile &file, const QwenTargetDimensions &g, const 
 
 } // namespace
 
-std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers) {
+std::vector<StreamedExperts> streamedExperts(std::span<const Image> images) {
   std::vector<StreamedExperts> result;
-  for (const Image &layer : layers) {
-    if (!layer.experts) throw GgufError("a target layer's experts do not stream");
-    result.push_back(*layer.experts);
+  for (const Image &image : images) {
+    if (image.type != kGgufExpertsImageType) continue;
+    if (!image.experts) throw GgufError("a target layer's experts do not stream");
+    result.push_back(*image.experts);
   }
   return result;
 }
@@ -775,6 +787,71 @@ StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t c
   rows.rowBytes = static_cast<uint32_t>(rowBytes);
   rows.format = format;
   return rows;
+}
+
+namespace {
+
+// The source bytes writeGgufImage reads for `rows`, as its reader does
+// (rowReader): the tensors a quantized safetensors tensor or a BF16 weight is
+// built from, else the rows of the file (llama.cpp's NVFP4 rows, the BF16 or
+// F16 rows quantized into Q8_0, or the rows as stored), and the tensor scale.
+void addSources(const TensorRows &rows, std::vector<SourceBytes> &sources) {
+  const auto whole = [&](const SourceTensor *tensor) {
+    if (tensor) sources.push_back({tensor->file, tensor->offset, tensor->bytes});
+  };
+  if (rows.safetensors.codes) {
+    whole(rows.safetensors.codes);
+    whole(rows.safetensors.scales);
+    whole(rows.safetensors.biases);
+  } else if (rows.safetensors.bfloat16 && !rows.ggufNvfp4RowBytes) {
+    whole(rows.safetensors.bfloat16);
+  } else {
+    const uint64_t rowBytes = rows.ggufNvfp4RowBytes  ? rows.ggufNvfp4RowBytes
+                              : rows.ggufFloatRowBytes ? rows.ggufFloatRowBytes
+                                                       : rows.rowBytes;
+    sources.push_back({rows.file, rows.offset + rows.first * rowBytes, rows.rows * rowBytes});
+  }
+  if (rows.scale.rowsPerValue) sources.push_back({rows.scale.file, rows.scale.offset, rows.scale.bytes});
+}
+
+// Every field of `rows` that decides what its reader writes, bar where its
+// bytes are in their files (the sources say what they hold).
+void describeRows(std::ostream &text, const TensorRows &rows) {
+  text << "rows type=" << rows.type << " rows=" << rows.rows << " rowBytes=" << rows.rowBytes
+       << " first=" << rows.first << " order=" << rows.order.from << ',' << rows.order.headRows << ','
+       << rows.order.keyHeads << ',' << rows.order.valueHeadsPerKey
+       << " nvfp4RowBytes=" << rows.ggufNvfp4RowBytes << " floatType=" << rows.ggufFloatType
+       << " floatRowBytes=" << rows.ggufFloatRowBytes << " tensors=" << bool(rows.safetensors.codes)
+       << bool(rows.safetensors.scales) << bool(rows.safetensors.biases) << bool(rows.safetensors.bfloat16)
+       << " scale=" << rows.scale.rowsPerValue << ',' << rows.scale.bytes << ',' << rows.scale.bfloat16 << ','
+       << rows.scale.reciprocal << '\n';
+}
+
+} // namespace
+
+Description describe(const Image &image) {
+  Description description;
+  std::ostringstream text;
+  text << "gguf-image 1\n";
+  for (const Fill &fill : image.fills)
+    text << "fill offset=" << fill.offset << " bytes=" << fill.bytes.size() << " sha256=" << weightDigest(fill.bytes)
+         << '\n';
+  for (const Copy &copy : image.copies) {
+    text << "copy destination=" << copy.destination << " conversion=" << static_cast<unsigned>(copy.conversion) << ' ';
+    describeRows(text, copy.source);
+    addSources(copy.source, description.sources);
+  }
+  for (const Repack &repack : image.repacks) {
+    text << "repack format=" << repack.format << " rows=" << repack.rows << " columns=" << repack.columns
+         << " planes=" << repack.plane0 << ',' << repack.plane1 << ',' << repack.meta
+         << " sources=" << repack.sources.size() << '\n';
+    for (const TensorRows &rows : repack.sources) {
+      describeRows(text, rows);
+      addSources(rows, description.sources);
+    }
+  }
+  description.text = text.str();
+  return description;
 }
 
 } // namespace splash::model::gguf

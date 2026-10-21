@@ -5,7 +5,12 @@ prints the component, size and SHA-256 of every image it holds
 (dev/tools/weight_digests.mm). Both builds must load the same images with the
 same bytes. Given --expert-memory SIZE or --ple-memory SIZE, it streams the
 routed experts or the PLE table from their files, as the engine does where
-memory cannot hold them, and their bytes are not among the images.
+memory cannot hold them, and their bytes are not among the images. A change
+of the image layout (--expect-image-change / EXPECT_IMAGE_CHANGE=1) has every
+image that differs reported instead of failing; one that names the images it
+means to change by a pattern (--expect-image-change REGEX /
+EXPECT_IMAGE_CHANGE=REGEX) has their differences recorded without failing,
+and any other still fails.
 
 Builds of earlier releases that have no weight-digests and prepared an
 assembly's images into a cache, <cache>/<key>/{weights, sha256,
@@ -19,7 +24,9 @@ backend_regression passes it.
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -28,6 +35,43 @@ WEIGHT_DIGESTS = Path("engine-tests/weight-digests")
 IDENTITY_HEADER = Path("engine/WeightPreparationIdentity.hpp")
 PROVENANCE = "splash-prepared-weight-v1"
 DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def pattern(value: str) -> re.Pattern:
+    """value compiled, or the argument error of a malformed pattern."""
+    try:
+        return re.compile(value)
+    except re.error as error:
+        raise argparse.ArgumentTypeError(f"invalid pattern {value!r}: {error}")
+
+
+def expected_images(value: str | None):
+    """What EXPECT_IMAGE_CHANGE says may change: nothing when unset, empty or
+    0; every image (True) when 1; else the pattern of the components, as the
+    text the option's parser compiles (and refuses when malformed)."""
+    if value in (None, "", "0"):
+        return None
+    return True if value == "1" else value
+
+
+def add_expect_image_change(parser: argparse.ArgumentParser) -> None:
+    """The option, defaulting to EXPECT_IMAGE_CHANGE, of what a change means
+    to change: alone, a change of the image layout, every image (True), whose
+    differences are reported and fail nothing; with REGEX, the components
+    whose whole name it matches, whose differences are recorded while any
+    other still fails; unset, none."""
+    parser.add_argument(
+        "--expect-image-change",
+        metavar="REGEX",
+        nargs="?",
+        const=True,
+        type=pattern,
+        default=expected_images(os.environ.get("EXPECT_IMAGE_CHANGE")),
+        help="report the weight images that differ without failing, or with "
+        "REGEX allow those whose whole component name matches it to differ or "
+        "appear in one build only, recorded (EXPECT_IMAGE_CHANGE=1 or "
+        "EXPECT_IMAGE_CHANGE=REGEX)",
+    )
 
 
 def loads_in_memory(build: Path) -> bool:
@@ -83,9 +127,14 @@ def prepared(environment: dict, model_root: Path) -> dict:
     return images
 
 
-def compare(baseline: dict, candidate: dict) -> dict:
+def compare(baseline: dict, candidate: dict, expected=None) -> dict:
     """Whether the builds loaded the same images, by component, with the
-    same bytes."""
+    same bytes; a difference in a component whose whole name expected, a
+    pattern (add_expect_image_change), matches is recorded in
+    expected_changes instead of failing. Every image expected (True) fails
+    as any other: its caller reports the failures instead."""
+    if not isinstance(expected, re.Pattern):
+        expected = None
     rows = [
         {
             "component": component,
@@ -94,25 +143,40 @@ def compare(baseline: dict, candidate: dict) -> dict:
         }
         for component in sorted(baseline.keys() | candidate.keys())
     ]
-    failures = [
-        f"{row['component']}: the baseline loaded {row['baseline_sha256'] or 'nothing'}, "
-        f"the candidate {row['candidate_sha256'] or 'nothing'}"
-        for row in rows
-        if row["baseline_sha256"] != row["candidate_sha256"]
-    ]
-    return {"images": rows, "failures": failures, "pass": not failures}
+    failures, changes = [], []
+    for row in rows:
+        if row["baseline_sha256"] == row["candidate_sha256"]:
+            continue
+        allowed = expected is not None and expected.fullmatch(row["component"])
+        (changes if allowed else failures).append(
+            f"{row['component']}: the baseline loaded {row['baseline_sha256'] or 'nothing'}, "
+            f"the candidate {row['candidate_sha256'] or 'nothing'}"
+        )
+    return {
+        "images": rows,
+        "failures": failures,
+        "expected_changes": changes,
+        "expect_image_change": expected.pattern if expected else None,
+        "pass": not failures,
+    }
 
 
 def compare_builds(
-    baseline: Path, candidate: Path, model_root: Path, environment: dict, options=()
+    baseline: Path,
+    candidate: Path,
+    model_root: Path,
+    environment: dict,
+    options=(),
+    expected=None,
 ) -> dict:
     """Compares the images the build directories load from model_root, which
     both were given, each build's weight-digests given options; environment
-    started the baseline."""
+    started the baseline, and expected names the images that may change
+    (compare)."""
     if loads_in_memory(baseline):
         images = digests(baseline, model_root, options)
     elif (Path(baseline) / IDENTITY_HEADER).is_file():
         images = prepared(environment, model_root)
     else:
         raise RuntimeError(f"the baseline build has no {WEIGHT_DIGESTS}")
-    return compare(images, digests(candidate, model_root, options))
+    return compare(images, digests(candidate, model_root, options), expected)

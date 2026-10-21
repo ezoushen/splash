@@ -27,6 +27,10 @@ public:
 
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile model();
+  // The plan of the image at `index` among those planned: the layers', then
+  // model.bin's.
+  [[nodiscard]] ImagePlan image(size_t index) const;
+  [[nodiscard]] size_t imageCount() const noexcept { return planned_->images.size(); }
 
 private:
   // The checkpoint and its images, which their writers share.
