@@ -36,10 +36,13 @@ done
 for value in 0 2049 -1 4294967296 1x '' '1,' ',1' '1,,4'; do
     reject '--rows requires integers' --rows "$value"
 done
+for value in 0 -1 4294967296 1x ''; do
+    reject '--warmup-ms requires integers' --warmup-ms "$value"
+done
 for value in -1 3 4294967296 1x ''; do
     reject '--variant requires integers' --variant "$value"
 done
-for option in --histories --lanes --repeat --shapes --phases --compare-metallib --extent-pages --qsa --rows --variant; do
+for option in --histories --lanes --repeat --shapes --phases --compare-metallib --extent-pages --qsa --rows --variant --warmup-ms; do
     reject "$option requires a value" "$option"
 done
 reject '--phases takes both, verify or prefill' --phases typo

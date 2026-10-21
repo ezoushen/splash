@@ -51,6 +51,8 @@ def s3():
     cases, _ = run("--phases", "prefill", "--rows", "128")
     assert cases[0]["warmup_gpu_seconds"] >= 1.5
     assert 0.1 <= cases[1]["warmup_gpu_seconds"] < 1.0, "S3: retain the later prefill warm-up"
+    cases, _ = run("--phases", "prefill", "--rows", "128", "--warmup-ms", "1500")
+    assert all(c["warmup_gpu_seconds"] >= 1.5 for c in cases), "S3: configurable warm-up minimum for clock qualification"
 
 
 def s4():

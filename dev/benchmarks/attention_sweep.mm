@@ -16,7 +16,7 @@
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
 //                        [--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer]
-//                        [--located] [--rows 128,512,2048] [--variant 0|1|2]
+//                        [--located] [--rows 128,512,2048] [--variant 0|1|2] [--warmup-ms N]
 //
 // fn is Qwen3.8-Flash-Next's GQA-12 attention, whose rows attend past 512
 // complete blocks of four tokens only to the 512 blocks their QSA bitmap
@@ -652,14 +652,14 @@ int main(int argc, const char *argv[]) {
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
                    "[--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer] "
-                   "[--located] [--rows LIST] [--variant 0|1|2]\n";
+                   "[--located] [--rows LIST] [--variant 0|1|2] [--warmup-ms N]\n";
       return 64;
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
     std::vector<uint32_t> lanes{1, 4};
     std::vector<uint32_t> rows{kPrefillRows};
     std::vector<std::string> shapes{"27b", "35b"};
-    uint32_t repeat = 5;
+    uint32_t repeat = 5, minimumWarmupMs = 0;
     std::optional<uint32_t> variant;
     // Zero: the largest extent the memory plan picks for the model's K/V
     // pages (Flash-Next's without its index regions, which no case reads).
@@ -684,6 +684,8 @@ int main(int argc, const char *argv[]) {
         rows = parseList(value, 1, kPrefillRows, option);
       else if (option == "--variant")
         variant = parseCount(value, 0, 2, option);
+      else if (option == "--warmup-ms")
+        minimumWarmupMs = parseCount(value, 1, std::numeric_limits<uint32_t>::max(), option);
       else if (option == "--repeat")
         repeat = parseCount(value, 1, std::numeric_limits<uint32_t>::max(), option);
       else if (option == "--extent-pages")
@@ -769,7 +771,8 @@ int main(int argc, const char *argv[]) {
         plans.push_back(casePlan(geometry, prefill, lane, history, shapeExtentPages,
                                  chunkRows, i && variant ? *variant : 0));
       const auto cases = measure(backends, plans, !comparisonLibrary.empty(),
-                                 prefill, repeat, warmupSeconds, shapeQsa, caseLocated);
+                                 prefill, repeat, std::max(warmupSeconds, minimumWarmupMs / 1000.0),
+                                 shapeQsa, caseLocated);
       warmupSeconds = 0.1;
       for (size_t i = 0; i < cases.size(); ++i) {
         std::cout << (firstCase ? "" : ",")
