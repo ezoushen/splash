@@ -76,7 +76,8 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout) {
 }
 
 void checkPlans(uint32_t queryHeads, kv::Layout layout) {
-  const std::string geometrySuffix = layout.kvHeads == 4 ? "" : "_kv2_g8";
+  // The split and reduce kernels are those of the GQA group: 6, 8 or 16 query heads per KV head.
+  const std::string geometrySuffix = queryHeads == 24 ? "" : queryHeads == 16 ? "_kv2_g8" : "_kv2_g16";
   const std::array<uint32_t, 1> zeroHistory{};
   const std::string prefillSplit = std::string(layout.format == kv::Format::Int8
       ? "prefill_attention_q8_split" : "prefill_attention_bf16_split") + geometrySuffix;
@@ -935,7 +936,7 @@ int main(int argc, char **argv) {
   try {
     require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long]]");
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
-      for (uint32_t heads : {24U, 16U})
+      for (uint32_t heads : {24U, 16U, 32U})
         checkPlans(heads, {1, heads == 24 ? 4U : 2U, 256, format});
     if (argc == 1) {
       std::cout << "paged attention plans: CPU PASS\n";
@@ -945,17 +946,17 @@ int main(int argc, char **argv) {
     checkBf16StoreEdges(backend);
     ropeExtents(backend);
     ropeRangeMatchesPositions(backend);
-    for (uint32_t heads : {24U, 16U})
+    for (uint32_t heads : {24U, 16U, 32U})
       bufferExtents(backend, heads, {1, heads == 24 ? 4U : 2U, 256, kv::Format::Int8});
     // The prepare kernels do not depend on the KV format.
-    for (uint32_t heads : {24U, 16U})
+    for (uint32_t heads : {24U, 16U, 32U})
       for (bool float32 : {false, true})
         for (bool verify : {false, true})
           checkProjection(backend, heads, {1, heads == 24 ? 4U : 2U, 256, kv::Format::Int8}, float32,
                           verify);
     if (argc == 3 && std::string_view(argv[2]) == "--long") {
       for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
-        for (uint32_t heads : {24U, 16U})
+        for (uint32_t heads : {24U, 16U, 32U})
           for (uint32_t history : {131072U, 260096U}) {
             const kv::Layout layout{1, heads == 24 ? 4U : 2U, 256, format};
             auto prefill = makeCase(backend, heads, layout, 1, 2048, history, false);
@@ -970,7 +971,7 @@ int main(int argc, char **argv) {
     }
     require(argc == 2, "usage: paged-attention-plan [METALLIB [--long]]");
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
-    for (uint32_t heads : {24U, 16U}) {
+    for (uint32_t heads : {24U, 16U, 32U}) {
       const kv::Layout layout{1, heads == 24 ? 4U : 2U, 256, format};
       for (const auto [history, rows] :
            std::array<std::array<uint32_t, 2>, 10>{{{0, 1}, {33, 7}, {255, 17},

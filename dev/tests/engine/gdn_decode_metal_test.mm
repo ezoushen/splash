@@ -58,8 +58,8 @@ constexpr uint32_t kTaps = SPLASH_GDN_CONVOLUTION_TAPS, kCarried = kTaps - 1;
 constexpr uint32_t kLayers = 2;
 // The scales of the normalized q and k rows.
 constexpr double kQueryScale = 0.0078125, kKeyScale = 0.08838834765;
-constexpr std::array kShapes{GdnShape{16, 48, 128, 10240, 16640},
-                             GdnShape{16, 32, 128, 8192, 12544}};
+constexpr std::array kShapes{GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544},
+                             GdnShape{16, 64, 128, 12288, 20736}};
 
 double roundBfloat(double value) {
   return bf16ToFloat(floatToBf16(static_cast<float>(value)));

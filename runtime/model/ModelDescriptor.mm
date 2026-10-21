@@ -7,6 +7,7 @@
 
 #import <Foundation/Foundation.h>
 
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -204,6 +205,13 @@ void requireLayerTypes(NSArray *types, const QwenTargetDimensions &target,
   }
 }
 
+// A draft is trained for a block at least as long as the engine's, whose rows
+// it drafts; the default is the engine's own.
+static_assert(DFlashDraftLayout{}.trainedBlockSize == ExecutionLimits::draftQueryRows &&
+                  kQwen3_6Moe35B.draft.trainedBlockSize >= ExecutionLimits::draftQueryRows &&
+                  kQwen3_5Moe122B.draft.trainedBlockSize >= ExecutionLimits::draftQueryRows,
+              "a draft trained for a shorter block than the engine's cannot draft its rows");
+
 // Each family's native window, which its config's max_position_embeddings
 // states, fits the runtime's KV ceiling.
 static_assert(Qwen3_8Layout{}.maximumContextTokens <= kv::kMaximumLogicalTokens &&
@@ -217,11 +225,11 @@ ModelDescriptor qwen38Descriptor(std::string name, TargetSource targetSource,
                              targetSource, visionSource);
 }
 
-ModelDescriptor qwen36Descriptor(std::string name, TargetSource targetSource,
-                                 VisionSource visionSource) {
-  return makeModelDescriptor(std::move(name), Qwen3_6MoeLayout{},
-                             kQwen3_6MoeDraftLayout, kQwen3_6MoeVisionLayout,
-                             targetSource, visionSource);
+ModelDescriptor qwenMoeDescriptor(std::string name, const QwenMoeGeometry &geometry, TargetSource targetSource,
+                                  VisionSource visionSource) {
+  // The vision tower projects into the target's hidden width.
+  return makeModelDescriptor(std::move(name), Qwen3_6MoeLayout{geometry}, geometry.draft,
+                             ops::VisionLayout{.outputHiddenSize = geometry.hiddenSize}, targetSource, visionSource);
 }
 
 // The name errors give an upstream target's source: its format, safetensors
@@ -230,11 +238,16 @@ std::string_view sourceName(TargetSource source) {
   return source == TargetSource::Safetensors ? "safetensors" : "GGUF";
 }
 
+// The sparse-MoE geometries Splash serves, the 35B's first: a config of none of
+// them is refused against it, as it always was.
+constexpr std::array<const QwenMoeGeometry *, 2> kMoeGeometries{&kQwen3_6Moe35B, &kQwen3_5Moe122B};
+
 // The refusal of a model of none of the families Splash serves: what tells it
 // from the family its config's model type names, or that it names none.
 std::invalid_argument unsupportedModel(const std::string &difference) {
-  return std::invalid_argument("no supported model has this architecture (" + difference + "); supported: " +
-                               std::string(Qwen3_8Layout::family) + ", " + std::string(Qwen3_6MoeLayout::family));
+  std::string families(Qwen3_8Layout::family);
+  for (const QwenMoeGeometry *geometry : kMoeGeometries) families += ", " + std::string(geometry->family);
+  return std::invalid_argument("no supported model has this architecture (" + difference + "); supported: " + families);
 }
 
 // The target's text configuration, of the family its model type names. Every
@@ -579,7 +592,7 @@ void validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layout,
   NSDictionary *flash =
       requireObject(draft, @"dflash_config", "draft config dflash_config");
   requireNumbers(flash, "checkpoint", "draft config dflash_config",
-                 {{"block_size", ExecutionLimits::draftQueryRows},
+                 {{"block_size", layout.trainedBlockSize},
                   {"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
                   {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
                   {"selector_rank", layout.selectorRank},
@@ -612,6 +625,19 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
     throw std::invalid_argument("vision deepstack layers are unsupported");
 }
 
+// The geometry whose hidden size and depth a text config states, chosen before
+// any check so that the checks all run against one family.
+const QwenMoeGeometry &moeGeometry(NSDictionary *text) {
+  const auto states = [&](NSString *key, uint32_t value) {
+    id number = text[key];
+    return [number isKindOfClass:[NSNumber class]] && [number doubleValue] == value;
+  };
+  for (const QwenMoeGeometry *geometry : kMoeGeometries)
+    if (states(@"hidden_size", geometry->hiddenSize) && states(@"num_hidden_layers", geometry->layers))
+      return *geometry;
+  return *kMoeGeometries.front();
+}
+
 // The descriptor, named name, of an upstream model of the family its text
 // config's model type names, from the source formats its record names, with
 // each config checked: the target's, as those formats require, and the
@@ -634,7 +660,10 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   else if (visionFormat == "safetensors") visionSource = VisionSource::Safetensors;
   else if (visionFormat == "gguf") visionSource = VisionSource::Gguf;
   else throw std::invalid_argument("unsupported vision source format: " + std::string(visionFormat));
-  ModelDescriptor result = moe ? qwen36Descriptor(std::move(name), targetSource, visionSource)
+  const QwenMoeGeometry &geometry = moeGeometry(text);
+  if (moe && targetSource == TargetSource::Gguf && !geometry.ggufServed)
+    throw std::invalid_argument("GGUF " + std::string(geometry.family) + " is not served");
+  ModelDescriptor result = moe ? qwenMoeDescriptor(std::move(name), geometry, targetSource, visionSource)
                                : qwen38Descriptor(std::move(name), targetSource, visionSource);
   std::visit([&](const auto &layout) {
     validateTextConfig(text, layout, layout.family, result.targetSource);

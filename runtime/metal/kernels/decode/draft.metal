@@ -479,6 +479,7 @@ inline void draft_conv_decode_batch_impl(
   }
 DRAFT_CONV_ENTRY(draft_conv, 5120)
 DRAFT_CONV_ENTRY(draft_conv_h2048, 2048)
+DRAFT_CONV_ENTRY(draft_conv_h3072, 3072)
 #undef DRAFT_CONV_ENTRY
 
 kernel void draft_attention_qkv(

@@ -83,6 +83,10 @@ struct DFlashDraftLayout final {
   uint32_t targetHiddenSize = 0;
   uint32_t selectorRank = 0;
   uint32_t kvHeads = 0;
+  // The block the draft was trained for, which its config states. The engine
+  // drafts one block of ExecutionLimits::draftQueryRows rows; a draft trained
+  // for a longer block runs its first rows.
+  uint32_t trainedBlockSize = 8;
 
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
     return {layers, kvHeads, attentionHeadDimension, hiddenSize};

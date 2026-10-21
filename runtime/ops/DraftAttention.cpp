@@ -74,7 +74,7 @@ void requireLanes(uint32_t lanes) {
     throw std::invalid_argument("invalid draft batch width");
 }
 
-enum class KernelLayout : uint8_t { Hidden5120, Hidden2048 };
+enum class KernelLayout : uint8_t { Hidden5120, Hidden2048, Hidden3072 };
 
 // The compiled draft (metal/abi/DraftAttention.h) of each hidden size the
 // convolution kernels take.
@@ -92,6 +92,8 @@ enum class KernelLayout : uint8_t { Hidden5120, Hidden2048 };
     return KernelLayout::Hidden5120;
   if (shape == compiled(2048))
     return KernelLayout::Hidden2048;
+  if (shape == compiled(3072))
+    return KernelLayout::Hidden3072;
   throw std::invalid_argument("unsupported compiled draft attention shape");
 }
 
@@ -139,8 +141,12 @@ void DraftAttention::addConvolution(metal::CommandGraph &graph,
                "draft convolution weight");
   const KernelLayout kernel = kernelShape(shape);
   const DraftConvBatchParams params{finish};
-  graph.add(kernel == KernelLayout::Hidden5120 ? "draft_conv"
-                                               : "draft_conv_h2048",
+  const char *convolution = "draft_conv";
+  if (kernel == KernelLayout::Hidden2048)
+    convolution = "draft_conv_h2048";
+  else if (kernel == KernelLayout::Hidden3072)
+    convolution = "draft_conv_h3072";
+  graph.add(convolution,
             {std::move(buffers.input), std::move(buffers.dynamic),
              std::move(buffers.weights), std::move(buffers.residual),
              std::move(buffers.output)},
