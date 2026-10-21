@@ -94,7 +94,7 @@ constexpr uint32_t kPrefillRows = SPLASH_PREFILL_TOKEN_BUDGET;
 constexpr uint32_t kLayer = 1;
 // The memory plan's extents of the full models: 16, 10 and 12 attention
 // layers.
-constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10, kModelLayersFn = 12;
+constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10, kModelLayersFn = 12, kModelLayers122b = 12;
 // Qwen3.8-Flash-Next's QSA: the indexer's top_k of 2048 tokens in blocks of 4.
 constexpr uint32_t kQsaTopBlocks = 512, kQsaBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
 // --qsa overlapping: the blocks a tile's rows choose theirs from, three times
@@ -104,15 +104,18 @@ constexpr uint32_t kQsaOverlapBlocks = 3 * kQsaTopBlocks;
 
 AttentionShape shapeOf(const std::string &shape, kv::Format format) {
   if (shape == "fn") return AttentionShape{24, 2, 256, format, true};
+  if (shape == "122b") return AttentionShape{32, 2, 256, format};
   return shape == "27b" ? AttentionShape{24, 4, 256, format}
                         : AttentionShape{16, 2, 256, format};
 }
 
 uint32_t modelLayers(const std::string &shape) {
+  if (shape == "122b") return kModelLayers122b;
   return shape == "27b" ? kModelLayers27b : shape == "35b" ? kModelLayers35b : kModelLayersFn;
 }
 
 std::string modelName(const std::string &shape) {
+  if (shape == "122b") return "ornith-1.5-122b";
   return shape == "27b" ? "qwen3.8-27b" : shape == "35b" ? "qwen3.6-35b-a3b" : "qwen3.8-flash-next";
 }
 
@@ -617,7 +620,7 @@ int main(int argc, const char *argv[]) {
           const size_t comma = value.find(',', start);
           const std::string shape =
               value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-          if (shape != "27b" && shape != "35b" && shape != "fn")
+          if (shape != "27b" && shape != "35b" && shape != "fn" && shape != "122b")
             throw std::invalid_argument("--shapes takes 27b, 35b or fn");
           shapes.push_back(shape);
           if (comma == std::string::npos) break;
