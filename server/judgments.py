@@ -62,6 +62,7 @@ PROBABILITY_STATUS = "conditional option score; uncalibrated as decision confide
 # prompt tokens in total.
 MAX_SYSTEMONE_QUESTIONS = 64
 MAX_SYSTEMONE_TOTAL_TOKENS = 1 << 20
+MAX_SYSTEMONE_IMAGES = 64
 
 _MISSING = object()
 
@@ -177,6 +178,22 @@ def slot_labels(tokenizer):
     return labels
 
 
+def score_template(chat_template):
+    """The arguments that render a scored prompt: without thinking, as a
+    request with effort none renders. Whatever re-renders a prompt that
+    encode_prompt prepared passes these too."""
+    return {
+        "chat_template": chat_template,
+        "tokenize": False,
+        **template_options(
+            reasoning_effort="none",
+            preserve_thinking=None,
+            tools=None,
+            add_generation_prompt=True,
+        ),
+    }
+
+
 def encode_prompt(
     prompt_tokenizer, chat_template, messages, labels, *, admit, checkpoint
 ):
@@ -197,20 +214,7 @@ def encode_prompt(
     runs once per slot inside it; either may raise to abandon preparation.
     """
     tokenizer = prompt_tokenizer.tokenizer
-    rendered = render_chat_template(
-        tokenizer,
-        messages,
-        {
-            "chat_template": chat_template,
-            "tokenize": False,
-            **template_options(
-                reasoning_effort="none",
-                preserve_thinking=None,
-                tools=None,
-                add_generation_prompt=True,
-            ),
-        },
-    )
+    rendered = render_chat_template(tokenizer, messages, score_template(chat_template))
     prompt = tokenizable(rendered)
     head, tail = prompt_tokenizer.split(prompt)
     tail_ids = list(tokenizer.encode(tail, add_special_tokens=False))
@@ -432,10 +436,32 @@ def validate_systemone(body):
     return state, specs, details
 
 
-def systemone_messages(state, spec, slots):
+def systemone_images(body):
+    """The optional request images: (data URLs, details). Every question's
+    prompt shows them before the evidence."""
+    images = body.get("images")
+    if images is None:
+        return (), []
+    if (
+        not isinstance(images, list)
+        or not 1 <= len(images) <= MAX_SYSTEMONE_IMAGES
+        or any(
+            not isinstance(url, str) or not url.startswith("data:") for url in images
+        )
+    ):
+        return (), [
+            field_error(
+                ["images"], f"images must be 1-{MAX_SYSTEMONE_IMAGES} data: URLs"
+            )
+        ]
+    return tuple(images), []
+
+
+def systemone_messages(state, spec, slots, image_urls=()):
     """Render one question in the direct-options-v1 shape. Structured
     instructions and descriptions stay JSON values; labels keep their
-    meaning alongside the answer slot."""
+    meaning alongside the answer slot. Images precede the evidence text in
+    the user turn; without them the user content stays one string."""
     options = [
         {"slot": slot, "label": label, "description": description}
         for slot, label, description in zip(slots, spec.labels, spec.descriptions)
@@ -444,9 +470,15 @@ def systemone_messages(state, spec, slots):
     if spec.instructions is not None:
         payload["criterion"] = spec.instructions
     payload["options"] = options
+    content = json.dumps(payload, ensure_ascii=False)
+    if image_urls:
+        content = [
+            *({"type": "image_url", "image_url": {"url": url}} for url in image_urls),
+            {"type": "text", "text": content},
+        ]
     return [
         {"role": "system", "content": SYSTEMONE_SYSTEM},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        {"role": "user", "content": content},
     ]
 
 

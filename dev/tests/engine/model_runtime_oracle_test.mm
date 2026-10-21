@@ -2655,6 +2655,66 @@ void requireCapturedStateKeepsItsImageRows(model::Runtime &executor,
   std::cout << "captured_state_keeps_its_image_rows=PASS\n";
 }
 
+// A score request may carry an image span: its start admits the pixels, the
+// prefill encodes and injects the image rows, and the final-position logits
+// reflect them. The generation request encodes first; the score request uses
+// identical pixels under another digest, so its own prefill runs the encoder
+// rather than the embedding cache.
+void requireImageScoreReadsItsImage(model::Runtime &executor) {
+  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
+  }
+  std::vector<uint32_t> prompt(120);
+  for (uint32_t index = 0; index < prompt.size(); ++index)
+    prompt[index] = 1 + index;
+  const std::vector<uint32_t> pages = pageRange(120, 4);
+  const ImageSpan span{56, 16, 8, 8, 271, 449};
+  std::vector<uint8_t> pixels(span.pixelBytes());
+  for (size_t index = 0; index < pixels.size(); ++index)
+    pixels[index] = static_cast<uint8_t>(index * 5 + 1);
+
+  EngineRequest generation = makeRequest(130, prompt, 4);
+  generation.images = {span};
+  generation.imagePixels = pixels;
+  require(executor.begin(generation.modelView()).granted(),
+          "image generation request was not admitted");
+  executor.setDraftContextPlan(
+      generation.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
+  const ModelStepResult first = firstStep(
+      executor, prefillChunk(executor, generation.id, 0, prompt, pages, false),
+      generation.id, prompt.size(), pages);
+  require(!first.outputTokens.empty(), "image prompt produced no first token");
+  executor.end(generation.id);
+
+  const uint32_t greedy = first.outputTokens.front();
+  const uint32_t otherA = greedy == 1 ? 2u : 1u;
+  const uint32_t otherB = greedy == 7 ? 8u : 7u;
+  EngineRequest scored = makeRequest(131, prompt, 0);
+  scored.images = {span};
+  scored.images.front().digestLo = 283;
+  scored.images.front().digestHi = 457;
+  scored.imagePixels = pixels;
+  scored.scoreTokens = {greedy, otherA, otherB};
+  const uint64_t encodes = executor.telemetry().imageEncodes;
+  require(executor.begin(scored.modelView()).granted(),
+          "image score request was not admitted");
+  executor.setDraftContextPlan(
+      scored.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
+  const ModelStepResult result =
+      prefillChunk(executor, scored.id, 0, prompt, pages, false);
+  require(executor.telemetry().imageEncodes == encodes + 1,
+          "score request did not encode its image");
+  require(result.finished && result.outputTokens.empty() &&
+              result.scoreLogits.size() == 3,
+          "image score prefill did not return ordered logits");
+  for (float logit : result.scoreLogits)
+    require(std::isfinite(logit), "image score logit is not finite");
+  require(result.scoreLogits[0] >= result.scoreLogits[1] &&
+              result.scoreLogits[0] >= result.scoreLogits[2],
+          "greedy image token is not the maximum scored logit");
+  executor.end(scored.id);
+  std::cout << "image_score_reads_its_image=PASS\n";
+}
+
 // The registry through which the placements of an image share its rows
 // keeps no entry of rows nothing holds once the next start with images adds
 // its own: starts of distinct images that end before their prefill, as
@@ -4034,6 +4094,7 @@ int main(int argc, char **argv) {
       requireReplayPointKeepsItsImageRows(executor, backend);
       requireCapturedStateKeepsItsImageRows(executor, backend);
       requireImageRegistryKeepsOnlyHeldRows(executor);
+      requireImageScoreReadsItsImage(executor);
     } else {
       require(!imagesOnly, "--images-only needs a model that serves vision");
       std::cout << "image scenarios: skipped, the model serves text only\n";
@@ -4044,7 +4105,7 @@ int main(int argc, char **argv) {
                    " shared, suspended and injected rows, rows a failed chunk encoded,"
                    " covered images, refused starts,"
                    " one cache unit per reclaim, replay point and captured state rows,"
-                   " registry entries of rows nothing holds)\n";
+                   " registry entries of rows nothing holds, image score)\n";
       return 0;
     }
 

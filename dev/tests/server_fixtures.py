@@ -224,6 +224,68 @@ class CharTokenizer(FakeTokenizer):
         return "".join(chr(token) for token in token_ids)
 
 
+class CharImageTokenizer(CharTokenizer):
+    """One token per character, and the image pad as one token. Each image
+    part renders as the pad the template source names, so the frontend's
+    render marker appears where it replaced the pad."""
+
+    PAD_ID = 0x110000
+    chat_template = FakeTokenizer.chat_template + "{#<|image_pad|>#}"
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.templates.append((messages, kwargs))
+        source = kwargs.get("chat_template", self.chat_template)
+        pad = (
+            api_shapes.IMAGE_PAD_TOKEN
+            if api_shapes.IMAGE_PAD_TOKEN in source
+            else request_frontend.IMAGE_RENDER_MARKER
+        )
+        rendered = ""
+        for message in messages:
+            content = message["content"]
+            if isinstance(content, list):
+                content = "".join(
+                    pad if part["type"] == "image_url" else part["text"]
+                    for part in content
+                )
+            rendered += f"<|im_start|>{message['role']}\n{content}<|im_end|>\n"
+        rendered += "<|im_start|>assistant\n"
+        return rendered if kwargs.get("tokenize") is False else self.encode(rendered)
+
+    def _pieces(self, text):
+        parts = text.split(api_shapes.IMAGE_PAD_TOKEN)
+        offset = 0
+        for index, part in enumerate(parts):
+            for char in part:
+                yield ord(char), (offset, offset + 1)
+                offset += 1
+            if index < len(parts) - 1:
+                width = len(api_shapes.IMAGE_PAD_TOKEN)
+                yield self.PAD_ID, (offset, offset + width)
+                offset += width
+
+    def encode(self, text, **kwargs):
+        return [token for token, _ in self._pieces(text)]
+
+    def __call__(self, text, **kwargs):
+        pieces = list(self._pieces(text))
+        return {
+            "input_ids": [token for token, _ in pieces],
+            "offset_mapping": [span for _, span in pieces],
+        }
+
+    def decode(self, token_ids, **kwargs):
+        return "".join(
+            api_shapes.IMAGE_PAD_TOKEN if token == self.PAD_ID else chr(token)
+            for token in token_ids
+        )
+
+    def convert_tokens_to_ids(self, token):
+        if token == api_shapes.IMAGE_PAD_TOKEN:
+            return self.PAD_ID
+        return super().convert_tokens_to_ids(token)
+
+
 class ImagePadTokenizer(FakeTokenizer):
     """Renders one image placeholder per image part like the pinned
     Qwen template, with pad id 50."""

@@ -97,6 +97,16 @@ def example_score_request():
     )
 
 
+def example_score_image_request():
+    image = example_image_request()
+    return replace(
+        example_score_request(),
+        prompt_tokens=image.prompt_tokens,
+        image_spans=image.image_spans,
+        image_pixels=image.image_pixels,
+    )
+
+
 def example_ignore_eos_request():
     return replace(
         example_request(),
@@ -114,6 +124,7 @@ def client_messages():
         "request": example_request(),
         "request_image": example_image_request(),
         "request_score": example_score_request(),
+        "request_score_image": example_score_image_request(),
         "request_ignore_eos": example_ignore_eos_request(),
         "request_progress": example_progress_request(),
         "cancel": p.CancelFrame(91),
@@ -316,6 +327,14 @@ class ProtocolPythonTests(unittest.TestCase):
             request.score_tokens,
         )
         self.assertEqual(decode_client(wire), request)
+        # Score requests may carry image spans with matching pixels.
+        span = p.ImageSpan(0, 1, 2, 2, 1, 2)
+        imaged = replace(
+            request,
+            image_spans=(span,),
+            image_pixels=bytes(span.pixel_bytes),
+        )
+        self.assertEqual(decode_client(p.serialize_message(imaged)), imaged)
 
     def test_maximum_score_domain_roundtrips_without_truncation(self):
         request = replace(example_score_request(), score_tokens=tuple(range(255)))
@@ -491,14 +510,6 @@ class ProtocolPythonTests(unittest.TestCase):
                 replace(base, thinking_budget=p.ThinkingBudget(0, (248069,), 248069)),
                 p.IssueCode.INVALID_COUNT,
             ),
-            (
-                replace(
-                    base,
-                    image_spans=(p.ImageSpan(0, 1, 2, 2, 1, 2),),
-                    image_pixels=bytes(48),
-                ),
-                p.IssueCode.INVALID_COUNT,
-            ),
         )
         for request, code in cases:
             with self.subTest(request=request):
@@ -516,6 +527,24 @@ class ProtocolPythonTests(unittest.TestCase):
                 replace(example_request(), logical_max_output_tokens=0)
             ),
         )
+
+    def test_score_request_image_pixels_must_match_the_spans(self):
+        span = p.ImageSpan(0, 1, 2, 2, 1, 2)
+        for request in (
+            replace(
+                example_score_request(),
+                image_spans=(span,),
+                image_pixels=bytes(span.pixel_bytes - 1),
+            ),
+            replace(example_score_request(), image_pixels=bytes(span.pixel_bytes)),
+        ):
+            with self.subTest(spans=len(request.image_spans)):
+                issue = self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda request=request: p.serialize_message(request),
+                )
+                self.assertEqual(issue.request_id, request.request_id)
 
     def test_done_option_logits_wire_layout_and_roundtrip(self):
         done = p.DoneEvent(
