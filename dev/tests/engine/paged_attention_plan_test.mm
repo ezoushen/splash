@@ -731,6 +731,24 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
             << " rows=" << rows << " PASS\n";
 }
 
+// Characterize GQA-16 tails around page and split partition boundaries.
+void check122bTails(metal::MetalBackend &backend) {
+  uint32_t failures = 0;
+  for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
+    for (uint32_t history : {511U, 513U, 4093U, 4097U})
+      for (uint32_t rows : {1U, 7U, 8U, 9U, 118U, 2047U, 2048U}) {
+        try {
+          checkPrefill(backend, 32, Geometry{32, 2, false}.layout(format), history, rows);
+        } catch (const std::exception &error) {
+          ++failures;
+          std::cerr << "122b tail: format=" << kv::formatName(format) << " history=" << history
+                    << " rows=" << rows << " FAIL: " << error.what() << '\n';
+        }
+      }
+  require(failures == 0, "122b tail characterization failed");
+  std::cout << "122b tails: 56 cases PASS\n";
+}
+
 // A prefill that reads its history staged, as one whose history has pages
 // that hold only their index does (ops::PagedAttention::addStageLayer): the
 // pool table it stages from has every third page of the history
@@ -1509,7 +1527,7 @@ void ropeTargetScaling(metal::MetalBackend &backend) {
 
 int main(int argc, char **argv) {
   try {
-    require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long]]");
+    require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long|--122b-tails]]");
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
       for (const Geometry geometry : kGeometries)
         checkPlans(geometry.queryHeads, geometry.layout(format));
@@ -1518,6 +1536,10 @@ int main(int argc, char **argv) {
       return 0;
     }
     metal::MetalBackend backend(argv[1]);
+    if (argc == 3 && std::string_view(argv[2]) == "--122b-tails") {
+      check122bTails(backend);
+      return 0;
+    }
     checkBf16StoreEdges(backend);
     ropeExtents(backend);
     ropeRangeMatchesPositions(backend);
@@ -1548,7 +1570,8 @@ int main(int argc, char **argv) {
       std::cout << "long paged attention plans: PASS\n";
       return 0;
     }
-    require(argc == 2, "usage: paged-attention-plan [METALLIB [--long]]");
+    require(argc == 2, "usage: paged-attention-plan [METALLIB [--long|--122b-tails]]");
+    check122bTails(backend);
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
     for (const Geometry geometry : kGeometries) {
       const uint32_t heads = geometry.queryHeads;
