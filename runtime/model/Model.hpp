@@ -576,9 +576,10 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
 }
 
 // Compile-time ceiling of the one native DFlash execution contract. A draft
-// must have been trained for blocks of at least draftQueryRows rows (it drafts
-// the first draftQueryRows of a longer block) over draftContextTokens context
-// tokens, which inspectModelRoot checks a DFlash2 checkpoint's config for; the
+// must have been trained for the block its family declares (draftBlockSize),
+// at least draftQueryRows rows (it drafts the first draftQueryRows of a longer
+// block), over draftContextTokens context tokens, which inspectModelRoot
+// checks a DFlash2 checkpoint's config for; the
 // other limits are the runtime's own. Cache-page
 // and attention-kernel geometry live with their operators.
 struct ExecutionLimits final {

@@ -208,7 +208,7 @@ void testOrnith122B(const std::filesystem::path &fixtures) {
           "the 122B's draft differs from its config");
 }
 
-// The 35B is what Splash's lanes run: giving the 122B a geometry of its own
+// The 35B is the default geometry: giving the 122B a geometry of its own
 // leaves every size the 35B's layout had, and refuses what is neither.
 void testMoeGeometries(const std::filesystem::path &fixtures) {
   // The shipped 35B layout, by the values it had before the 122B (the

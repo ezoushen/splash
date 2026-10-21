@@ -1843,10 +1843,11 @@ A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
 target's, and its attention (32 query and 8 KV heads of 128), selector (rank
-256, 16 candidates), block of 8 rows and 2048-token window are those the kernels
-are built for (`readDraftLayout` in `ModelDescriptor.mm`); the kernels take any
-hidden width of whole 16-channel convolution groups. Every family loads and runs
-its draft alike: a decode cycle drafts the whole block, the anchor and its seven
+256, 16 candidates), block and 2048-token window are those the kernels are built
+for (`readDraftLayout` in `ModelDescriptor.mm`): a block of 8 rows, or of 16 for
+Qwen3.5-122B-A10B's draft, of which the engine drafts the first 8; the kernels
+take any hidden width of whole 16-channel convolution groups. Every family loads
+and runs its draft alike: a decode cycle drafts 8 rows, the anchor and its seven
 proposals, and the target verifies the block's first rows, as many as the cycle
 chose for the lane (its verify rows, `ops::DraftSelector::addVerifyRows`), never
 more than the lane may still retain: the tokens its output budget leaves, at

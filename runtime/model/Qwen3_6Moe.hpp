@@ -64,8 +64,8 @@ inline constexpr QwenMoeGeometry kQwen3_5Moe122B{.family = "Qwen3.5-122B-A10B",
                                                  .expertIntermediateSize = 1024,
                                                  .draftBlockSize = 16};
 
-// The layout of a sparse-MoE Qwen target: by default the 35B's, the one
-// Splash's lanes have always run, or of another geometry on request.
+// The layout of a sparse-MoE Qwen target: by default the 35B's (Qwen3.6-35B-A3B),
+// or of another geometry on request.
 struct Qwen3_6MoeLayout final : QwenHybridLayout {
   // The family's name, as the installer pairs its draft (install/families.py).
   std::string_view family;
