@@ -12,11 +12,11 @@
 // case prints a digest of its output: two builds that fill the same pages must
 // print the same digests, whatever their storage.
 //
-// usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b,fn]
+// usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b,fn,122b]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
 //                        [--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer]
-//                        [--located]
+//                        [--located] [--rows 128,512,2048] [--variant 0|1|2]
 //
 // fn is Qwen3.8-Flash-Next's GQA-12 attention, whose rows attend past 512
 // complete blocks of four tokens only to the 512 blocks their QSA bitmap
@@ -56,6 +56,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -74,6 +75,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <variant>
 
 namespace {
 
@@ -177,21 +179,40 @@ std::vector<uint32_t> qsaBitmaps(const AttentionFixturePlan &plan, const std::st
 
 // The prefill chunk on one lane, or the verify rows of `lanes` lanes, all
 // after `history` tokens, with their plan's scratch.
-AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
-                              uint32_t history, uint32_t extentPages) {
+using AttentionPlan = std::variant<PrefillAttentionPlan, VerifyAttentionPlan>;
+struct SweepPlan final {
+  AttentionFixturePlan fixture;
+  AttentionPlan attention;
+  uint32_t variant;
+};
+
+// Variants 1/2 are diagnostic probes, not optimized kernels: a padded prefill
+// layout, and that layout with negated queries to exercise difference reporting.
+SweepPlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
+                    uint32_t history, uint32_t extentPages, uint32_t rows, uint32_t variant) {
   const kv::Layout layout{.attentionLayers = 1, .kvHeads = shape.kvHeads, .headDimension = shape.headDimension,
                           .format = shape.format, .valuesTokenMajor = shape.valuesTokenMajor};
   const uint32_t caseLanes = prefill ? 1 : lanes;
   AttentionFixturePlan::Histories histories{};
   std::fill_n(histories.begin(), caseLanes, history);
-  const AttentionWorkspace scratch =
-      prefill ? PagedAttention::prefillPlan(kPrefillRows, shape.queryHeads, layout)
-                    .workspace
-              : PagedAttention::verifyPlan(caseLanes, shape.queryHeads, layout,
-                                           std::span(histories).first(caseLanes))
-                    .workspace;
-  return AttentionFixturePlan::make(shape, caseLanes, prefill ? kPrefillRows : kVerifyRows,
-                                    histories, scratch, {kLayer + 1, kLayer, extentPages});
+  AttentionPlan attention = prefill
+      ? AttentionPlan(PagedAttention::prefillPlan(rows, shape.queryHeads, layout))
+      : AttentionPlan(PagedAttention::verifyPlan(caseLanes, shape.queryHeads, layout,
+                                                 std::span(histories).first(caseLanes)));
+  const AttentionWorkspace scratch = std::visit([](const auto &plan) { return plan.workspace; }, attention);
+  auto fixture = AttentionFixturePlan::make(shape, caseLanes, prefill ? rows : kVerifyRows,
+                                            histories, scratch, {kLayer + 1, kLayer, extentPages});
+  if (variant && prefill && fixture.stride < kPrefillRows) {
+    const uint32_t previous = fixture.stride;
+    fixture.stride += kv::kPageTokens;
+    for (auto tensor : {AttentionFixture::Tensor::ChunkKeys, AttentionFixture::Tensor::ChunkValues,
+                        AttentionFixture::Tensor::Queries, AttentionFixture::Tensor::Output})
+      fixture.sizes[static_cast<size_t>(tensor)] =
+          fixture.sizes[static_cast<size_t>(tensor)] / previous * fixture.stride;
+    fixture.bytes = AttentionFixturePlan::aligned(fixture.poolBytes);
+    for (uint64_t size : fixture.sizes) fixture.bytes += AttentionFixturePlan::aligned(size);
+  }
+  return {fixture, std::move(attention), variant};
 }
 
 // The QSA indexer of a case's rows (--qsa indexer): its inputs, as the
@@ -372,7 +393,7 @@ double listEntries(const QsaBlocks &qsa) {
 // The store and attention graph the runtime encodes for a case, after its
 // block lists when it has QSA bitmaps, and the indexer that selects them
 // with --qsa indexer.
-metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill, const QsaBlocks &qsa) {
+metal::CommandGraph caseGraph(const AttentionFixture &fixture, const AttentionPlan &attention, const QsaBlocks &qsa) {
   const AttentionFixturePlan &plan = fixture.plan();
   metal::CommandGraph graph;
   if (const QsaIndexer *indexer = qsa.indexer ? &*qsa.indexer : nullptr) {
@@ -391,15 +412,7 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill, con
       sequences.push_back({lane * plan.rows, plan.rows, plan.histories[lane], lane});
     PagedAttention::addBlockLists(graph, qsa.bitmaps, qsa.words, sequences, qsa.blocks);
   }
-  if (prefill)
-    fixture.addGraph(graph,
-                     PagedAttention::prefillPlan(plan.rows, plan.shape.queryHeads, plan.layout()),
-                     qsa.blocks);
-  else
-    fixture.addGraph(graph,
-                     PagedAttention::verifyPlan(plan.lanes, plan.shape.queryHeads, plan.layout(),
-                                                std::span(plan.histories).first(plan.lanes)),
-                     qsa.blocks);
+  std::visit([&](const auto &plan) { fixture.addGraph(graph, plan, qsa.blocks); }, attention);
   return graph;
 }
 
@@ -418,7 +431,8 @@ std::span<const uint8_t> outputBytes(const AttentionFixture &fixture) {
   return {static_cast<const uint8_t *>(output.contents()), output.sizeBytes()};
 }
 
-// FNV-1a of the attention output.
+// FNV-1a of the raw output allocation, including padding. Logical values
+// alone determine bit_equal across variant layouts.
 uint64_t outputDigest(const AttentionFixture &fixture) {
   uint64_t digest = 0xcbf29ce484222325ULL;
   for (const uint8_t byte : outputBytes(fixture))
@@ -426,7 +440,30 @@ uint64_t outputDigest(const AttentionFixture &fixture) {
   return digest;
 }
 
+// Canonical logical output excludes layout padding and normalizes row strides.
+std::vector<uint16_t> logicalOutput(const AttentionFixture &fixture) {
+  const auto &plan = fixture.plan();
+  const auto *output = static_cast<const uint16_t *>(fixture.buffer(AttentionFixture::Tensor::Output).contents());
+  std::vector<uint16_t> values;
+  values.reserve(uint64_t{plan.lanes} * plan.shape.queryHeads * plan.rows * plan.shape.headDimension);
+  for (uint32_t lane = 0; lane < plan.lanes; ++lane)
+    for (uint32_t head = 0; head < plan.shape.queryHeads; ++head)
+      for (uint32_t row = 0; row < plan.rows; ++row)
+        for (uint32_t d = 0; d < plan.shape.headDimension; ++d)
+          values.push_back(output[plan.queryIndex(lane, head, row, d)]);
+  return values;
+}
+
 struct Case final {
+  uint32_t variant = 0;
+  bool bitEqual = true;
+  double maxAbsDiff = 0.0;
+  uint32_t rows = 0;
+  uint32_t extentPages = 0;
+  uint32_t queryStride = 0;
+  double warmupGpuSeconds = 0.0;
+  double startEpoch = 0.0, endEpoch = 0.0;
+  std::vector<double> fusedSamples;
   double fusedMilliseconds = 0.0;
   std::map<std::string, double> pipelineMilliseconds;
   uint64_t kvBytes = 0;
@@ -444,45 +481,55 @@ double median(std::vector<double> values) {
 // with lists) runs on the lists alone first, then moves its blocks (locate)
 // and must give the same output reading them through their locations.
 std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
-                          const AttentionFixturePlan &plan, bool prefill, uint32_t repeat,
+                          const std::vector<SweepPlan> &plans, bool strictComparison, bool prefill, uint32_t repeat,
                           double warmupSeconds, const std::string &qsa, bool located) {
   std::vector<std::unique_ptr<AttentionFixture>> fixtures;
   std::vector<QsaBlocks> blocks;
   std::vector<metal::CommandGraph> graphs;
   std::vector<Case> results(backends.size());
   // The indexer writes its own bitmaps.
-  const uint32_t words = qsa.empty() ? 0 : qsaWords(plan);
+  const uint32_t words = qsa.empty() ? 0 : qsaWords(plans.front().fixture);
   const std::vector<uint32_t> bitmaps =
-      qsa.empty() || qsa == "indexer" ? std::vector<uint32_t>{} : qsaBitmaps(plan, qsa);
+      qsa.empty() || qsa == "indexer" ? std::vector<uint32_t>{} : qsaBitmaps(plans.front().fixture, qsa);
   for (size_t i = 0; i < backends.size(); ++i) {
+    const auto &plan = plans[i].fixture;
     fixtures.push_back(
         std::make_unique<AttentionFixture>(*backends[i], plan, "attention-sweep-fixture"));
     fixtures.back()->fill();
+    if (plans[i].variant == 2) {
+      auto *queries = static_cast<uint16_t *>(fixtures.back()->buffer(AttentionFixture::Tensor::Queries).contents());
+      for (uint32_t lane = 0; lane < plan.lanes; ++lane)
+        for (uint32_t head = 0; head < plan.shape.queryHeads; ++head)
+          for (uint32_t row = 0; row < plan.rows; ++row)
+            for (uint32_t d = 0; d < plan.shape.headDimension; ++d)
+              queries[plan.queryIndex(lane, head, row, d)] ^= 0x8000;
+    }
+    results[i].variant = plans[i].variant;
     blocks.push_back(qsaBlocks(*backends[i], plan, prefill, bitmaps, words, qsa == "indexer", located));
-    graphs.push_back(caseGraph(*fixtures.back(), prefill, blocks.back()));
+    graphs.push_back(caseGraph(*fixtures.back(), plans[i].attention, blocks.back()));
     if (located) {
       (void)backends[i]->submitCommandAsync(graphs.back().dispatches()).wait();
       const uint64_t paged = outputDigest(*fixtures.back());
       locate(*backends[i], *fixtures.back(), blocks.back());
-      graphs.back() = caseGraph(*fixtures.back(), prefill, blocks.back());
+      graphs.back() = caseGraph(*fixtures.back(), plans[i].attention, blocks.back());
       (void)backends[i]->submitCommandAsync(graphs.back().dispatches()).wait();
       if (outputDigest(*fixtures.back()) != paged)
         throw std::runtime_error("the located verify split changed attention output bits");
     }
     results[i].kvBytes = historyBytes(plan);
+    results[i].rows = plan.rows;
+    results[i].extentPages = plan.geometry.extentPages;
+    results[i].queryStride = plan.stride;
   }
   // Warm every variant, then alternate order to limit clock/thermal drift.
-  double warmup = 0.0;
-  while (warmup < warmupSeconds)
-    for (size_t i = 0; i < backends.size(); ++i)
-      warmup += backends[i]->submitCommandAsync(graphs[i].dispatches()).wait().gpuSeconds;
-  for (size_t i = 1; i < fixtures.size(); ++i)
-    if (!std::ranges::equal(outputBytes(*fixtures[0]), outputBytes(*fixtures[i])))
-      throw std::runtime_error("comparison metallib changed attention output bits");
-  for (size_t i = 0; i < fixtures.size(); ++i) {
-    results[i].outputDigest = outputDigest(*fixtures[i]);
-    results[i].listEntries = listEntries(blocks[i]);
-  }
+  const auto epoch = [] {
+    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+  };
+  const double start = epoch();
+  for (size_t i = 0; i < backends.size(); ++i)
+    while (results[i].warmupGpuSeconds < (prefill ? warmupSeconds : std::max(1.0, warmupSeconds)))
+      results[i].warmupGpuSeconds +=
+          backends[i]->submitCommandAsync(graphs[i].dispatches()).wait().gpuSeconds;
   std::vector<std::vector<double>> fused(backends.size());
   std::vector<std::map<std::string, std::vector<double>>> perPipeline(backends.size());
   for (uint32_t round = 0; round < repeat; ++round)
@@ -499,7 +546,30 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
         for (const auto &[name, seconds] : run)
           perPipeline[i][name].push_back(seconds * 1000.0);
     }
+  const double end = epoch();
+  for (size_t i = 1; i < fixtures.size(); ++i)
+    if (strictComparison && !std::ranges::equal(outputBytes(*fixtures[0]), outputBytes(*fixtures[i])))
+      throw std::runtime_error("comparison metallib changed attention output bits");
+  if (fixtures.size() > 1) {
+    const auto reference = logicalOutput(*fixtures[0]);
+    for (size_t i = 1; i < fixtures.size(); ++i) {
+      const auto candidate = logicalOutput(*fixtures[i]);
+      results[i].bitEqual = reference == candidate;
+      for (size_t j = 0; j < reference.size(); ++j) {
+        const double difference = std::abs(double(test::bf16ToFloat(reference[j])) - test::bf16ToFloat(candidate[j]));
+        results[i].maxAbsDiff = std::isfinite(difference)
+            ? std::max(results[i].maxAbsDiff, difference) : std::numeric_limits<double>::infinity();
+      }
+    }
+  }
+  for (size_t i = 0; i < fixtures.size(); ++i) {
+    results[i].outputDigest = outputDigest(*fixtures[i]);
+    results[i].listEntries = listEntries(blocks[i]);
+  }
   for (size_t i = 0; i < backends.size(); ++i) {
+    results[i].startEpoch = start;
+    results[i].endEpoch = end;
+    results[i].fusedSamples = fused[i];
     results[i].fusedMilliseconds = median(fused[i]);
     for (auto &[name, samples] : perPipeline[i])
       results[i].pipelineMilliseconds[name] = median(samples);
@@ -540,16 +610,31 @@ std::string hex(uint64_t value) {
 }
 
 std::string json(const Case &item, const std::string &shape, uint32_t history,
-                 const std::string &kind, uint32_t lanes, size_t variant,
+                 const std::string &kind, uint32_t lanes, size_t arm,
                  const std::string &qsa, bool located) {
-  std::string out = "{\"variant\":" + std::to_string(variant) + ",\"shape\":\"" + shape + "\",\"qsa\":\"" + qsa +
+  std::ostringstream difference;
+  if (std::isfinite(item.maxAbsDiff)) difference << std::setprecision(17) << item.maxAbsDiff;
+  else difference << "null";
+  std::string out = "{\"arm\":" + std::to_string(arm) +
+                    ",\"bit_equal\":" + (item.bitEqual ? "true" : "false") +
+                    ",\"max_abs_diff\":" + difference.str() +
+                    ",\"variant\":" + std::to_string(item.variant) + ",\"shape\":\"" + shape + "\",\"qsa\":\"" + qsa +
                     "\",\"located\":" + (located ? "true" : "false") +
                     ",\"history\":" + std::to_string(history) +
                     ",\"kind\":\"" + kind + "\",\"lanes\":" + std::to_string(lanes) +
+                    ",\"rows\":" + std::to_string(item.rows) +
+                    ",\"extent_pages\":" + std::to_string(item.extentPages) +
+                    ",\"query_stride\":" + std::to_string(item.queryStride) +
                     ",\"fused_ms\":" + std::to_string(item.fusedMilliseconds) +
                     ",\"kv_bytes\":" + std::to_string(item.kvBytes) +
                     ",\"list_entries\":" + std::to_string(item.listEntries) +
-                    ",\"output_digest\":\"" + hex(item.outputDigest) + "\",\"pipelines\":{";
+                    ",\"output_digest\":\"" + hex(item.outputDigest) + "\"";
+  out += ",\"warmup_gpu_seconds\":" + std::to_string(item.warmupGpuSeconds) +
+         ",\"start_epoch\":" + std::to_string(item.startEpoch) +
+         ",\"end_epoch\":" + std::to_string(item.endEpoch) + ",\"fused_samples_ms\":[";
+  for (size_t i = 0; i < item.fusedSamples.size(); ++i)
+    out += (i ? "," : "") + std::to_string(item.fusedSamples[i]);
+  out += "],\"pipelines\":{";
   bool first = true;
   for (const auto &[name, milliseconds] : item.pipelineMilliseconds) {
     out += (first ? "" : ",") + std::string("\"") + name + "\":" + std::to_string(milliseconds);
@@ -563,17 +648,19 @@ std::string json(const Case &item, const std::string &shape, uint32_t history,
 int main(int argc, const char *argv[]) {
   try {
     if (argc < 2) {
-      std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b,fn] "
+      std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b,fn,122b] "
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
                    "[--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer] "
-                   "[--located]\n";
+                   "[--located] [--rows LIST] [--variant 0|1|2]\n";
       return 64;
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
     std::vector<uint32_t> lanes{1, 4};
+    std::vector<uint32_t> rows{kPrefillRows};
     std::vector<std::string> shapes{"27b", "35b"};
     uint32_t repeat = 5;
+    std::optional<uint32_t> variant;
     // Zero: the largest extent the memory plan picks for the model's K/V
     // pages (Flash-Next's without its index regions, which no case reads).
     uint32_t extentPages = 0;
@@ -593,6 +680,10 @@ int main(int argc, const char *argv[]) {
         histories = parseList(value, 0, kv::kMaximumPhysicalTokens - kPrefillRows, option);
       else if (option == "--lanes")
         lanes = parseList(value, 1, kMaximumLanes, option);
+      else if (option == "--rows")
+        rows = parseList(value, 1, kPrefillRows, option);
+      else if (option == "--variant")
+        variant = parseCount(value, 0, 2, option);
       else if (option == "--repeat")
         repeat = parseCount(value, 1, std::numeric_limits<uint32_t>::max(), option);
       else if (option == "--extent-pages")
@@ -621,7 +712,7 @@ int main(int argc, const char *argv[]) {
           const std::string shape =
               value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
           if (shape != "27b" && shape != "35b" && shape != "fn" && shape != "122b")
-            throw std::invalid_argument("--shapes takes 27b, 35b or fn");
+            throw std::invalid_argument("--shapes takes 27b, 35b, fn or 122b");
           shapes.push_back(shape);
           if (comma == std::string::npos) break;
           start = comma + 1;
@@ -640,6 +731,8 @@ int main(int argc, const char *argv[]) {
                                     " does not hold whole alignment units of " + shape +
                                     " " + std::string(kv::formatName(format)));
     }
+    if (variant && !comparisonLibrary.empty())
+      throw std::invalid_argument("--variant cannot be combined with --compare-metallib");
     metal::MetalBackend backend(argv[1]);
     std::unique_ptr<metal::MetalBackend> comparison;
     std::vector<metal::MetalBackend *> backends{&backend};
@@ -647,12 +740,14 @@ int main(int argc, const char *argv[]) {
       comparison = std::make_unique<metal::MetalBackend>(comparisonLibrary);
       backends.push_back(comparison.get());
     }
+    if (variant) backends.push_back(&backend);
     std::cerr << "device " << backend.capabilities().deviceName << ", one attention layer, "
               << "Page32 " << kv::formatName(format) << " KV, median of " << repeat << " fused graphs (ms)\n";
     double warmupSeconds = 1.5;
     std::cout << "{\"device\":\"" << backend.capabilities().deviceName << "\",\"kv_format\":\"" << kv::formatName(format) << "\",\"cases\":[";
     bool firstCase = true;
-    for (const std::string &shape : shapes) {
+    auto report = [&](const std::string &shape, uint32_t history, bool prefill,
+                      uint32_t lane, uint32_t chunkRows) {
       const AttentionShape geometry = shapeOf(shape, format);
       const std::string name = modelName(shape);
       const uint32_t shapeExtentPages =
@@ -666,31 +761,37 @@ int main(int argc, const char *argv[]) {
                 << geometry.kvHeads << " KV heads, d=" << geometry.headDimension
                 << ", extents of " << shapeExtentPages << " pages"
                 << (shapeQsa.empty() ? "" : ", QSA " + shapeQsa) << ")\n";
-      for (uint32_t history : histories) {
-        auto report = [&](bool prefill, uint32_t lane) {
-          // Only a verify with lists reads its blocks through locations.
-          const bool caseLocated = located && !prefill && !shapeQsa.empty();
-          const auto cases =
-              measure(backends, casePlan(geometry, prefill, lane, history, shapeExtentPages),
-                      prefill, repeat, warmupSeconds, shapeQsa, caseLocated);
-          warmupSeconds = 0.1;
-          for (size_t i = 0; i < cases.size(); ++i) {
-            std::cout << (firstCase ? "" : ",")
-                      << json(cases[i], name, history, prefill ? "prefill" : "verify", lane, i,
-                              shapeQsa, caseLocated);
-            firstCase = false;
-            std::cerr << history << " " << (prefill ? "prefill" : "verify")
-                      << " lanes=" << lane << " variant=" << i << " fused="
-                      << cases[i].fusedMilliseconds << " ms digest="
-                      << hex(cases[i].outputDigest);
-            if (cases[i].listEntries) std::cerr << " list_entries=" << cases[i].listEntries;
-            if (caseLocated) std::cerr << " located";
-            std::cerr << "\n";
-          }
-        };
-        if (phases != "verify") report(true, 1);
-        if (phases != "prefill") for (uint32_t lane : lanes) report(false, lane);
+
+      // Only a verify with lists reads its blocks through locations.
+      const bool caseLocated = located && !prefill && !shapeQsa.empty();
+      std::vector<SweepPlan> plans;
+      for (size_t i = 0; i < backends.size(); ++i)
+        plans.push_back(casePlan(geometry, prefill, lane, history, shapeExtentPages,
+                                 chunkRows, i && variant ? *variant : 0));
+      const auto cases = measure(backends, plans, !comparisonLibrary.empty(),
+                                 prefill, repeat, warmupSeconds, shapeQsa, caseLocated);
+      warmupSeconds = 0.1;
+      for (size_t i = 0; i < cases.size(); ++i) {
+        std::cout << (firstCase ? "" : ",")
+                  << json(cases[i], name, history, prefill ? "prefill" : "verify", lane, i,
+                          shapeQsa, caseLocated);
+        firstCase = false;
+        std::cerr << history << " " << (prefill ? "prefill" : "verify")
+                  << " lanes=" << lane << " variant=" << cases[i].variant << " fused="
+                  << cases[i].fusedMilliseconds << " ms digest="
+                  << hex(cases[i].outputDigest);
+        if (cases[i].listEntries) std::cerr << " list_entries=" << cases[i].listEntries;
+        if (caseLocated) std::cerr << " located";
+        std::cerr << "\n";
       }
+    };
+    for (uint32_t history : histories) {
+      if (phases != "verify")
+        for (uint32_t chunkRows : rows)
+          for (const std::string &shape : shapes) report(shape, history, true, 1, chunkRows);
+      if (phases != "prefill")
+        for (uint32_t lane : lanes)
+          for (const std::string &shape : shapes) report(shape, history, false, lane, kVerifyRows);
     }
     std::cout << "]}\n";
     return 0;

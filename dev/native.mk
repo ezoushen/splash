@@ -586,7 +586,8 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(TEST_STATUS_TEST) dev/tests/engine/status_golden.json
 	$(TEST_Q8_CPU_TEST)
 
-test-engine-metal: $(TEST_METAL_TARGETS)
+test-engine-metal: $(TEST_METAL_TARGETS) $(TEST_ATTENTION_SWEEP)
+	/bin/sh dev/tests/attention_sweep_cli.sh $(TEST_ATTENTION_SWEEP) $(LIB)
 	$(METAL_TEST_ENV) $(BUILD_ID_PYTHON) dev/tests/engine/run_draft_preparation.py $(TEST_DRAFT_PREPARATION) $(LIB) \
 		$(WEIGHT_GOLDENS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PREPARATION) $(LIB) $(WEIGHT_GOLDENS) $(MLX_QUANTIZATION_FIXTURE)

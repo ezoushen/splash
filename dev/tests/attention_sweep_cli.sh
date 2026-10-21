@@ -28,12 +28,18 @@ for value in -1 1048576 4294967296 10x '' '0,'; do
     reject '--histories requires integers' --histories "$value"
 done
 for value in typo '' '27b,' '27b,typo' ',35b'; do
-    reject '--shapes takes 27b, 35b or fn' --shapes "$value"
+    reject '--shapes takes 27b, 35b, fn or 122b' --shapes "$value"
 done
 for value in 0 16384 -1 1x ''; do
     reject '--extent-pages requires integers' --extent-pages "$value"
 done
-for option in --histories --lanes --repeat --shapes --phases --compare-metallib --extent-pages --qsa; do
+for value in 0 2049 -1 4294967296 1x '' '1,' ',1' '1,,4'; do
+    reject '--rows requires integers' --rows "$value"
+done
+for value in -1 3 4294967296 1x ''; do
+    reject '--variant requires integers' --variant "$value"
+done
+for option in --histories --lanes --repeat --shapes --phases --compare-metallib --extent-pages --qsa --rows --variant; do
     reject "$option requires a value" "$option"
 done
 reject '--phases takes both, verify or prefill' --phases typo
@@ -47,4 +53,12 @@ reject 'does not hold whole alignment units' --shapes 27b --extent-pages 448
 reject 'unknown option --sentinel' \
     --lanes 1,2,3,4 --histories 0,2048,131072 --repeat 1 \
     --shapes 27b,35b,fn --qsa pages --located --extent-pages 512 --sentinel 1
+reject 'unknown option --sentinel' --rows 1,7,8,9,118,128,512,2047,2048 --sentinel 1
+reject '--variant cannot be combined with --compare-metallib' --variant 0 --compare-metallib ignored
+for value in 0 1 2; do
+    reject 'unknown option --sentinel' --variant "$value" --sentinel 1
+done
 echo 'attention-sweep CLI validation: PASS'
+if [ "$#" -ge 2 ]; then
+    python3 "$(dirname "$0")/attention_sweep_cases.py" "$binary" "$2" "${3:-all}"
+fi
