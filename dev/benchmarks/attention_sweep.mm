@@ -16,7 +16,7 @@
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
 //                        [--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer]
-//                        [--located] [--rows 128,512,2048] [--variant 0|1|2] [--warmup-ms N]
+//                        [--located] [--rows 128,512,2048] [--variant 0|1|2|3] [--warmup-ms N]
 //
 // fn is Qwen3.8-Flash-Next's GQA-12 attention, whose rows attend past 512
 // complete blocks of four tokens only to the 512 blocks their QSA bitmap
@@ -46,6 +46,7 @@
 // residency_kick (kernels/shared/residency.metal) in every library it loads:
 // build baselines from a tree that has that kernel.
 #include "../tests/engine/AttentionFixture.hpp"
+#include "../tests/engine/VirtualGroupAttention.hpp"
 #include "DispatchReplay.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
@@ -202,7 +203,7 @@ SweepPlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
   const AttentionWorkspace scratch = std::visit([](const auto &plan) { return plan.workspace; }, attention);
   auto fixture = AttentionFixturePlan::make(shape, caseLanes, prefill ? rows : kVerifyRows,
                                             histories, scratch, {kLayer + 1, kLayer, extentPages});
-  if (variant && prefill && fixture.stride < kPrefillRows) {
+  if ((variant == 1 || variant == 2) && prefill && fixture.stride < kPrefillRows) {
     const uint32_t previous = fixture.stride;
     fixture.stride += kv::kPageTokens;
     for (auto tensor : {AttentionFixture::Tensor::ChunkKeys, AttentionFixture::Tensor::ChunkValues,
@@ -393,7 +394,8 @@ double listEntries(const QsaBlocks &qsa) {
 // The store and attention graph the runtime encodes for a case, after its
 // block lists when it has QSA bitmaps, and the indexer that selects them
 // with --qsa indexer.
-metal::CommandGraph caseGraph(const AttentionFixture &fixture, const AttentionPlan &attention, const QsaBlocks &qsa) {
+metal::CommandGraph caseGraph(const AttentionFixture &fixture, const AttentionPlan &attention, const QsaBlocks &qsa,
+                                metal::MetalBackend &backend, bool virtualGroups) {
   const AttentionFixturePlan &plan = fixture.plan();
   metal::CommandGraph graph;
   if (const QsaIndexer *indexer = qsa.indexer ? &*qsa.indexer : nullptr) {
@@ -412,7 +414,20 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, const AttentionPl
       sequences.push_back({lane * plan.rows, plan.rows, plan.histories[lane], lane});
     PagedAttention::addBlockLists(graph, qsa.bitmaps, qsa.words, sequences, qsa.blocks);
   }
-  std::visit([&](const auto &plan) { fixture.addGraph(graph, plan, qsa.blocks); }, attention);
+  if (virtualGroups) {
+    const auto chunk = PagedAttention::prefillParams(plan.histories[0], plan.rows, plan.stride, plan.pages[0]);
+    const auto layer = fixture.pool().layer(plan.geometry.layer);
+    using Tensor = AttentionFixture::Tensor;
+    PagedAttention::addPrefillStore(graph, layer, fixture.buffer(Tensor::ChunkKeys),
+                                    fixture.buffer(Tensor::ChunkValues), fixture.buffer(Tensor::Table0),
+                                    chunk, plan.layout());
+    test::addVirtualGroupPrefill(backend, graph, layer, fixture.buffer(Tensor::Queries),
+                                 fixture.buffer(Tensor::Output), fixture.buffer(Tensor::Partials),
+                                 fixture.buffer(Tensor::Statistics), fixture.buffer(Tensor::Table0),
+                                 chunk, std::get<PrefillAttentionPlan>(attention));
+  } else {
+    std::visit([&](const auto &plan) { fixture.addGraph(graph, plan, qsa.blocks); }, attention);
+  }
   return graph;
 }
 
@@ -507,12 +522,12 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
     }
     results[i].variant = plans[i].variant;
     blocks.push_back(qsaBlocks(*backends[i], plan, prefill, bitmaps, words, qsa == "indexer", located));
-    graphs.push_back(caseGraph(*fixtures.back(), plans[i].attention, blocks.back()));
+    graphs.push_back(caseGraph(*fixtures.back(), plans[i].attention, blocks.back(), *backends[i], plans[i].variant == 3));
     if (located) {
       (void)backends[i]->submitCommandAsync(graphs.back().dispatches()).wait();
       const uint64_t paged = outputDigest(*fixtures.back());
       locate(*backends[i], *fixtures.back(), blocks.back());
-      graphs.back() = caseGraph(*fixtures.back(), plans[i].attention, blocks.back());
+      graphs.back() = caseGraph(*fixtures.back(), plans[i].attention, blocks.back(), *backends[i], plans[i].variant == 3);
       (void)backends[i]->submitCommandAsync(graphs.back().dispatches()).wait();
       if (outputDigest(*fixtures.back()) != paged)
         throw std::runtime_error("the located verify split changed attention output bits");
@@ -661,7 +676,7 @@ int main(int argc, const char *argv[]) {
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
                    "[--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer] "
-                   "[--located] [--rows LIST] [--variant 0|1|2] [--warmup-ms N]\n";
+                   "[--located] [--rows LIST] [--variant 0|1|2|3] [--warmup-ms N]\n";
       return 64;
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
@@ -692,7 +707,7 @@ int main(int argc, const char *argv[]) {
       else if (option == "--rows")
         rows = parseList(value, 1, kPrefillRows, option);
       else if (option == "--variant")
-        variant = parseCount(value, 0, 2, option);
+        variant = parseCount(value, 0, 3, option);
       else if (option == "--warmup-ms")
         minimumWarmupMs = parseCount(value, 1, std::numeric_limits<uint32_t>::max(), option);
       else if (option == "--repeat")
@@ -744,6 +759,8 @@ int main(int argc, const char *argv[]) {
     }
     if (variant && !comparisonLibrary.empty())
       throw std::invalid_argument("--variant cannot be combined with --compare-metallib");
+    if (variant == 3 && (shapes != std::vector<std::string>{"122b"} || phases != "prefill"))
+      throw std::invalid_argument("--variant 3 requires --shapes 122b --phases prefill");
     metal::MetalBackend backend(argv[1]);
     std::unique_ptr<metal::MetalBackend> comparison;
     std::vector<metal::MetalBackend *> backends{&backend};

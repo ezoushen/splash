@@ -39,7 +39,7 @@ done
 for value in 0 -1 4294967296 1x ''; do
     reject '--warmup-ms requires integers' --warmup-ms "$value"
 done
-for value in -1 3 4294967296 1x ''; do
+for value in -1 4 4294967296 1x ''; do
     reject '--variant requires integers' --variant "$value"
 done
 for option in --histories --lanes --repeat --shapes --phases --compare-metallib --extent-pages --qsa --rows --variant --warmup-ms; do
@@ -61,6 +61,9 @@ reject '--variant cannot be combined with --compare-metallib' --variant 0 --comp
 for value in 0 1 2; do
     reject 'unknown option --sentinel' --variant "$value" --sentinel 1
 done
+reject 'unknown option --sentinel' --variant 3 --sentinel 1
+reject '--variant 3 requires --shapes 122b --phases prefill' --variant 3 --shapes 35b --phases prefill
+reject '--variant 3 requires --shapes 122b --phases prefill' --variant 3 --shapes 122b --phases verify
 echo 'attention-sweep CLI validation: PASS'
 if [ "$#" -ge 2 ]; then
     python3 "$(dirname "$0")/attention_sweep_cases.py" "$binary" "$2" "${3:-all}"
