@@ -44,11 +44,13 @@ def s3():
     for options in [(), ("--compare-metallib", library)]:
         cases, _ = run("--lanes", "1,4", *options)
         assert len(cases) == (8 if options else 4)
+        assert all(c["warmup_graphs_per_submission"] > 1 for c in cases), "S3: verify warm-up batches the measured graph"
         assert all(c["warmup_gpu_seconds"] >= 1.0 for c in cases), \
             "S3: every verify arm needs at least one second of GPU warm-up"
         assert all(c["start_epoch"] < c["end_epoch"] for c in cases)
         assert all(len(c["fused_samples_ms"]) == 1 for c in cases)
     cases, _ = run("--phases", "prefill", "--rows", "128")
+    assert all(c["warmup_graphs_per_submission"] == 1 for c in cases), "S3: prefill warm-up stays unchanged"
     assert cases[0]["warmup_gpu_seconds"] >= 1.5
     assert 0.1 <= cases[1]["warmup_gpu_seconds"] < 1.0, "S3: retain the later prefill warm-up"
     cases, _ = run("--phases", "prefill", "--rows", "128", "--warmup-ms", "1500")

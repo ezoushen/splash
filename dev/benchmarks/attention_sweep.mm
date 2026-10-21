@@ -461,6 +461,7 @@ struct Case final {
   uint32_t rows = 0;
   uint32_t extentPages = 0;
   uint32_t queryStride = 0;
+  uint32_t warmupGraphsPerSubmission = 1;
   double warmupGpuSeconds = 0.0;
   double startEpoch = 0.0, endEpoch = 0.0;
   std::vector<double> fusedSamples;
@@ -526,10 +527,17 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
     return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
   };
   const double start = epoch();
-  for (size_t i = 0; i < backends.size(); ++i)
+  for (size_t i = 0; i < backends.size(); ++i) {
+    const auto dispatches = graphs[i].dispatches();
+    std::vector<metal::ComputeDispatch> warmup;
+    const uint32_t copies = prefill ? 1 : 128;
+    warmup.reserve(copies * dispatches.size());
+    for (uint32_t copy = 0; copy < copies; ++copy)
+      warmup.insert(warmup.end(), dispatches.begin(), dispatches.end());
+    results[i].warmupGraphsPerSubmission = warmup.size() / dispatches.size();
     while (results[i].warmupGpuSeconds < (prefill ? warmupSeconds : std::max(1.0, warmupSeconds)))
-      results[i].warmupGpuSeconds +=
-          backends[i]->submitCommandAsync(graphs[i].dispatches()).wait().gpuSeconds;
+      results[i].warmupGpuSeconds += backends[i]->submitCommandAsync(warmup).wait().gpuSeconds;
+  }
   std::vector<std::vector<double>> fused(backends.size());
   std::vector<std::map<std::string, std::vector<double>>> perPipeline(backends.size());
   for (uint32_t round = 0; round < repeat; ++round)
@@ -629,7 +637,8 @@ std::string json(const Case &item, const std::string &shape, uint32_t history,
                     ",\"kv_bytes\":" + std::to_string(item.kvBytes) +
                     ",\"list_entries\":" + std::to_string(item.listEntries) +
                     ",\"output_digest\":\"" + hex(item.outputDigest) + "\"";
-  out += ",\"warmup_gpu_seconds\":" + std::to_string(item.warmupGpuSeconds) +
+  out += ",\"warmup_graphs_per_submission\":" + std::to_string(item.warmupGraphsPerSubmission) +
+         ",\"warmup_gpu_seconds\":" + std::to_string(item.warmupGpuSeconds) +
          ",\"start_epoch\":" + std::to_string(item.startEpoch) +
          ",\"end_epoch\":" + std::to_string(item.endEpoch) + ",\"fused_samples_ms\":[";
   for (size_t i = 0; i < item.fusedSamples.size(); ++i)
