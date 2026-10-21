@@ -311,6 +311,14 @@ void checkGdnWidths() {
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
   rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
           "packed GDN rows without the gates reached arena sizing");
+  // The 122B's layout holds the same: its value heads span attentionWidth and
+  // its convolution width is its key and value widths.
+  const model::Qwen3_6MoeLayout ornith{model::kQwen3_5Moe122B};
+  model::requireQwenLayout(ornith);
+  auto ornithConvolutionMismatch = ornith;
+  ornithConvolutionMismatch.convolutionDimension += ornith.gdnHeadDimension;
+  rejects([&] { model::requireQwenLayout(ornithConvolutionMismatch); }, "Qwen target layout is inconsistent",
+          "an inconsistent 122B layout was accepted");
   // The dense layout is checked like the sparse one: its convolution width
   // against its GDN heads.
   const model::Qwen3_8Layout dense;

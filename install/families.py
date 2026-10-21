@@ -26,6 +26,7 @@ class ModelFamily:
 FAMILIES = (
     ModelFamily("Qwen3.8-27B", "incoai/Qwen3.8-27B-DFlash2"),
     ModelFamily("Qwen3.6-35B-A3B", "incoai/Qwen3.6-35B-A3B-DFlash2"),
+    ModelFamily("Qwen3.5-122B-A10B", "incoai/Ornith-1.5-122B-DFlash2"),
     ModelFamily("Qwen3.8-Flash-Next", "incoai/Qwen3.8-Flash-Next-DFlash2"),
 )
 

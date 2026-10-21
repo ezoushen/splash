@@ -60,10 +60,12 @@ constexpr uint32_t kLayers = 2;
 constexpr double kQueryScale = 0.0078125, kKeyScale = 0.08838834765;
 // Qwen3.6-35B-A3B's, Qwen3.8-27B's and Qwen3.8-Flash-Next's, whose 16512-column
 // packed rows have kernel variants of their own (_p16512) and whose output
-// gate is sigmoid(z), the others' silu(z).
+// gate is sigmoid(z), the others' silu(z); and Qwen3.5-122B-A10B's 64 value
+// heads (_vh64).
 constexpr std::array kShapes{GdnShape{16, 48, 128, 10240, 16640},
                              GdnShape{16, 32, 128, 8192, 12544},
-                             GdnShape{16, 48, 128, 10240, 16512, true}};
+                             GdnShape{16, 48, 128, 10240, 16512, true},
+                             GdnShape{16, 64, 128, 12288, 20736}};
 
 double roundBfloat(double value) {
   return bf16ToFloat(floatToBf16(static_cast<float>(value)));

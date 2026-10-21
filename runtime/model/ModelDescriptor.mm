@@ -8,6 +8,7 @@
 
 #import <Foundation/Foundation.h>
 
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -21,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 
@@ -213,18 +215,34 @@ static_assert([] {
   return fits;
 }(), "a family's window exceeds the runtime's KV ceiling");
 
+// A draft is trained for a block at least as long as the engine's, whose rows
+// it drafts; the default is the engine's own.
+static_assert(DFlashDraftLayout{}.trainedBlockSize == ExecutionLimits::draftQueryRows &&
+                  QwenMoeGeometry{}.draftBlockSize == ExecutionLimits::draftQueryRows &&
+                  kQwen3_6Moe35B.draftBlockSize >= ExecutionLimits::draftQueryRows &&
+                  kQwen3_5Moe122B.draftBlockSize >= ExecutionLimits::draftQueryRows,
+              "a draft trained for a shorter block than the engine's cannot draft its rows");
+
 // The name errors give an upstream target's source: its format, safetensors
 // for MLX, Model Optimizer and compressed-tensors checkpoints alike.
 std::string_view sourceName(TargetSource source) {
   return source == TargetSource::Safetensors ? "safetensors" : "GGUF";
 }
 
+// The sparse-MoE geometries Splash serves, the 35B's first: a config of none of
+// them is refused against it, as it always was.
+constexpr std::array<const QwenMoeGeometry *, 2> kMoeGeometries{&kQwen3_6Moe35B, &kQwen3_5Moe122B};
+
 // The refusal of a model of none of the families Splash serves: what tells it
 // from the family its config's model type names, or that it names none.
 std::invalid_argument unsupportedModel(const std::string &difference) {
   std::string supported;
-  forEachFamily([&](const auto &layout) {
-    supported += (supported.empty() ? "" : ", ") + std::string(layout.family);
+  const auto add = [&](std::string_view family) { supported += (supported.empty() ? "" : ", ") + std::string(family); };
+  forEachFamily([&]<class Layout>(const Layout &layout) {
+    if constexpr (std::is_same_v<Layout, Qwen3_6MoeLayout>)
+      for (const QwenMoeGeometry *geometry : kMoeGeometries) add(geometry->family);
+    else
+      add(layout.family);
   });
   return std::invalid_argument("no supported model has this architecture (" + difference + "); supported: " +
                                supported);
@@ -535,11 +553,13 @@ void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geome
 }
 
 // A DFlash2 checkpoint's config: the draft's layout. Its attention widths,
-// block, window, convolutions and selector must be those the draft kernels
-// are built for; its hidden size, vocabulary and mask token the target's;
+// window, convolutions and selector must be those the draft kernels are
+// built for; its hidden size, vocabulary and mask token the target's;
 // and the target layers it reads (target_layer_ids) some of the target's,
-// ascending. Its layers, intermediate size and rotary base are its own.
-DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
+// ascending. Its layers, intermediate size and rotary base are its own, and
+// its block the one its target's draft was trained for (trainedBlockSize).
+DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target,
+                                  uint32_t trainedBlockSize) {
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");
   if (architectures.count != 1 ||
@@ -567,7 +587,7 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   NSDictionary *flash =
       requireObject(draft, @"dflash_config", "draft config dflash_config");
   requireNumbers(flash, "checkpoint", "draft config dflash_config",
-                 {{"block_size", ExecutionLimits::draftQueryRows},
+                 {{"block_size", trainedBlockSize},
                   {"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
                   {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
@@ -590,12 +610,13 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
     if (targetLayers.back() >= target.layers)
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
   }
-  const DFlashDraftLayout layout =
+  DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
                   requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
                   requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
                   targetLayers);
+  layout.trainedBlockSize = trainedBlockSize;
   return layout;
 }
 
@@ -621,6 +642,19 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
     throw std::invalid_argument("vision deepstack layers are unsupported");
 }
 
+// The geometry whose hidden size and depth a text config states, chosen before
+// any check so that the checks all run against one family.
+const QwenMoeGeometry &moeGeometry(NSDictionary *text) {
+  const auto states = [&](NSString *key, uint32_t value) {
+    id number = text[key];
+    return [number isKindOfClass:[NSNumber class]] && [number doubleValue] == value;
+  };
+  for (const QwenMoeGeometry *geometry : kMoeGeometries)
+    if (states(@"hidden_size", geometry->hiddenSize) && states(@"num_hidden_layers", geometry->layers))
+      return *geometry;
+  return *kMoeGeometries.front();
+}
+
 // The descriptor, named name, of an upstream model of the family its text
 // config's model type names, from the source formats its record names, with
 // each config checked: the target's, as those formats require, its vision
@@ -637,6 +671,9 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
     if (layout.modelType == type) target = layout;
   });
   if (!target) throw unsupportedModel("text model type " + type);
+  // A sparse-MoE target's geometry, which its hidden size and depth choose.
+  const QwenMoeGeometry *geometry = nullptr;
+  if (std::holds_alternative<Qwen3_6MoeLayout>(*target)) target = Qwen3_6MoeLayout{*(geometry = &moeGeometry(text))};
   TargetSource targetSource;
   // "mlx-affine" names every safetensors target, as installations record it.
   if (targetFormat == "mlx-affine") targetSource = TargetSource::Safetensors;
@@ -647,6 +684,8 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   else if (visionFormat == "safetensors") visionSource = VisionSource::Safetensors;
   else if (visionFormat == "gguf") visionSource = VisionSource::Gguf;
   else throw std::invalid_argument("unsupported vision source format: " + std::string(visionFormat));
+  if (geometry && targetSource == TargetSource::Gguf && !geometry->ggufServed)
+    throw std::invalid_argument("GGUF " + std::string(geometry->family) + " is not served");
   // Without a draft config the descriptor names the family but has no draft
   // (inspectSourceConfiguration), and is not valid; a model root always
   // holds its draft's.
@@ -656,7 +695,9 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
       throw std::invalid_argument(std::string(layout.family) + " loads from a GGUF only");
     validateTextConfig(text, layout, layout.family, targetSource);
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
-    if (draft) dflashLayout = readDraftLayout(draft, layout);
+    if (draft)
+      dflashLayout =
+          readDraftLayout(draft, layout, geometry ? geometry->draftBlockSize : ExecutionLimits::draftQueryRows);
   }, *target);
   ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
                                                {.outputHiddenSize = std::visit(

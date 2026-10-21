@@ -47,7 +47,7 @@ using splash::test::require;
 
 // The production attention geometries: query heads over the KV heads of a
 // layout, whose values the group of twelve keeps token-major for its sparse
-// kernels.
+// kernels; the group of sixteen (Qwen3.5-122B-A10B) runs the dense ones.
 struct Geometry final {
   uint32_t queryHeads;
   uint32_t kvHeads;
@@ -58,12 +58,16 @@ struct Geometry final {
             .valuesTokenMajor = valuesTokenMajor};
   }
 };
-constexpr std::array<Geometry, 3> kGeometries{{{24, 4, false}, {16, 2, false}, {24, 2, true}}};
+constexpr std::array<Geometry, 4> kGeometries{{{24, 4, false}, {16, 2, false}, {24, 2, true}, {32, 2, false}}};
 
 // A layout's split or reduce pipeline of a phase ("prefill" or "verify").
 std::string pipelineName(std::string_view phase, bool split, uint32_t queryHeads, kv::Layout layout) {
   const bool sparse = layout.valuesTokenMajor;
-  const std::string suffix = layout.kvHeads == 4 ? "" : queryHeads == 24 ? "_kv2_g12" : "_kv2_g8";
+  // The split and reduce kernels are those of the GQA group: 6, 8, 12 or 16 query heads per KV head.
+  const std::string suffix = layout.kvHeads == 4   ? ""
+                             : queryHeads == 24 ? "_kv2_g12"
+                             : queryHeads == 32 ? "_kv2_g16"
+                                                : "_kv2_g8";
   const std::string format = layout.format == kv::Format::Int8 ? "q8_" : "bf16_";
   return std::string(phase) + "_attention_" +
          (split ? format + (sparse ? "sparse" : "split") : std::string(sparse ? "sparse_reduce" : "reduce")) +
