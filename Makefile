@@ -52,9 +52,11 @@ PRODUCTION_KERNEL_SOURCES := $(sort $(wildcard \
 # retain their baseline identities.
 PRODUCTION_KERNEL_SOURCES := $(filter-out \
 	runtime/metal/kernels/prefill/paged_attention_vgroups.metal \
-	runtime/metal/kernels/decode/paged_attention_vgroups.metal,$(PRODUCTION_KERNEL_SOURCES)) \
-	runtime/metal/kernels/prefill/paged_attention_vgroups.metal \
-	runtime/metal/kernels/decode/paged_attention_vgroups.metal
+	runtime/metal/kernels/decode/paged_attention_vgroups.metal \
+	runtime/metal/kernels/shared/attention_qkv_vgroups.metal,$(PRODUCTION_KERNEL_SOURCES)) \
+	$(wildcard runtime/metal/kernels/prefill/paged_attention_vgroups.metal) \
+	$(wildcard runtime/metal/kernels/decode/paged_attention_vgroups.metal) \
+	$(wildcard runtime/metal/kernels/shared/attention_qkv_vgroups.metal)
 PRODUCTION_KERNEL_NAMES := \
 	$(patsubst runtime/metal/kernels/%.metal,%,$(PRODUCTION_KERNEL_SOURCES))
 PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \

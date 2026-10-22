@@ -1,8 +1,8 @@
 #include "metal/kernels/common/paged_attention_tile.h"
 
-// The production QKV layout is [2 KV heads][row][16 query heads][D].
-// The candidate's M=64 tile reads [4 query groups][row][8 query heads][D].
-// Copy whole head vectors; current production QKV and gate kernels stay intact.
+// Prototype variant 3 converts legacy [2 KV heads][row][16 query heads][D]
+// staging to [4 query groups][row][8 query heads][D], and back. Production
+// preparation and gates address the four-group layout directly.
 kernel void prefill_attention_vgroups_pack(
     device const bfloat *input [[buffer(0)]], device bfloat *output [[buffer(1)]],
     constant SplashPrefillAttentionParams &params [[buffer(2)]],

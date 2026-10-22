@@ -1,4 +1,5 @@
 """Check benchmark behavior through its CLI, using the production metallib."""
+
 import json
 import subprocess
 import sys
@@ -8,8 +9,21 @@ selected = sys.argv[3] if len(sys.argv) > 3 else "all"
 
 
 def run(*options):
-    command = [binary, library, "--shapes", "122b,35b", "--histories", "8192",
-               "--phases", "verify", "--lanes", "1", "--repeat", "1", *options]
+    command = [
+        binary,
+        library,
+        "--shapes",
+        "122b,35b",
+        "--histories",
+        "8192",
+        "--phases",
+        "verify",
+        "--lanes",
+        "1",
+        "--repeat",
+        "1",
+        *options,
+    ]
     print("command:", command, flush=True)
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     print(result.stderr, end="")
@@ -21,13 +35,27 @@ def run(*options):
 def s1():
     cases, diagnostics = run("--extent-pages", "512")
     assert len(cases) == 2
-    assert all(c["extent_pages"] == 512 for c in cases), "S1: both fixtures must use the extent override"
-    assert diagnostics.count("extents of 512 pages") == 2, "S1: extent override must reach both shapes"
+    assert all(c["extent_pages"] == 512 for c in cases), (
+        "S1: both fixtures must use the extent override"
+    )
+    assert diagnostics.count("extents of 512 pages") == 2, (
+        "S1: extent override must reach both shapes"
+    )
 
 
 def s2():
-    cases, _ = run("--histories", "8192,16384", "--rows", "128,512,2048",
-                   "--phases", "both", "--lanes", "1,4", "--extent-pages", "512")
+    cases, _ = run(
+        "--histories",
+        "8192,16384",
+        "--rows",
+        "128,512,2048",
+        "--phases",
+        "both",
+        "--lanes",
+        "1,4",
+        "--extent-pages",
+        "512",
+    )
     expected = []
     for history in [8192, 16384]:
         for rows in [128, 512, 2048]:
@@ -36,35 +64,53 @@ def s2():
         for lanes in [1, 4]:
             for shape in ["ornith-1.5-122b", "qwen3.6-35b-a3b"]:
                 expected.append((history, "verify", 8, lanes, shape))
-    observed = [(c["history"], c["kind"], c["rows"], c["lanes"], c["shape"]) for c in cases]
-    assert observed == expected, "S2: alternate shapes within each history, row count and phase"
+    observed = [
+        (c["history"], c["kind"], c["rows"], c["lanes"], c["shape"]) for c in cases
+    ]
+    assert observed == expected, (
+        "S2: alternate shapes within each history, row count and phase"
+    )
 
 
 def s3():
     for options in [(), ("--compare-metallib", library)]:
         cases, _ = run("--lanes", "1,4", *options)
         assert len(cases) == (8 if options else 4)
-        assert all(c["warmup_graphs_per_submission"] > 1 for c in cases), "S3: verify warm-up batches the measured graph"
-        assert all(c["warmup_gpu_seconds"] >= 1.0 for c in cases), \
+        assert all(c["warmup_graphs_per_submission"] > 1 for c in cases), (
+            "S3: verify warm-up batches the measured graph"
+        )
+        assert all(c["warmup_gpu_seconds"] >= 1.0 for c in cases), (
             "S3: every verify arm needs at least one second of GPU warm-up"
+        )
         assert all(c["start_epoch"] < c["end_epoch"] for c in cases)
         assert all(len(c["fused_samples_ms"]) == 1 for c in cases)
     cases, _ = run("--phases", "prefill", "--rows", "128")
-    assert all(c["warmup_graphs_per_submission"] == 1 for c in cases), "S3: prefill warm-up stays unchanged"
+    assert all(c["warmup_graphs_per_submission"] == 1 for c in cases), (
+        "S3: prefill warm-up stays unchanged"
+    )
     assert cases[0]["warmup_gpu_seconds"] >= 1.5
-    assert 0.1 <= cases[1]["warmup_gpu_seconds"] < 1.0, "S3: retain the later prefill warm-up"
+    assert 0.1 <= cases[1]["warmup_gpu_seconds"] < 1.0, (
+        "S3: retain the later prefill warm-up"
+    )
     cases, _ = run("--phases", "prefill", "--rows", "128", "--warmup-ms", "1500")
-    assert all(c["warmup_gpu_seconds"] >= 1.5 for c in cases), "S3: configurable warm-up minimum for clock qualification"
+    assert all(c["warmup_gpu_seconds"] >= 1.5 for c in cases), (
+        "S3: configurable warm-up minimum for clock qualification"
+    )
 
 
 def s4():
     cases, _ = run("--phases", "prefill", "--rows", "128,512,2048")
-    expected = {(shape, rows) for shape in ["ornith-1.5-122b", "qwen3.6-35b-a3b"]
-                for rows in [128, 512, 2048]}
-    assert len(cases) == 6 and {(c["shape"], c["rows"]) for c in cases} == expected, \
+    expected = {
+        (shape, rows)
+        for shape in ["ornith-1.5-122b", "qwen3.6-35b-a3b"]
+        for rows in [128, 512, 2048]
+    }
+    assert len(cases) == 6 and {(c["shape"], c["rows"]) for c in cases} == expected, (
         "S4: each shape must actually run all selected prefill row counts"
-    assert all(c["kv_bytes"] == (8192 + c["rows"]) * 1040 for c in cases), \
+    )
+    assert all(c["kv_bytes"] == (8192 + c["rows"]) * 1040 for c in cases), (
         "S4: selected rows must reach the fixture's KV history"
+    )
 
 
 def s5():
@@ -76,28 +122,99 @@ def s5():
             assert baseline["arm"] == 0 and candidate["arm"] == 1
             assert baseline["bit_equal"] and baseline["max_abs_diff"] == 0
             if variant == 0:
-                assert candidate["bit_equal"] and candidate["max_abs_diff"] == 0, "S5: variant 0 against itself"
+                assert candidate["bit_equal"] and candidate["max_abs_diff"] == 0, (
+                    "S5: variant 0 against itself"
+                )
             elif variant == 1:
-                assert baseline["query_stride"] == 32 and candidate["query_stride"] == 64
-                assert candidate["bit_equal"] and candidate["max_abs_diff"] == 0, "S5: compare logical output across layouts"
+                assert (
+                    baseline["query_stride"] == 32 and candidate["query_stride"] == 64
+                )
+                assert candidate["bit_equal"] and candidate["max_abs_diff"] == 0, (
+                    "S5: compare logical output across layouts"
+                )
             else:
-                assert not candidate["bit_equal"] and candidate["max_abs_diff"] > 0, "S5: perturbed variant must report a difference"
+                assert not candidate["bit_equal"] and candidate["max_abs_diff"] > 0, (
+                    "S5: perturbed variant must report a difference"
+                )
 
 
 def s6():
     # Every verify lane uses four virtual query groups over two physical KV heads.
-    cases, _ = run("--shapes", "122b", "--phases", "verify", "--variant", "3",
-                   "--histories", "511,4097", "--lanes", "1,4")
+    cases, _ = run(
+        "--shapes",
+        "122b",
+        "--phases",
+        "verify",
+        "--variant",
+        "3",
+        "--histories",
+        "511,4097",
+        "--lanes",
+        "1,4",
+    )
     assert len(cases) == 8
     for baseline, candidate in zip(cases[::2], cases[1::2]):
         assert baseline["variant"] == 0 and candidate["variant"] == 3
-        assert "verify_attention_q8_split_kv2_vgroups" in candidate["pipelines"] and \
-            "verify_attention_reduce_kv2_vgroups" in candidate["pipelines"], \
-            "S6: use the virtual-group verify plan"
-        assert isinstance(candidate["bit_equal"], bool) and candidate["max_abs_diff"] >= 0
+        assert (
+            "verify_attention_q8_split_kv2_vgroups" in candidate["pipelines"]
+            and "verify_attention_reduce_kv2_vgroups" in candidate["pipelines"]
+        ), "S6: use the virtual-group verify plan"
+        assert (
+            isinstance(candidate["bit_equal"], bool) and candidate["max_abs_diff"] >= 0
+        )
 
 
-rules = {"s1": s1, "s2": s2, "s3": s3, "s4": s4, "s5": s5, "s6": s6}
+def s7():
+    # Production 122B is direct four-group; 35B retains its g8 entries.
+    for phase in ["prefill", "verify"]:
+        cases, _ = run("--phases", phase, "--rows", "7")
+        for case in cases:
+            suffix = "vgroups" if case["shape"] == "ornith-1.5-122b" else "g8"
+            assert f"{phase}_attention_q8_split_kv2_{suffix}" in case["pipelines"], (
+                "S7: production shape dispatch"
+            )
+            assert not any(
+                "_pack" in name or "_unpack" in name for name in case["pipelines"]
+            ), "S7: production needs no layout copies"
+
+
+def s8():
+    # Paired old host graph is explicit and compares logical outputs.
+    for kv_format in ["int8", "bf16"]:
+        cases, _ = run(
+            "--shapes",
+            "122b",
+            "--phases",
+            "both",
+            "--rows",
+            "7",
+            "--lanes",
+            "4",
+            "--histories",
+            "513",
+            "--variant",
+            "4",
+            "--kv-format",
+            kv_format,
+        )
+        assert len(cases) == 4
+        for production, legacy in zip(cases[::2], cases[1::2]):
+            phase = production["kind"]
+            prefix = "q8" if kv_format == "int8" else "bf16"
+            assert production["variant"] == 0 and legacy["variant"] == 4
+            assert (
+                f"{phase}_attention_{prefix}_split_kv2_vgroups"
+                in production["pipelines"]
+            )
+            assert f"{phase}_attention_{prefix}_split_kv2_g16" in legacy["pipelines"], (
+                "S8: paired baseline must run legacy g16"
+            )
+            assert legacy["bit_equal"] and legacy["max_abs_diff"] == 0, (
+                "S8: direct and legacy layouts have equal logical output"
+            )
+
+
+rules = {"s1": s1, "s2": s2, "s3": s3, "s4": s4, "s5": s5, "s6": s6, "s7": s7, "s8": s8}
 for name, check in rules.items():
     if selected in ("all", name):
         check()

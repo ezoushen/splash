@@ -16,7 +16,7 @@
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
 //                        [--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer]
-//                        [--located] [--rows 128,512,2048] [--variant 0|1|2|3] [--warmup-ms N]
+//                        [--located] [--rows 128,512,2048] [--variant 0|1|2|3|4] [--warmup-ms N]
 //
 // fn is Qwen3.8-Flash-Next's GQA-12 attention, whose rows attend past 512
 // complete blocks of four tokens only to the 512 blocks their QSA bitmap
@@ -189,6 +189,8 @@ struct SweepPlan final {
 
 // Variants 1/2 are diagnostic probes, not optimized kernels: a padded prefill
 // layout, and that layout with negated queries to exercise difference reporting.
+// Variant 3 retains prototype layout copies; variant 4 is the original g16 graph.
+// Variant 0 always uses the production plan, including the direct 122B layout.
 SweepPlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
                     uint32_t history, uint32_t extentPages, uint32_t rows, uint32_t variant) {
   const kv::Layout layout{.attentionLayers = 1, .kvHeads = shape.kvHeads, .headDimension = shape.headDimension,
@@ -203,6 +205,8 @@ SweepPlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
   const AttentionWorkspace scratch = std::visit([](const auto &plan) { return plan.workspace; }, attention);
   auto fixture = AttentionFixturePlan::make(shape, caseLanes, prefill ? rows : kVerifyRows,
                                             histories, scratch, {kLayer + 1, kLayer, extentPages});
+  // Prototype 3 and legacy 4 still use the original two-group staging.
+  if (variant == 3 || variant == 4) fixture.queryGroups = shape.kvHeads;
   if ((variant == 1 || variant == 2) && prefill && fixture.stride < kPrefillRows) {
     const uint32_t previous = fixture.stride;
     fixture.stride += kv::kPageTokens;
@@ -395,7 +399,7 @@ double listEntries(const QsaBlocks &qsa) {
 // block lists when it has QSA bitmaps, and the indexer that selects them
 // with --qsa indexer.
 metal::CommandGraph caseGraph(const AttentionFixture &fixture, const AttentionPlan &attention, const QsaBlocks &qsa,
-                                metal::MetalBackend &backend, bool virtualGroups) {
+                                metal::MetalBackend &backend, uint32_t variant) {
   const AttentionFixturePlan &plan = fixture.plan();
   metal::CommandGraph graph;
   if (const QsaIndexer *indexer = qsa.indexer ? &*qsa.indexer : nullptr) {
@@ -414,18 +418,33 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, const AttentionPl
       sequences.push_back({lane * plan.rows, plan.rows, plan.histories[lane], lane});
     PagedAttention::addBlockLists(graph, qsa.bitmaps, qsa.words, sequences, qsa.blocks);
   }
-  if (virtualGroups && std::holds_alternative<PrefillAttentionPlan>(attention)) {
+  if ((variant == 3 || variant == 4) && std::holds_alternative<PrefillAttentionPlan>(attention)) {
     const auto chunk = PagedAttention::prefillParams(plan.histories[0], plan.rows, plan.stride, plan.pages[0]);
     const auto layer = fixture.pool().layer(plan.geometry.layer);
     using Tensor = AttentionFixture::Tensor;
     PagedAttention::addPrefillStore(graph, layer, fixture.buffer(Tensor::ChunkKeys),
                                     fixture.buffer(Tensor::ChunkValues), fixture.buffer(Tensor::Table0),
                                     chunk, plan.layout());
-    test::addVirtualGroupPrefill(backend, graph, layer, fixture.buffer(Tensor::Queries),
-                                 fixture.buffer(Tensor::Output), fixture.buffer(Tensor::Partials),
-                                 fixture.buffer(Tensor::Statistics), fixture.buffer(Tensor::Table0),
-                                 chunk, std::get<PrefillAttentionPlan>(attention));
-  } else if (virtualGroups) {
+    const auto &kernelPlan = std::get<PrefillAttentionPlan>(attention);
+    if (variant == 3) {
+      test::addVirtualGroupPrefill(backend, graph, layer, fixture.buffer(Tensor::Queries),
+                                   fixture.buffer(Tensor::Output), fixture.buffer(Tensor::Partials),
+                                   fixture.buffer(Tensor::Statistics), fixture.buffer(Tensor::Table0),
+                                   chunk, kernelPlan);
+    } else {
+      // Paired baseline: the original production g16 graph, without copies.
+      const kv::PrefillAttentionParams params{chunk.committed_tokens, chunk.chunk_tokens,
+          chunk.chunk_stride, chunk.page_table_entries, layer, kernelPlan.splits, 0, 0};
+      graph.add(plan.shape.format == kv::Format::Int8 ? "prefill_attention_q8_split_kv2_g16"
+                                                     : "prefill_attention_bf16_split_kv2_g16",
+                {fixture.buffer(Tensor::Queries), fixture.buffer(Tensor::Partials),
+                 fixture.buffer(Tensor::Statistics), fixture.buffer(Tensor::Table0)}, params,
+                {2, kernelPlan.tiles, kernelPlan.splits});
+      graph.add("prefill_attention_reduce_kv2_g16",
+                {fixture.buffer(Tensor::Partials), fixture.buffer(Tensor::Statistics), fixture.buffer(Tensor::Output)},
+                params, {2, 128, kernelPlan.tiles});
+    }
+  } else if (variant == 3 || variant == 4) {
     std::array<kv::ChunkedPrefillParams, AttentionFixturePlan::kMaximumLanes> chunks{};
     std::array<metal::MetalBuffer, AttentionFixturePlan::kMaximumLanes> tables{};
     for (uint32_t lane = 0; lane < plan.lanes; ++lane)
@@ -433,11 +452,34 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, const AttentionPl
     for (uint32_t lane = 0; lane < tables.size(); ++lane)
       tables[lane] = fixture.buffer(AttentionFixturePlan::table(lane < plan.lanes ? lane : 0));
     using Tensor = AttentionFixture::Tensor;
-    test::addVirtualGroupVerify(backend, graph, fixture.pool().layer(plan.geometry.layer),
-        {fixture.buffer(Tensor::ChunkKeys), fixture.buffer(Tensor::ChunkValues),
-         fixture.buffer(Tensor::Queries), fixture.buffer(Tensor::Partials),
-         fixture.buffer(Tensor::Statistics), fixture.buffer(Tensor::Output), tables},
-        std::span(chunks).first(plan.lanes), std::get<VerifyAttentionPlan>(attention));
+    const auto layer = fixture.pool().layer(plan.geometry.layer);
+    const auto &kernelPlan = std::get<VerifyAttentionPlan>(attention);
+    if (variant == 3) {
+      test::addVirtualGroupVerify(backend, graph, layer,
+          {fixture.buffer(Tensor::ChunkKeys), fixture.buffer(Tensor::ChunkValues),
+           fixture.buffer(Tensor::Queries), fixture.buffer(Tensor::Partials),
+           fixture.buffer(Tensor::Statistics), fixture.buffer(Tensor::Output), tables},
+          std::span(chunks).first(plan.lanes), kernelPlan);
+    } else {
+      auto stores = chunks;
+      std::array<kv::VerifyAttentionParams, AttentionFixturePlan::kMaximumLanes> params{};
+      for (uint32_t lane = 0; lane < plan.lanes; ++lane) {
+        stores[lane].kv = layer;
+        params[lane] = {chunks[lane].committed_tokens, chunks[lane].page_table_entries,
+                         layer, kernelPlan.laneSplits[lane], kernelPlan.splits, 0, 0};
+      }
+      const bool bf16 = plan.shape.format == kv::Format::BFloat16;
+      graph.add(bf16 ? "verify_attention_bf16_store_kv2_g8" : "verify_attention_q8_store_kv2_g8",
+                {fixture.buffer(Tensor::ChunkKeys), fixture.buffer(Tensor::ChunkValues),
+                 tables[0], tables[1], tables[2], tables[3]}, stores,
+                {uint64_t{plan.lanes} * 2 * kv::kVerifyRows * plan.shape.kvHeads, 1, 1}, {256, 1, 1});
+      graph.add(bf16 ? "verify_attention_bf16_split_kv2_g16" : "verify_attention_q8_split_kv2_g16",
+                {fixture.buffer(Tensor::Queries), fixture.buffer(Tensor::Partials), fixture.buffer(Tensor::Statistics),
+                 tables[0], tables[1], tables[2], tables[3]}, params, {2, kernelPlan.splits, plan.lanes});
+      graph.add("verify_attention_reduce_kv2_g16",
+                {fixture.buffer(Tensor::Partials), fixture.buffer(Tensor::Statistics), fixture.buffer(Tensor::Output)},
+                params, {2, 128, plan.lanes});
+    }
   } else {
     std::visit([&](const auto &plan) { fixture.addGraph(graph, plan, qsa.blocks); }, attention);
   }
@@ -535,12 +577,12 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
     }
     results[i].variant = plans[i].variant;
     blocks.push_back(qsaBlocks(*backends[i], plan, prefill, bitmaps, words, qsa == "indexer", located));
-    graphs.push_back(caseGraph(*fixtures.back(), plans[i].attention, blocks.back(), *backends[i], plans[i].variant == 3));
+    graphs.push_back(caseGraph(*fixtures.back(), plans[i].attention, blocks.back(), *backends[i], plans[i].variant));
     if (located) {
       (void)backends[i]->submitCommandAsync(graphs.back().dispatches()).wait();
       const uint64_t paged = outputDigest(*fixtures.back());
       locate(*backends[i], *fixtures.back(), blocks.back());
-      graphs.back() = caseGraph(*fixtures.back(), plans[i].attention, blocks.back(), *backends[i], plans[i].variant == 3);
+      graphs.back() = caseGraph(*fixtures.back(), plans[i].attention, blocks.back(), *backends[i], plans[i].variant);
       (void)backends[i]->submitCommandAsync(graphs.back().dispatches()).wait();
       if (outputDigest(*fixtures.back()) != paged)
         throw std::runtime_error("the located verify split changed attention output bits");
@@ -689,7 +731,7 @@ int main(int argc, const char *argv[]) {
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
                    "[--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer] "
-                   "[--located] [--rows LIST] [--variant 0|1|2|3] [--warmup-ms N]\n";
+                   "[--located] [--rows LIST] [--variant 0|1|2|3|4] [--warmup-ms N]\n";
       return 64;
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
@@ -720,7 +762,7 @@ int main(int argc, const char *argv[]) {
       else if (option == "--rows")
         rows = parseList(value, 1, kPrefillRows, option);
       else if (option == "--variant")
-        variant = parseCount(value, 0, 3, option);
+        variant = parseCount(value, 0, 4, option);
       else if (option == "--warmup-ms")
         minimumWarmupMs = parseCount(value, 1, std::numeric_limits<uint32_t>::max(), option);
       else if (option == "--repeat")
@@ -772,8 +814,8 @@ int main(int argc, const char *argv[]) {
     }
     if (variant && !comparisonLibrary.empty())
       throw std::invalid_argument("--variant cannot be combined with --compare-metallib");
-    if (variant == 3 && shapes != std::vector<std::string>{"122b"})
-      throw std::invalid_argument("--variant 3 requires --shapes 122b");
+    if ((variant == 3 || variant == 4) && shapes != std::vector<std::string>{"122b"})
+      throw std::invalid_argument("--variant " + std::to_string(*variant) + " requires --shapes 122b");
     metal::MetalBackend backend(argv[1]);
     std::unique_ptr<metal::MetalBackend> comparison;
     std::vector<metal::MetalBackend *> backends{&backend};

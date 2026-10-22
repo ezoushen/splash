@@ -282,7 +282,9 @@ public:
                               metal::MetalBuffer pageTable,
                               const kv::ChunkedPrefillParams &params,
                               kv::Layout layout);
-  // Queries and output are [KV head][row][query head in group][dimension] and
+  // Queries and output are [query group][row][head in group][dimension].
+  // Dense 32/2 attention has four groups of eight; other shapes group by KV
+  // head. Projection writes this layout and the gate consumes it. Buffers
   // must not alias. Encode the store before attention; both stay in one
   // compute encoder. The plan owns both dispatch grids and their exact scratch.
   // prefillWorkspace() bounds every legal history for the command's largest
