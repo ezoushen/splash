@@ -84,7 +84,20 @@ def s5():
                 assert not candidate["bit_equal"] and candidate["max_abs_diff"] > 0, "S5: perturbed variant must report a difference"
 
 
-rules = {"s1": s1, "s2": s2, "s3": s3, "s4": s4, "s5": s5}
+def s6():
+    # Every verify lane uses four virtual query groups over two physical KV heads.
+    cases, _ = run("--shapes", "122b", "--phases", "verify", "--variant", "3",
+                   "--histories", "511,4097", "--lanes", "1,4")
+    assert len(cases) == 8
+    for baseline, candidate in zip(cases[::2], cases[1::2]):
+        assert baseline["variant"] == 0 and candidate["variant"] == 3
+        assert "verify_attention_q8_split_kv2_vgroups" in candidate["pipelines"] and \
+            "verify_attention_reduce_kv2_vgroups" in candidate["pipelines"], \
+            "S6: use the virtual-group verify plan"
+        assert isinstance(candidate["bit_equal"], bool) and candidate["max_abs_diff"] >= 0
+
+
+rules = {"s1": s1, "s2": s2, "s3": s3, "s4": s4, "s5": s5, "s6": s6}
 for name, check in rules.items():
     if selected in ("all", name):
         check()

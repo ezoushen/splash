@@ -288,14 +288,16 @@ metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {
 // the same bits.
 Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
                kv::Layout layout, uint32_t lanes, uint32_t rows,
-               uint32_t history, bool verify, bool oneExtent = false) {
+               uint32_t history, bool verify, bool oneExtent = false,
+               bool reverseHistories = false) {
   std::array<uint32_t, 4> historyLengths{};
   std::array<uint32_t, 4> pageCounts{};
   uint32_t allPages = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     // Verify lanes differ by more than a split's worth of pages, so long
     // histories give each lane its own split count under one slot stride.
-    historyLengths[lane] = history + (verify ? lane * 649 : 0);
+    const uint32_t historyLane = reverseHistories ? lanes - lane - 1 : lane;
+    historyLengths[lane] = history + (verify ? historyLane * 649 : 0);
     pageCounts[lane] = (historyLengths[lane] + rows + 31) / 32;
     allPages += pageCounts[lane];
   }
@@ -666,20 +668,26 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
       checkDispatch(graph.dispatches()[attention + 1], plan.reduceGroups, plan.reducePipeline);
     }
   } else {
-    ops::PagedAttention::addVerify(graph, data.layer,
-                                   {data.keys, data.values, data.queries, partials, statistics, output, data.tables},
-                                   std::span(data.stores).first(plan.lanes), plan, blocks);
-    require(graph.dispatches().size() == first + 3, "production verify should encode store/split/reduce");
-    const auto &split = graph.dispatches()[first + 1];
-    const auto &reduce = graph.dispatches()[first + 2];
-    const std::string splitPipeline =
-        blocks.locations ? locatedSplitName(data.layout) : std::string(plan.splitPipeline);
-    require(split.pipelineName == splitPipeline && reduce.pipelineName == plan.reducePipeline &&
-                split.threadgroups.x == plan.splitGroups.x && split.threadgroups.y == plan.splitGroups.y &&
-                split.threadgroups.z == plan.splitGroups.z &&
-                reduce.threadgroups.y == plan.reduceGroups.y &&
-                reduce.threadgroups.z == plan.reduceGroups.z,
-            "production verify encoding departed from its plan");
+    if (virtualGroups) {
+      test::addVirtualGroupVerify(backend, graph, data.layer,
+          {data.keys, data.values, data.queries, partials, statistics, output, data.tables},
+          std::span(data.stores).first(plan.lanes), plan);
+    } else {
+      ops::PagedAttention::addVerify(graph, data.layer,
+                                     {data.keys, data.values, data.queries, partials, statistics, output, data.tables},
+                                     std::span(data.stores).first(plan.lanes), plan, blocks);
+      require(graph.dispatches().size() == first + 3, "production verify should encode store/split/reduce");
+      const auto &split = graph.dispatches()[first + 1];
+      const auto &reduce = graph.dispatches()[first + 2];
+      const std::string splitPipeline =
+          blocks.locations ? locatedSplitName(data.layout) : std::string(plan.splitPipeline);
+      require(split.pipelineName == splitPipeline && reduce.pipelineName == plan.reducePipeline &&
+                  split.threadgroups.x == plan.splitGroups.x && split.threadgroups.y == plan.splitGroups.y &&
+                  split.threadgroups.z == plan.splitGroups.z &&
+                  reduce.threadgroups.y == plan.reduceGroups.y &&
+                  reduce.threadgroups.z == plan.reduceGroups.z,
+              "production verify encoding departed from its plan");
+    }
   }
   const auto expected = data.layout.format == kv::Format::BFloat16
                             ? expectedBf16Store(data)
@@ -883,15 +891,38 @@ void checkVerifyLocations(metal::MetalBackend &backend, uint32_t heads, kv::Layo
 }
 
 void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout,
-                  uint32_t history, uint32_t lanes) {
-  auto data = makeCase(backend, heads, layout, lanes, 8, history, true);
-  const auto output = run<Phase::Verify>(backend, data, true);
-  checkReference(data, output);
-  auto oneExtent = makeCase(backend, heads, layout, lanes, 8, history, true, true);
-  require(run<Phase::Verify>(backend, oneExtent, false) == output,
+                  uint32_t history, uint32_t lanes, bool virtualGroups = false,
+                  bool reverseHistories = false) {
+  auto data = makeCase(backend, heads, layout, lanes, 8, history, true, false, reverseHistories);
+  const auto output = run<Phase::Verify>(backend, data, true, {}, {}, virtualGroups);
+  checkReference(data, output, virtualGroups);
+  if (virtualGroups) checkEquivalent(data, output, run<Phase::Verify>(backend, data, false));
+  auto oneExtent = makeCase(backend, heads, layout, lanes, 8, history, true, true, reverseHistories);
+  require(run<Phase::Verify>(backend, oneExtent, false, {}, {}, virtualGroups) == output,
           "verify attention over extents differs from one extent of the same pages");
   std::cout << "paged verify: format=" << kv::formatName(layout.format) << " q=" << heads << " history=" << history
             << " lanes=" << lanes << " PASS\n";
+}
+
+// Both KV formats, heterogeneous lane histories, and the 32-split boundary.
+void checkVirtualGroupVerify(metal::MetalBackend &backend) {
+  uint32_t failures = 0;
+  for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
+    for (uint32_t history : {511U, 513U, 4093U, 4097U, 16385U})
+      for (uint32_t lanes : {1U, 4U})
+        for (bool reverse : {false, true}) {
+          // Descending split counts expose overlap from per-lane slot strides.
+          if (reverse && (history != 16385 || lanes != 4)) continue;
+          try {
+            checkVerify(backend, 32, Geometry{32, 2, false}.layout(format), history, lanes, true, reverse);
+          } catch (const std::exception &error) {
+            ++failures;
+            std::cerr << "virtual-group verify: format=" << kv::formatName(format) << " history=" << history
+                      << " lanes=" << lanes << " reverse=" << reverse << " FAIL: " << error.what() << '\n';
+          }
+        }
+  require(failures == 0, "virtual-group verify characterization failed");
+  std::cout << "virtual-group verify: 22 cases PASS\n";
 }
 
 // The q/k RMS norms, RoPE and V copy of the attention prepare, prefill and
@@ -1539,7 +1570,7 @@ void ropeTargetScaling(metal::MetalBackend &backend) {
 
 int main(int argc, char **argv) {
   try {
-    require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long|--122b-tails|--122b-vgroups]]");
+    require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long|--122b-tails|--122b-vgroups|--122b-vgroups-verify]]");
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
       for (const Geometry geometry : kGeometries)
         checkPlans(geometry.queryHeads, geometry.layout(format));
@@ -1548,6 +1579,10 @@ int main(int argc, char **argv) {
       return 0;
     }
     metal::MetalBackend backend(argv[1]);
+    if (argc == 3 && std::string_view(argv[2]) == "--122b-vgroups-verify") {
+      checkVirtualGroupVerify(backend);
+      return 0;
+    }
     if (argc == 3 && std::string_view(argv[2]) == "--122b-vgroups") {
       check122bTails(backend, true);
       return 0;
@@ -1586,9 +1621,10 @@ int main(int argc, char **argv) {
       std::cout << "long paged attention plans: PASS\n";
       return 0;
     }
-    require(argc == 2, "usage: paged-attention-plan [METALLIB [--long|--122b-tails|--122b-vgroups]]");
+    require(argc == 2, "usage: paged-attention-plan [METALLIB [--long|--122b-tails|--122b-vgroups|--122b-vgroups-verify]]");
     check122bTails(backend);
     check122bTails(backend, true);
+    checkVirtualGroupVerify(backend);
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
     for (const Geometry geometry : kGeometries) {
       const uint32_t heads = geometry.queryHeads;

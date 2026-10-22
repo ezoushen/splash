@@ -414,7 +414,7 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, const AttentionPl
       sequences.push_back({lane * plan.rows, plan.rows, plan.histories[lane], lane});
     PagedAttention::addBlockLists(graph, qsa.bitmaps, qsa.words, sequences, qsa.blocks);
   }
-  if (virtualGroups) {
+  if (virtualGroups && std::holds_alternative<PrefillAttentionPlan>(attention)) {
     const auto chunk = PagedAttention::prefillParams(plan.histories[0], plan.rows, plan.stride, plan.pages[0]);
     const auto layer = fixture.pool().layer(plan.geometry.layer);
     using Tensor = AttentionFixture::Tensor;
@@ -425,6 +425,19 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, const AttentionPl
                                  fixture.buffer(Tensor::Output), fixture.buffer(Tensor::Partials),
                                  fixture.buffer(Tensor::Statistics), fixture.buffer(Tensor::Table0),
                                  chunk, std::get<PrefillAttentionPlan>(attention));
+  } else if (virtualGroups) {
+    std::array<kv::ChunkedPrefillParams, AttentionFixturePlan::kMaximumLanes> chunks{};
+    std::array<metal::MetalBuffer, AttentionFixturePlan::kMaximumLanes> tables{};
+    for (uint32_t lane = 0; lane < plan.lanes; ++lane)
+      chunks[lane] = PagedAttention::verifyParams(plan.histories[lane], plan.pages[lane]);
+    for (uint32_t lane = 0; lane < tables.size(); ++lane)
+      tables[lane] = fixture.buffer(AttentionFixturePlan::table(lane < plan.lanes ? lane : 0));
+    using Tensor = AttentionFixture::Tensor;
+    test::addVirtualGroupVerify(backend, graph, fixture.pool().layer(plan.geometry.layer),
+        {fixture.buffer(Tensor::ChunkKeys), fixture.buffer(Tensor::ChunkValues),
+         fixture.buffer(Tensor::Queries), fixture.buffer(Tensor::Partials),
+         fixture.buffer(Tensor::Statistics), fixture.buffer(Tensor::Output), tables},
+        std::span(chunks).first(plan.lanes), std::get<VerifyAttentionPlan>(attention));
   } else {
     std::visit([&](const auto &plan) { fixture.addGraph(graph, plan, qsa.blocks); }, attention);
   }
@@ -759,8 +772,8 @@ int main(int argc, const char *argv[]) {
     }
     if (variant && !comparisonLibrary.empty())
       throw std::invalid_argument("--variant cannot be combined with --compare-metallib");
-    if (variant == 3 && (shapes != std::vector<std::string>{"122b"} || phases != "prefill"))
-      throw std::invalid_argument("--variant 3 requires --shapes 122b --phases prefill");
+    if (variant == 3 && shapes != std::vector<std::string>{"122b"})
+      throw std::invalid_argument("--variant 3 requires --shapes 122b");
     metal::MetalBackend backend(argv[1]);
     std::unique_ptr<metal::MetalBackend> comparison;
     std::vector<metal::MetalBackend *> backends{&backend};

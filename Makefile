@@ -48,11 +48,13 @@ PRODUCTION_KERNEL_SOURCES := $(sort $(wildcard \
 	runtime/metal/kernels/prefill/*.metal \
 	runtime/metal/kernels/decode/*.metal \
 	runtime/metal/kernels/shared/*.metal))
-# Link the candidate after existing modules so their anonymous AIR type names
+# Link the candidates after existing modules so their anonymous AIR type names
 # retain their baseline identities.
 PRODUCTION_KERNEL_SOURCES := $(filter-out \
-	runtime/metal/kernels/prefill/paged_attention_vgroups.metal,$(PRODUCTION_KERNEL_SOURCES)) \
-	runtime/metal/kernels/prefill/paged_attention_vgroups.metal
+	runtime/metal/kernels/prefill/paged_attention_vgroups.metal \
+	runtime/metal/kernels/decode/paged_attention_vgroups.metal,$(PRODUCTION_KERNEL_SOURCES)) \
+	runtime/metal/kernels/prefill/paged_attention_vgroups.metal \
+	runtime/metal/kernels/decode/paged_attention_vgroups.metal
 PRODUCTION_KERNEL_NAMES := \
 	$(patsubst runtime/metal/kernels/%.metal,%,$(PRODUCTION_KERNEL_SOURCES))
 PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
