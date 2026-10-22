@@ -164,7 +164,9 @@ TEST_Q8_KERNEL_SOURCES := \
 	runtime/metal/kernels/decode/paged_attention.metal \
 	runtime/metal/kernels/prefill/paged_attention_store.metal \
 	runtime/metal/kernels/decode/paged_attention_store.metal \
-	runtime/metal/kernels/shared/sparse_attention.metal
+	runtime/metal/kernels/shared/sparse_attention.metal \
+	runtime/metal/kernels/prefill/paged_attention_vgroups.metal \
+	runtime/metal/kernels/decode/paged_attention_vgroups.metal
 TEST_Q8_KERNEL_AIRS := $(patsubst runtime/metal/kernels/%.metal,$(ENGINE_TEST_BUILD)/kernels/%.air,$(TEST_Q8_KERNEL_SOURCES))
 # Every library a MetalBackend loads has the kernel that ends its residency;
 # the test libraries built without the production kernels link it in.
