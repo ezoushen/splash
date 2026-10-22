@@ -365,12 +365,16 @@ class CompileConfigurationTests(unittest.TestCase):
             self.build_files(root)
             kernel_root = Path("runtime/metal/kernels")
             # The Q8 tests' kernels: both phases' attention and store, and the
-            # sparse ones.
+            # sparse and virtual-group ones.
             q8_sources = [
                 kernel_root / phase / name
                 for phase in ("prefill", "decode")
                 for name in ("paged_attention.metal", "paged_attention_store.metal")
-            ] + [kernel_root / "shared/sparse_attention.metal"]
+            ] + [
+                kernel_root / "shared/sparse_attention.metal",
+                kernel_root / "shared/wide_attention.metal",
+                kernel_root / "shared/wide_attention_decode.metal",
+            ]
             # Every test library a MetalBackend loads links the kernel that
             # ends residency; q8-attention.metallib is loaded by raw MTLDevice
             # tests.
