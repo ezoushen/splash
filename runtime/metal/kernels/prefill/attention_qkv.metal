@@ -27,12 +27,10 @@
   }
 PREFILL_ATTENTION_QKV(prefill_attention_qkv, 24, 4, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g8, 16, 2, bfloat)
-PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g16, 32, 2, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_f32, 24, 4, float)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g8_f32, 16, 2, float)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g12, 24, 2, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g12_f32, 24, 2, float)
-PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g16_f32, 32, 2, float)
 #undef PREFILL_ATTENTION_QKV
 
 template <uint QHeads, uint KHeads>
@@ -59,5 +57,4 @@ inline void full_attention_gate_prefill_phase(
 PREFILL_ATTENTION_GATE(prefill_attention_gate, 24, 4)
 PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g8, 16, 2)
 PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g12, 24, 2)
-PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g16, 32, 2)
 #undef PREFILL_ATTENTION_GATE

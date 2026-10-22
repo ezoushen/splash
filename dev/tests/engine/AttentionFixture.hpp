@@ -66,6 +66,7 @@ struct AttentionFixturePlan final {
   uint32_t rows = 0;
   // A lane's rows of chunk keys and values, queries and output: whole pages.
   uint32_t stride = 0;
+  uint32_t queryGroups = 0;
   Histories histories{};
   // The pages of each lane's history and rows.
   Histories pages{};
@@ -113,6 +114,9 @@ struct AttentionFixturePlan final {
                                                  AttentionFixtureGeometry geometry) {
     AttentionFixturePlan plan;
     plan.shape = shape;
+    plan.queryGroups = shape.queryHeads == 32 && shape.kvHeads == 2 &&
+                               shape.headDimension == 256 && !shape.valuesTokenMajor
+                           ? 4 : shape.kvHeads;
     plan.geometry = geometry;
     plan.lanes = lanes;
     plan.rows = rows;
@@ -162,11 +166,11 @@ struct AttentionFixturePlan final {
   // Attention plans are per layer.
   [[nodiscard]] kv::Layout layout() const noexcept { return layoutOf(1); }
   [[nodiscard]] kv::Layout poolLayout() const noexcept { return layoutOf(geometry.poolLayers); }
-  // Queries and output are [lane][KV head][row][query head in group][dimension].
+  // Queries and output are [lane][query group][row][head in group][dimension].
   [[nodiscard]] uint64_t queryIndex(uint32_t lane, uint32_t head, uint32_t row,
                                     uint32_t dimension) const noexcept {
-    const uint32_t group = shape.queryHeads / shape.kvHeads;
-    return (((uint64_t{lane} * shape.kvHeads + head / group) * stride + row) * group +
+    const uint32_t group = shape.queryHeads / queryGroups;
+    return (((uint64_t{lane} * queryGroups + head / group) * stride + row) * group +
             head % group) * kHeadDimension + dimension;
   }
 

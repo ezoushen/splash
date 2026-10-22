@@ -29,30 +29,38 @@ constexpr uint32_t kQueryStride = kStride;
 constexpr uint32_t kRows = kVerifyRows;
 static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
 
-// The production GQA geometries (27B, 35B, 122B, Flash-Next). The group size
-// selects the kernel specialization; the suffix names its pipelines. The group
+// The production GQA geometries, including virtual groups for the 122B.
+// Physical KV heads and query groups differ for virtual groups. The group
 // of twelve runs the sparse kernels, which attend through block lists, bound
 // before their parameters, and read token-major values.
 struct Shape {
   uint32_t kvHeads;
   uint32_t queryHeadsPerKvHead;
   const char *suffix;
+  uint32_t virtualGroups = 0;
+  Format format = Format::Int8;
+  uint32_t queryGroups() const { return virtualGroups ? virtualGroups : kvHeads; }
+  uint32_t groupSize() const { return queryHeads() / queryGroups(); }
   uint32_t queryHeads() const { return kvHeads * queryHeadsPerKvHead; }
-  uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
+  uint32_t fusedRows() const { return kRows * groupSize(); }
   bool sparse() const { return queryHeadsPerKvHead == 12; }
   Layout layout() const {
     return {.attentionLayers = 1, .kvHeads = kvHeads, .headDimension = kHeadDimension,
-            .valuesTokenMajor = sparse()};
+            .format = format, .valuesTokenMajor = sparse()};
   }
   // A phase's ("verify" or "prefill") split and reduce entries.
   std::string split(const char *phase) const {
-    return std::string(phase) + (sparse() ? "_attention_q8_sparse" : "_attention_q8_split") + suffix;
+    return std::string(phase) + (sparse() ? "_attention_q8_sparse" :
+        format == Format::Int8 ? "_attention_q8_split" : "_attention_bf16_split") + suffix;
   }
   std::string reduce(const char *phase) const {
     return std::string(phase) + (sparse() ? "_attention_sparse_reduce" : "_attention_reduce") + suffix;
   }
 };
-constexpr std::array<Shape, 4> kShapes{{{4, 6, ""}, {2, 8, "_kv2_g8"}, {2, 12, "_kv2_g12"}, {2, 16, "_kv2_g16"}}};
+constexpr std::array<Shape, 5> kShapes{{
+    {2, 16, "_kv2_vgroups", 4, Format::Int8},
+    {2, 16, "_kv2_vgroups", 4, Format::BFloat16},
+    {4, 6, ""}, {2, 8, "_kv2_g8"}, {2, 12, "_kv2_g12"}}};
 
 using splash::test::require;
 
@@ -175,9 +183,9 @@ struct Case {
   }
 
   uint64_t queryIndex(uint32_t head, uint32_t row, uint32_t dimension) const {
-    const uint32_t kvHead = head / shape.queryHeadsPerKvHead;
-    const uint32_t localHead = head % shape.queryHeadsPerKvHead;
-    return ((uint64_t{kvHead} * kQueryStride + row) * shape.queryHeadsPerKvHead +
+    const uint32_t group = head / shape.groupSize();
+    const uint32_t localHead = head % shape.groupSize();
+    return ((uint64_t{group} * kQueryStride + row) * shape.groupSize() +
             localHead) *
                kHeadDimension +
            dimension;
@@ -228,8 +236,8 @@ Case oneExtentCopy(id<MTLDevice> device, const Case &data) {
   const uint64_t scaleBytes = layout.scaleBytesPerLayerPage();
   for (uint32_t page = 0; page < data.pageTable.size(); ++page)
     for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor)
-      std::memcpy(result.slab<std::byte>(tensor, page), data.slab<std::byte>(tensor, page),
-                  tensor % 2 ? scaleBytes : dataBytes);
+      if (const uint64_t bytes = tensor % 2 ? scaleBytes : dataBytes)
+        std::memcpy(result.slab<std::byte>(tensor, page), data.slab<std::byte>(tensor, page), bytes);
   std::memcpy(result.queries.contents, data.queries.contents, data.queries.length);
   result.mask = data.mask;
   result.maskWords = data.maskWords;
@@ -341,6 +349,19 @@ void fill(Case &data) {
               floatToBFloat16(valuePattern(global, head, dimension)));
         }
       }
+    }
+    if (shape.format == Format::BFloat16) {
+      auto *keys = data.slab<BFloat16Bits>(SPLASH_KV_KEYS, logicalPage);
+      auto *values = data.slab<BFloat16Bits>(SPLASH_KV_VALUES, logicalPage);
+      for (uint32_t head = 0; head < shape.kvHeads; ++head)
+        for (uint32_t token = 0; token < valid; ++token)
+          for (uint32_t dim = 0; dim < kHeadDimension; ++dim) {
+            keys[splash_kv_key_element(head, token, dim)] =
+                floatToBFloat16(pageKeys[logicalIndex(token, head, dim)]);
+            values[data.pool->valueElement(head, token, dim)] =
+                floatToBFloat16(pageValues[logicalIndex(token, head, dim)]);
+          }
+      continue;
     }
     quantizeLayerPage(pageKeys, pageValues, valid, *quantized);
     const uint64_t elements = layout.elementsPerLayerPage();
@@ -473,8 +494,8 @@ Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
 }
 
 // The split, reduce and every scratch buffer of one production-sized
-// dispatch: partials and statistics exactly cover [lane][KV head][split]
-// (verify) or [tile][KV head][split] (prefill, one tile).
+// dispatch: partials and statistics exactly cover [lane][query group][split]
+// (verify) or [tile][query group][split] (prefill, one tile).
 struct Dispatch {
   std::vector<uint8_t> output;
   std::vector<uint8_t> partials;
@@ -497,7 +518,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const uint64_t laneBytes = data.queries.length;
   id<MTLBuffer> queries = makeBuffer(device, width * laneBytes);
   id<MTLBuffer> output = makeBuffer(device, width * laneBytes);
-  const uint64_t slots = uint64_t{width} * shape.kvHeads * splits;
+  const uint64_t slots = uint64_t{width} * shape.queryGroups() * splits;
   id<MTLBuffer> partials = makeBuffer(
       device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
   id<MTLBuffer> statistics =
@@ -535,8 +556,8 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
   // The sparse split's grid is one-dimensional (ops::PagedAttention::verifyPlan).
-  [encoder dispatchThreadgroups:shape.sparse() ? MTLSizeMake(shape.kvHeads * splits, 1, width)
-                                               : MTLSizeMake(shape.kvHeads, splits, width)
+  [encoder dispatchThreadgroups:shape.sparse() ? MTLSizeMake(shape.queryGroups() * splits, 1, width)
+                                               : MTLSizeMake(shape.queryGroups(), splits, width)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
@@ -548,7 +569,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBytes:params.data()
               length:sizeof(VerifyAttentionParams) * params.size()
              atIndex:paramsIndex];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), width)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.queryGroups(), shape.fusedRows(), width)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder endEncoding];
   finish(command);
@@ -562,7 +583,7 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const Shape shape = data.shape;
   const uint32_t splits = data.params.split_count;
   id<MTLBuffer> output = makeBuffer(device, data.queries.length);
-  const uint64_t slots = uint64_t{shape.kvHeads} * splits;
+  const uint64_t slots = uint64_t{shape.queryGroups()} * splits;
   id<MTLBuffer> partials = makeBuffer(
       device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
   id<MTLBuffer> statistics =
@@ -589,7 +610,7 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, 1, splits)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.queryGroups(), 1, splits)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
@@ -599,7 +620,7 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   if (shape.sparse())
     [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
   [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), 1)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.queryGroups(), shape.fusedRows(), 1)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder endEncoding];
   finish(command);
@@ -686,13 +707,13 @@ void checkOutput(const Case &data, uint32_t width,
             << " bf16_max_absolute=" << qualityMaximumAbsolute
             << " bf16_top1=" << top1Agreement << '\n';
   require(cosine > 0.9995,
-          "production batch attention differs from its Q8 reference");
+          "production batch attention differs from its KV reference");
   if (data.maskWords)
     for (const auto &[rowDot, rowActual, rowExpected] : rowSums)
       require(rowDot / std::sqrt(rowActual * rowExpected) > 0.999,
               "a QSA row's attention differs from its Q8 reference");
   require(maximumAbsolute < 0.02f,
-          "production batch attention exceeds its Q8 error bound");
+          "production batch attention exceeds its KV error bound");
   require(!qualityGate ||
               (qualityCosine > 0.9999 && qualityMaximumAbsolute < 0.01f &&
                top1Agreement >= 0.98),
@@ -771,7 +792,7 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
   fill(data);
   if (qsa) setQsaMask(data);
   const Case oneExtent = oneExtentCopy(device, data);
-  const std::vector<BFloat16Bits> expectedQ8 = cpuReference(data, true);
+  const std::vector<BFloat16Bits> expectedQ8 = cpuReference(data, shape.format == Format::Int8);
   const std::vector<BFloat16Bits> expectedBf16 = cpuReference(data, false);
   const bool verify = activeRows == kRows;
   const std::string name = (verify ? pipelines.splitName : pipelines.prefillSplitName) + (qsa ? "_qsa" : "");
@@ -797,16 +818,18 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
 void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
                  id<MTLLibrary> library, Shape shape, uint32_t splits,
                  uint32_t activeRows) {
+  std::cout << "reduce=" << shape.reduce("verify") << " splits=" << splits
+            << " active_rows=" << activeRows << '\n';
   const uint32_t m = shape.fusedRows(), d = kHeadDimension;
-  auto partials = makeBuffer(device, uint64_t{shape.kvHeads} * splits * m * d * 4);
-  auto stats = makeBuffer(device, uint64_t{shape.kvHeads} * splits * m * 2 * 4);
+  auto partials = makeBuffer(device, uint64_t{shape.queryGroups()} * splits * m * d * 4);
+  auto stats = makeBuffer(device, uint64_t{shape.queryGroups()} * splits * m * 2 * 4);
   auto *p = static_cast<float *>(partials.contents);
   auto *t = static_cast<float *>(stats.contents);
-  for (uint32_t head = 0; head < shape.kvHeads; ++head)
+  for (uint32_t head = 0; head < shape.queryGroups(); ++head)
     for (uint32_t split = 0; split < splits; ++split)
       for (uint32_t row = 0; row < m; ++row) {
         const uint64_t index = (uint64_t{head} * splits + split) * m + row;
-        const bool active = row / shape.queryHeadsPerKvHead < activeRows;
+        const bool active = row / shape.groupSize() < activeRows;
         // Alternate underflow-scale differences and fractional exp weights.
         const float spacing = row % 2 ? 0.25f : 500.0f;
         t[index * 2] = active ? float(int(split % 5) - 2) * spacing : -INFINITY;
@@ -818,12 +841,13 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // reduce without lists binds another buffer of the dispatch for their
   // counts, of which it reads nothing.
   const auto reduce = [&](const char *phase, const auto &params) {
-    id<MTLBuffer> output = makeBuffer(device, uint64_t{shape.kvHeads} * kStride *
-                                                 shape.queryHeadsPerKvHead * d * 2);
+    id<MTLBuffer> output = makeBuffer(device, uint64_t{shape.queryGroups()} * kStride *
+                                                 shape.groupSize() * d * 2);
     std::memset(output.contents, 0xa5, output.length);
+    const auto pipeline = makePipeline(device, library, shape.reduce(phase));
     id<MTLCommandBuffer> command = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-    [encoder setComputePipelineState:makePipeline(device, library, shape.reduce(phase))];
+    [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:partials offset:0 atIndex:0];
     [encoder setBuffer:stats offset:0 atIndex:1];
     [encoder setBuffer:output offset:0 atIndex:2];
@@ -831,7 +855,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
     if (shape.sparse())
       [encoder setBuffer:partials offset:0 atIndex:paramsIndex++];
     [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
-    [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, m, 1)
+    [encoder dispatchThreadgroups:MTLSizeMake(shape.queryGroups(), m, 1)
            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [encoder endEncoding];
     finish(command);
@@ -841,10 +865,10 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // poison kept past the eight-row view.
   const auto check = [&](id<MTLBuffer> output) {
     const auto *out = static_cast<const BFloat16Bits *>(output.contents);
-    for (uint32_t head = 0; head < shape.kvHeads; ++head)
+    for (uint32_t head = 0; head < shape.queryGroups(); ++head)
       for (uint32_t row = 0; row < m; ++row) {
-        const uint64_t offset = (uint64_t{head} * kStride * shape.queryHeadsPerKvHead + row) * d;
-        const bool active = row / shape.queryHeadsPerKvHead < activeRows;
+        const uint64_t offset = (uint64_t{head} * kStride * shape.groupSize() + row) * d;
+        const bool active = row / shape.groupSize() < activeRows;
         if (!active) {
           for (uint32_t dim = 0; dim < d; ++dim)
             require(out[offset + dim] == 0, "inactive attention row was not exactly zero");
@@ -870,10 +894,10 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
                   "attention merge differs from fp64 reference");
         }
       }
-    for (uint32_t head = 0; head < shape.kvHeads; ++head)
-      for (uint32_t row = m; row < kStride * shape.queryHeadsPerKvHead; ++row)
+    for (uint32_t head = 0; head < shape.queryGroups(); ++head)
+      for (uint32_t row = m; row < kStride * shape.groupSize(); ++row)
         for (uint32_t dim = 0; dim < d; ++dim)
-          require(out[(uint64_t{head} * kStride * shape.queryHeadsPerKvHead + row) * d + dim] ==
+          require(out[(uint64_t{head} * kStride * shape.groupSize() + row) * d + dim] ==
                       0xa5a5,
                   "attention merge wrote beyond its eight-row view");
   };
@@ -900,7 +924,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
 }
 
-void run(const char *libraryPath) {
+void run(const char *libraryPath, bool vgroupsOnly) {
   testContract();
   id<MTLDevice> device = MTLCreateSystemDefaultDevice();
   if (!device)
@@ -913,6 +937,7 @@ void run(const char *libraryPath) {
     throw std::runtime_error(error.localizedDescription.UTF8String);
   id<MTLCommandQueue> queue = [device newCommandQueue];
   for (const Shape shape : kShapes) {
+    if (vgroupsOnly && !shape.virtualGroups) continue;
     for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U}) {
       checkReduce(device, queue, library, shape, splits, kRows);
       if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)
@@ -972,10 +997,10 @@ void run(const char *libraryPath) {
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     try {
-      if (argc != 2)
+      if (argc != 2 && (argc != 3 || std::strcmp(argv[2], "--vgroups")))
         throw std::runtime_error(
-            "usage: q8_flash_attention_metal_test <metallib>");
-      run(argv[1]);
+            "usage: q8_flash_attention_metal_test <metallib> [--vgroups]");
+      run(argv[1], argc == 3);
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "q8_flash_attention_metal_test: " << error.what() << '\n';
