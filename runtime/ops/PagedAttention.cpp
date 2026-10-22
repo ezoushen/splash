@@ -80,7 +80,7 @@ std::string_view storePipeline(kv::Layout layout, bool verify) {
 
 // The attention kernel of the GQA group the layout compiled.
 std::string_view pipeline(KernelLayout layout, std::string_view kv4Group6, std::string_view kv2Group8,
-                          std::string_view kv2Group12, std::string_view kv2Group16) noexcept {
+                          std::string_view kv2Group12, std::string_view kv2VirtualGroups) noexcept {
   switch (layout) {
   case KernelLayout::Kv4Group6:
     return kv4Group6;
@@ -89,7 +89,7 @@ std::string_view pipeline(KernelLayout layout, std::string_view kv4Group6, std::
   case KernelLayout::Kv2Group12:
     return kv2Group12;
   case KernelLayout::Kv2VirtualGroups:
-    return kv2Group16;
+    return kv2VirtualGroups;
   }
   return kv2Group8;
 }

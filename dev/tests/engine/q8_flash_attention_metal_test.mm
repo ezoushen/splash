@@ -818,8 +818,6 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
 void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
                  id<MTLLibrary> library, Shape shape, uint32_t splits,
                  uint32_t activeRows) {
-  std::cout << "reduce=" << shape.reduce("verify") << " splits=" << splits
-            << " active_rows=" << activeRows << '\n';
   const uint32_t m = shape.fusedRows(), d = kHeadDimension;
   auto partials = makeBuffer(device, uint64_t{shape.queryGroups()} * splits * m * d * 4);
   auto stats = makeBuffer(device, uint64_t{shape.queryGroups()} * splits * m * 2 * 4);
@@ -924,7 +922,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
 }
 
-void run(const char *libraryPath, bool vgroupsOnly) {
+void run(const char *libraryPath) {
   testContract();
   id<MTLDevice> device = MTLCreateSystemDefaultDevice();
   if (!device)
@@ -937,7 +935,6 @@ void run(const char *libraryPath, bool vgroupsOnly) {
     throw std::runtime_error(error.localizedDescription.UTF8String);
   id<MTLCommandQueue> queue = [device newCommandQueue];
   for (const Shape shape : kShapes) {
-    if (vgroupsOnly && !shape.virtualGroups) continue;
     for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U}) {
       checkReduce(device, queue, library, shape, splits, kRows);
       if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)
@@ -997,10 +994,10 @@ void run(const char *libraryPath, bool vgroupsOnly) {
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     try {
-      if (argc != 2 && (argc != 3 || std::strcmp(argv[2], "--vgroups")))
+      if (argc != 2)
         throw std::runtime_error(
-            "usage: q8_flash_attention_metal_test <metallib> [--vgroups]");
-      run(argv[1], argc == 3);
+            "usage: q8_flash_attention_metal_test <metallib>");
+      run(argv[1]);
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "q8_flash_attention_metal_test: " << error.what() << '\n';

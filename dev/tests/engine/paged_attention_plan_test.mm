@@ -746,21 +746,12 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
             << " rows=" << rows << " PASS\n";
 }
 
-// Characterize GQA-16 tails around page and split partition boundaries.
+// Production 122B tails around page and split partition boundaries.
 void check122bTails(metal::MetalBackend &backend) {
-  uint32_t failures = 0;
   for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
     for (uint32_t history : {511U, 513U, 4093U, 4097U})
-      for (uint32_t rows : {1U, 7U, 8U, 9U, 118U, 2047U, 2048U}) {
-        try {
-          checkPrefill(backend, 32, Geometry{32, 2, false}.layout(format), history, rows);
-        } catch (const std::exception &error) {
-          ++failures;
-          std::cerr << "122b tail: format=" << kv::formatName(format) << " history=" << history
-                    << " rows=" << rows << " FAIL: " << error.what() << '\n';
-        }
-      }
-  require(failures == 0, "122b tail characterization failed");
+      for (uint32_t rows : {1U, 7U, 8U, 9U, 118U, 2047U, 2048U})
+        checkPrefill(backend, 32, Geometry{32, 2, false}.layout(format), history, rows);
   std::cout << "122b tails: 56 cases PASS\n";
 }
 
@@ -900,22 +891,14 @@ void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout
 
 // Both KV formats, heterogeneous lane histories, and the 32-split boundary.
 void check122bVerify(metal::MetalBackend &backend) {
-  uint32_t failures = 0;
   for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
     for (uint32_t history : {511U, 513U, 4093U, 4097U, 16385U})
       for (uint32_t lanes : {1U, 4U})
         for (bool reverse : {false, true}) {
           // Descending split counts expose overlap from per-lane slot strides.
           if (reverse && (history != 16385 || lanes != 4)) continue;
-          try {
-            checkVerify(backend, 32, Geometry{32, 2, false}.layout(format), history, lanes, reverse);
-          } catch (const std::exception &error) {
-            ++failures;
-            std::cerr << "122b production verify: format=" << kv::formatName(format) << " history=" << history
-                      << " lanes=" << lanes << " reverse=" << reverse << " FAIL: " << error.what() << '\n';
-          }
+          checkVerify(backend, 32, Geometry{32, 2, false}.layout(format), history, lanes, reverse);
         }
-  require(failures == 0, "122b production verify characterization failed");
   std::cout << "122b production verify: 22 cases PASS\n";
 }
 
@@ -1641,33 +1624,8 @@ void ropeTargetScaling(metal::MetalBackend &backend) {
 
 int main(int argc, char **argv) {
   try {
-    require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long|--122b-tails|--122b-verify|--122b-layout|--122b-production]]");
-    if (argc == 3 && std::string_view(argv[2]) == "--122b-layout") {
-      metal::MetalBackend backend(argv[1]);
-      uint32_t failures = 0;
-      for (bool verify : {false, true}) {
-        for (bool float32 : {false, true}) {
-          try { checkProjection(backend, 32, Geometry{32, 2, false}.layout(kv::Format::Int8), float32, verify); }
-          catch (const std::exception &error) { ++failures; std::cerr << "projection: " << error.what() << '\n'; }
-        }
-        try { check122bGate(backend, verify); }
-        catch (const std::exception &error) { ++failures; std::cerr << "gate: " << error.what() << '\n'; }
-      }
-      try { bufferExtents(backend, 32, Geometry{32, 2, false}.layout(kv::Format::Int8)); }
-      catch (const std::exception &error) { ++failures; std::cerr << "bounds: " << error.what() << '\n'; }
-      require(failures == 0, "122b direct layout failed");
-      return 0;
-    }
-    if (argc == 3 && std::string_view(argv[2]) == "--122b-production") {
-      metal::MetalBackend backend(argv[1]);
-      uint32_t failures = 0;
-      try { check122bTails(backend); }
-      catch (const std::exception &error) { ++failures; std::cerr << error.what() << '\n'; }
-      try { check122bVerify(backend); }
-      catch (const std::exception &error) { ++failures; std::cerr << error.what() << '\n'; }
-      require(failures == 0, "122b production numerical cases failed");
-      return 0;
-    }
+    require(argc >= 1 && argc <= 3 && (argc != 3 || std::string_view(argv[2]) == "--long"),
+            "usage: paged-attention-plan [METALLIB [--long]]");
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
       for (const Geometry geometry : kGeometries)
         checkPlans(geometry.queryHeads, geometry.layout(format));
@@ -1676,14 +1634,6 @@ int main(int argc, char **argv) {
       return 0;
     }
     metal::MetalBackend backend(argv[1]);
-    if (argc == 3 && std::string_view(argv[2]) == "--122b-verify") {
-      check122bVerify(backend);
-      return 0;
-    }
-    if (argc == 3 && std::string_view(argv[2]) == "--122b-tails") {
-      check122bTails(backend);
-      return 0;
-    }
     check122bGate(backend, false);
     check122bGate(backend, true);
     checkBf16StoreEdges(backend);
@@ -1717,7 +1667,7 @@ int main(int argc, char **argv) {
       std::cout << "long paged attention plans: PASS\n";
       return 0;
     }
-    require(argc == 2, "usage: paged-attention-plan [METALLIB [--long|--122b-tails|--122b-verify|--122b-layout|--122b-production]]");
+    require(argc == 2, "usage: paged-attention-plan [METALLIB [--long]]");
     check122bTails(backend);
     check122bVerify(backend);
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
