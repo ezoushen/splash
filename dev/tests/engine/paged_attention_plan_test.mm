@@ -5,6 +5,7 @@
 #include "ops/RoPE.hpp"
 
 #include "AttentionFixture.hpp"
+#include "AttentionT512.hpp"
 #include "HostKvExtents.hpp"
 #include "LinearNumerics.hpp"
 #include "NormReference.hpp"
@@ -562,7 +563,8 @@ using AttendedKv = std::pair<metal::MetalBuffer, SplashKvLayer>;
 template <Phase phase>
 std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBounds,
                           const std::function<void(ops::AttentionBlocks &)> &locate = {},
-                          const std::function<AttendedKv(metal::CommandGraph &)> &stage = {}) {
+                          const std::function<AttendedKv(metal::CommandGraph &)> &stage = {},
+                          bool t512 = false) {
   constexpr bool prefill = phase == Phase::Prefill;
   const auto plan = [&] {
     if constexpr (prefill)
@@ -672,7 +674,10 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
   const auto expected = data.layout.format == kv::Format::BFloat16
                             ? expectedBf16Store(data)
                             : std::vector<std::vector<std::byte>>{};
-  (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  const auto dispatches = t512 ? test::prefillT512Dispatches(graph.dispatches())
+                               : std::vector<metal::ComputeDispatch>{};
+  (void)backend.submitCommandAsync(t512 ? std::span<const metal::ComputeDispatch>(dispatches)
+                                       : graph.dispatches()).wait();
   if (data.layout.format == kv::Format::BFloat16) checkBf16Store(data, expected);
   for (size_t i = 0; i < sizes.size(); ++i) {
     const auto *bytes = static_cast<const uint8_t *>(backing[i].contents());
@@ -685,13 +690,13 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
 }
 
 void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout,
-                   uint32_t history, uint32_t rows) {
+                   uint32_t history, uint32_t rows, bool t512 = false) {
   auto data = makeCase(backend, heads, layout, 1, rows, history, false);
-  const auto output = run<Phase::Prefill>(backend, data, true);
+  const auto output = run<Phase::Prefill>(backend, data, true, {}, {}, t512);
   checkReference(data, output);
-  checkEquivalent(data, output, run<Phase::Prefill>(backend, data, false));
+  checkEquivalent(data, output, run<Phase::Prefill>(backend, data, false, {}, {}, t512));
   auto oneExtent = makeCase(backend, heads, layout, 1, rows, history, false, true);
-  require(run<Phase::Prefill>(backend, oneExtent, false) == output,
+  require(run<Phase::Prefill>(backend, oneExtent, false, {}, {}, t512) == output,
           "prefill attention over extents differs from one extent of the same pages");
   if (rows == 1057) {
     // Reuse the identical BF16 inputs and KV history across unaligned
@@ -720,9 +725,9 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
           for (uint32_t d = 0; d < 256; ++d)
             static_cast<uint16_t *>(data.queries.contents())[data.queryIndex(0, head, row, d)] =
                 queries[data.queryIndex(0, head, offset + row, d)];
-      const auto chunkOutput = run<Phase::Prefill>(backend, data, true);
+      const auto chunkOutput = run<Phase::Prefill>(backend, data, true, {}, {}, t512);
       checkReference(data, chunkOutput);
-      checkEquivalent(data, chunkOutput, run<Phase::Prefill>(backend, data, false));
+      checkEquivalent(data, chunkOutput, run<Phase::Prefill>(backend, data, false, {}, {}, t512));
       offset += chunk;
     }
     require(offset == rows, "chunk comparison dropped logical query rows");
@@ -732,13 +737,13 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
 }
 
 // Characterize GQA-16 tails around page and split partition boundaries.
-void check122bTails(metal::MetalBackend &backend) {
+void check122bTails(metal::MetalBackend &backend, bool t512 = false) {
   uint32_t failures = 0;
   for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
     for (uint32_t history : {511U, 513U, 4093U, 4097U})
       for (uint32_t rows : {1U, 7U, 8U, 9U, 118U, 2047U, 2048U}) {
         try {
-          checkPrefill(backend, 32, Geometry{32, 2, false}.layout(format), history, rows);
+          checkPrefill(backend, 32, Geometry{32, 2, false}.layout(format), history, rows, t512);
         } catch (const std::exception &error) {
           ++failures;
           std::cerr << "122b tail: format=" << kv::formatName(format) << " history=" << history
@@ -1527,7 +1532,7 @@ void ropeTargetScaling(metal::MetalBackend &backend) {
 
 int main(int argc, char **argv) {
   try {
-    require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long|--122b-tails]]");
+    require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long|--122b-tails|--122b-t512]]");
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
       for (const Geometry geometry : kGeometries)
         checkPlans(geometry.queryHeads, geometry.layout(format));
@@ -1536,8 +1541,9 @@ int main(int argc, char **argv) {
       return 0;
     }
     metal::MetalBackend backend(argv[1]);
-    if (argc == 3 && std::string_view(argv[2]) == "--122b-tails") {
-      check122bTails(backend);
+    if (argc == 3 && (std::string_view(argv[2]) == "--122b-tails" ||
+                      std::string_view(argv[2]) == "--122b-t512")) {
+      check122bTails(backend, std::string_view(argv[2]) == "--122b-t512");
       return 0;
     }
     checkBf16StoreEdges(backend);
@@ -1570,7 +1576,7 @@ int main(int argc, char **argv) {
       std::cout << "long paged attention plans: PASS\n";
       return 0;
     }
-    require(argc == 2, "usage: paged-attention-plan [METALLIB [--long|--122b-tails]]");
+    require(argc == 2, "usage: paged-attention-plan [METALLIB [--long|--122b-tails|--122b-t512]]");
     check122bTails(backend);
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
     for (const Geometry geometry : kGeometries) {

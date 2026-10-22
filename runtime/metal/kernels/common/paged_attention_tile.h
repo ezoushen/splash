@@ -9,6 +9,10 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
+#ifndef SPLASH_ATTENTION_TILE_SIMDGROUPS
+#define SPLASH_ATTENTION_TILE_SIMDGROUPS 8
+#endif
+
 // Paged attention over INT8 or BF16 KV. INT8 has one fp32 scale per
 // (token, KV head); BF16 reads the stored values directly. The preceding
 // store writes current rows to their final slots; committed_tokens controls
@@ -209,11 +213,11 @@ inline void splash_attention_page_softmax(
   probabilities4[1] = bfloat4(high);
 }
 
-// The softmax runs one lane per thread of the tile's 256-thread threadgroup.
-// A tile with more lanes than threads (kv2_g16: 4 lanes x 128 fused rows)
+// The softmax runs one lane per thread of the tile's threadgroup.
+// A tile with more lanes than threads (256-thread kv2_g16: 4 x 128 rows)
 // takes the rest in further passes, each over whole rows; the other tiles
 // call it once, as they always have.
-constant uint SplashAttentionTileThreads = 256;
+constant uint SplashAttentionTileThreads = SPLASH_ATTENTION_TILE_SIMDGROUPS * 32;
 constexpr uint splash_attention_softmax_passes(uint query_heads_per_kv_head,
                                                uint rows_per_tile) {
   return (SplashKvPageTokens / 8 * rows_per_tile * query_heads_per_kv_head +
@@ -277,14 +281,14 @@ inline void splash_paged_attention_tile(
   constexpr auto pv_descriptor =
       matmul2d_descriptor(M, D, N, false, true, true,
                           matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<qk_descriptor, execution_simdgroups<8>> qk;
-  matmul2d<pv_descriptor, execution_simdgroups<8>> pv;
+  matmul2d<qk_descriptor, execution_simdgroups<SPLASH_ATTENTION_TILE_SIMDGROUPS>> qk;
+  matmul2d<pv_descriptor, execution_simdgroups<SPLASH_ATTENTION_TILE_SIMDGROUPS>> pv;
   auto running = pv.template get_destination_cooperative_tensor<
       decltype(p0), decltype(v0), float>();
-  // Uniform capacity partitions the logical tile across eight 32-lane groups.
+  // Uniform capacity partitions the tile across the configured 32-lane groups.
   // Equality proves no padding; otherwise only valid entries may be accessed.
   const bool running_full =
-      uint(running.get_capacity()) * (8u * 32u) == uint(M) * D;
+      uint(running.get_capacity()) * (SPLASH_ATTENTION_TILE_SIMDGROUPS * 32u) == uint(M) * D;
 #pragma unroll
   for (ushort index = 0; index < running.get_capacity(); ++index) {
     if (running_full || running.is_valid_element(index))
